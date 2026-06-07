@@ -1,0 +1,15 @@
+# Data fetching
+requests
+
+# Selenium (for FinViz token refresh)
+selenium
+webdriver-manager
+
+# Data processing
+pandas
+
+# Database
+pymongo
+
+# Utilities
+python-dotenv
