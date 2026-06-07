@@ -1,3 +1,6 @@
+# Command: pip install -r requirements.txt
+# ========================================================
+
 # Data fetching
 requests
 
