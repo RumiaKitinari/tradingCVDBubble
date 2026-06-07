@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Chart</title>
+    <!-- Include D3.js -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        /* Styling for candlesticks and wicks */
+        .candle {
+            stroke: black;
+        }
+
+        .candle.up {
+            fill: green;
+        }
+
+        .candle.down {
+            fill: red;
+        }
+
+        .wick {
+            stroke: black;
+        }
+    </style>
+</head>
+<body>
+    <h1>Hourly Candlestick Chart For NVIDIA</h1>
+    
+    {% if is_empty %}
+        <p>No data available for the selected period.</p>
+    {% else %}
+        <!-- Container for the SVG chart -->
+        <svg id="chart" width="800" height="400"></svg>
+        <script>
+            // Debugging logs
+            console.log("D3.js is working!");
+            
+            // Get chart data passed from Django (ensure it's safe JSON)
+            const chartData = {{ chart_data|safe }};
+            console.log("Chart Data from Django:", chartData);
+
+            // Parse the dates in chartData
+            const parseDate = d3.isoParse; // ISO string parser
+            chartData.forEach(d => {
+                d.date = parseDate(d.x); // Convert ISO string to Date object
+            });
+
+            // Set up chart dimensions and margins
+            const margin = { top: 20, right: 30, bottom: 30, left: 50 };
+            const width = 800 - margin.left - margin.right;
+            const height = 400 - margin.top - margin.bottom;
+
+            // Create SVG container
+            const svg = d3.select('#chart')
+                .attr('width', width + margin.left + margin.right)
+                .attr('height', height + margin.top + margin.bottom)
+                .append('g')
+                .attr('transform', `translate(${margin.left},${margin.top})`);
+
+            // Define scales
+            const x = d3.scaleBand()
+                .domain(chartData.map(d => d.date)) // Use parsed dates
+                .range([0, width])
+                .padding(0.2);
+
+            const y = d3.scaleLinear()
+                .domain([d3.min(chartData, d => d.l) - 1, d3.max(chartData, d => d.h) + 1]) // High and low prices
+                .range([height, 0]);
+
+            // Add axes
+            svg.append('g')
+                .attr('transform', `translate(0,${height})`)
+                .call(d3.axisBottom(x).tickFormat(d3.timeFormat('%H:%M')));
+
+            svg.append('g')
+                .call(d3.axisLeft(y));
+
+            // Add candlesticks
+            svg.selectAll('.candle')
+                .data(chartData)
+                .enter()
+                .append('rect')
+                .attr('class', d => `candle ${d.c > d.o ? 'up' : 'down'}`) // Green for upward, red for downward
+                .attr('x', d => x(d.date))
+                .attr('y', d => y(Math.max(d.o, d.c)))
+                .attr('width', x.bandwidth())
+                .attr('height', d => Math.abs(y(d.o) - y(d.c)));
+
+            // Add wicks
+            svg.selectAll('.wick')
+                .data(chartData)
+                .enter()
+                .append('line')
+                .attr('class', 'wick')
+                .attr('x1', d => x(d.date) + x.bandwidth() / 2) // Center the wick
+                .attr('x2', d => x(d.date) + x.bandwidth() / 2)
+                .attr('y1', d => y(d.h)) // High point
+                .attr('y2', d => y(d.l)); // Low point
+        </script>
+    {% endif %}
+</body>
+</html>

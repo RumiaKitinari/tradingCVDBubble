@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Candlestick Chart</title>
+    <style>
+        body {
+            background-color: #f5f5dc; /* Creme color */
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-top: 50px;
+        }
+        .welcome {
+            text-align: center;
+            font-size: 1.2em;
+            margin-bottom: 30px;
+            color: #333;
+        }
+        .content-box {
+            max-width: 800px;
+            margin: 0 auto 20px; /* Align to center horizontally and add spacing */
+            padding: 20px;
+            background-color: #fff;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            text-align: left; /* Align content to the left */
+        }
+        .content-box h2 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .content-box p {
+            line-height: 1.6;
+            color: #555;
+        }
+        .content-box ul {
+            margin-top: 10px;
+            margin-bottom: 10px;
+            padding-left: 20px;
+        }
+        .content-box ul li {
+            margin-bottom: 10px;
+        }
+        .button-container {
+            text-align: center;
+            margin-top: 30px;
+        }
+        .button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            text-decoration: none;
+            font-size: 16px;
+        }
+        .button:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>CANDLESTICK CHART</h1>
+
+    <div class="welcome">
+        Welcome to this page! Learn more about candlestick charts and how to interpret them.
+    </div>
+
+    <div class="content-box">
+        <h2>What Is A Candlestick Chart?</h2>
+        <p>
+            A candlestick chart is a type of financial chart used to represent the price movement of securities, derivatives, and currencies. Each candlestick provides key information about market trends for a specific time period, such as a day or hour.
+        </p>
+        <ul>
+            <li>**Open Price**: The price at which the asset started trading during the period.</li>
+            <li>**Close Price**: The price at which the asset ended trading during the period.</li>
+            <li>**High Price**: The highest price reached during the period.</li>
+            <li>**Low Price**: The lowest price reached during the period.</li>
+        </ul>
+    </div>
+
+    <div class="content-box">
+        <h2>How to Read a Candlestick Chart</h2>
+        <p>
+            Candlesticks give a quick visual representation of market trends and patterns:
+        </p>
+        <ul>
+            <li>A **green candlestick** (or hollow) indicates a price increase (close > open).</li>
+            <li>A **red candlestick** (or filled) indicates a price decrease (close < open).</li>
+            <li>The **body** of the candlestick represents the difference between the open and close prices.</li>
+            <li>The **wicks (or shadows)** above and below the body show the high and low prices during the period.</li>
+            <li>Look for patterns such as **Doji**, **Hammer**, or **Engulfing**, which can signal market reversals or continuations.</li>
+        </ul>
+    </div>
+
+    <div class="button-container">
+        <a href="{% url 'real_time_chart' %}" class="button">Go to Chart</a>
+    </div>
+</body>
+</html>
