@@ -1,4 +1,5 @@
 DOWNLOAD_DIR = "/Users/person/Desktop/Project_Name/data/TV_selenium_data"
-USERNAME = "email@gmail.com"
+USERNAME = "username"
+EMAIL = "email@gmail.com"
 PASSWORD = "password"
 COOKIES_FILE = "/Users/person/Desktop/Project_Name/data/cookies2.pkl"
