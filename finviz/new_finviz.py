@@ -1,7 +1,7 @@
 import requests
 import csv
 import io
-from .api_keys import FINVIZ_AUTH_TOKEN
+from api_keys import FINVIZ_AUTH_TOKEN
 from pymongo import MongoClient, UpdateOne
 
 # MongoDB connection
