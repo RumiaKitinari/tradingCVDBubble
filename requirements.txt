@@ -1,6 +1,8 @@
-# Command: pip install -r requirements.txt
-# ========================================================
+#########################################################################################
+# --------- TIP: To install all, run command "pip install -r requirements.txt" --------- #
+#########################################################################################
 
+## Extracting data from TradingView/Finviz
 # Data fetching
 requests
 
@@ -16,3 +18,9 @@ pymongo
 
 # Utilities
 python-dotenv
+
+yfinance # TEMPORARY!!!!!!!
+
+
+## For loading the website
+pytz
