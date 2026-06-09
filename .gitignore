@@ -1,5 +1,6 @@
 /finviz/api_keys.py
 /TradingView/admin.py
+data/
 .env
 
 venv/
