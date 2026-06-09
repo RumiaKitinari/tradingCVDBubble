@@ -1,9 +1,13 @@
 /finviz/api_keys.py
 /TradingView/admin.py
+.env
 
 venv/
 .venv/
 env/
+
+venv_main/
+.venv_main/
 
 __pycache__/
 *.pyc

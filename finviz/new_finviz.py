@@ -1,7 +1,13 @@
 import requests
 import csv
 import io
-from api_keys import FINVIZ_AUTH_TOKEN
+from .api_keys import FINVIZ_AUTH_TOKEN
+from pymongo import MongoClient, UpdateOne
+
+# MongoDB connection
+client = MongoClient("mongodb://localhost:27017/")
+db = client["finviz_db"]
+collection = db["candles"]
 
 BASE_URL = "https://elite.finviz.com/quote_export"
 
@@ -48,8 +54,44 @@ def test_connection(ticker: str = 'NVDA') -> bool:
         return False
 
 
+def save_candles_to_mongo(ticker: str, timeframe: str, candles: list[dict]) -> int:
+    """
+    Save candles to MongoDB with upsert (no duplicates).
+    Uses ticker + timeframe + date as unique key.
+
+    Returns number of upserted/modified documents.
+    """
+    if not candles:
+        print("[MongoDB] No candles to save.")
+        return 0
+
+    operations = [
+        UpdateOne(
+            {"ticker": ticker, "timeframe": timeframe, "date": c["date"]},
+            {"$set": {**c, "ticker": ticker, "timeframe": timeframe}},
+            upsert=True
+        )
+        for c in candles
+    ]
+
+    result = collection.bulk_write(operations)
+    total = result.upserted_count + result.modified_count
+    print(f"[MongoDB] Saved {total} candles for {ticker} ({timeframe})")
+    return total
+
+
+def fetch_and_save(ticker: str, timeframe: str = 'i1') -> list[dict]:
+    """
+    Fetch OHLCV from FinViz and save to MongoDB in one step.
+    Returns the fetched candles.
+    """
+    candles = get_candle_data(ticker, timeframe)
+    save_candles_to_mongo(ticker, timeframe, candles)
+    return candles
+
+
 # Run test when executed directly
 if __name__ == '__main__':
     test_connection('NVDA')
-    data=get_candle_data('NVDA', 'i1')
-    print(len(data), data[-1])
+    data = fetch_and_save('NVDA', 'i1')
+    print(f"Total: {len(data)} | Last: {data[-1]}")
