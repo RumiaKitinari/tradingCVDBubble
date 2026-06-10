@@ -30,7 +30,7 @@ def save_cookies(driver):
         pickle.dump(driver.get_cookies(), cookiesfile)
 
 # Log into the account
-# NOTE: Future errors likely if TradingView updates their UI and thus HTML for the buttons
+# NOTE: Future errors possible if TradingView updates their UI and thus HTML for the fields
 # TIP: Tutorial to finding HTML: https://www.youtube.com/watch?v=j-cqGs75zo4
 def login(driver):
     try:
