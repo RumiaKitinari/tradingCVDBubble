@@ -6,9 +6,13 @@
 # Data fetching
 requests
 
-# Selenium (for FinViz token refresh)
-selenium
+# Selenium (for FinViz token refresh), Web Scraper
+#selenium
 webdriver-manager
+beautifulsoup4
+
+#Curl impersonate
+curl_cffi
 
 # Data processing
 pandas
@@ -20,7 +24,6 @@ pymongo
 python-dotenv
 
 yfinance # TEMPORARY!!!!!!!
-
 
 ## For loading the website
 pytz
