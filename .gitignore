@@ -13,3 +13,6 @@ venv_main/
 __pycache__/
 *.pyc
 *.pyo
+
+# Generated chart outputs
+*_cvd_chart.html
