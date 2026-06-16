@@ -112,7 +112,17 @@ TIMEFRAME_RULE = {
     "5min":  "5min",
     "15min": "15min",
     "1hr":   "1h",
+    "3hr":   "3h",
+    "1day":  "1D",
+    "1week": "1W-MON",
+    "1month": "1ME",
 }
+
+# Timeframes at or above daily granularity (no intraday hour breaks on x-axis)
+DAILY_OR_ABOVE = {"1day", "1week", "1month"}
+
+# Timeframes where weekend breaks must NOT be applied (labels can land on weekends)
+WEEK_OR_ABOVE = {"1week", "1month"}
 
 def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.DataFrame:
     """

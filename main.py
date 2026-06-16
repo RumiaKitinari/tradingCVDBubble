@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import random
 import time
 import traceback
 
@@ -46,6 +47,14 @@ def refresh_token():
 def fetch(ticker: str):
     print(f"\n[Fetch] Fetching 1-min candles for {ticker}...")
     candles = fetch_and_save(ticker, timeframe="i1")
+
+    # 0 candles usually means the token expired (HTTP 401).
+    # Regenerate the token and retry once.
+    if not candles:
+        print("[Fetch] ⚠️  0 candles — token may be expired. Regenerating...")
+        refresh_token()
+        candles = fetch_and_save(ticker, timeframe="i1")
+
     print(f"[Fetch] ✅ {len(candles)} candles fetched and saved.")
     return candles
 
@@ -85,10 +94,25 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
     # Token regeneration once at startup
     refresh_token()
 
+    # Schedule next proactive token refresh:
+    # ~12h worth of iterations (720 @ 60s) ± random jitter to avoid a fixed pattern.
+    def next_refresh_iter(current: int) -> int:
+        base = (12 * 60 * 60) // max(interval, 1)   # iterations in ~12h
+        jitter = random.randint(-10, 10)
+        return current + base + jitter
+
+    refresh_at = next_refresh_iter(0)
+
     iteration = 0
     while True:
         iteration += 1
         print(f"\n[Loop] ── Iteration {iteration} ──────────────────────")
+
+        # Proactive token refresh before it expires (~24h lifetime)
+        if iteration >= refresh_at:
+            print(f"[Loop] Scheduled token refresh (iter {iteration}).")
+            refresh_token()
+            refresh_at = next_refresh_iter(iteration)
 
         try:
             fetch(ticker)
