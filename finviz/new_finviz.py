@@ -1,7 +1,8 @@
 import requests
 import csv
 import io
-from api_keys import FINVIZ_AUTH_TOKEN
+import importlib
+from . import api_keys
 from pymongo import MongoClient, UpdateOne
 
 # MongoDB connection
@@ -10,10 +11,14 @@ db = client["finviz_db"]
 collection = db["candles"]
 
 BASE_URL = "https://elite.finviz.com/quote_export"
+session = requests.Session()
 
 def get_candle_data(ticker: str, timeframe: str = 'd') -> list[dict]:
-    url = f"{BASE_URL}?t={ticker}&p={timeframe}&auth={FINVIZ_AUTH_TOKEN}"
-    response = requests.get(url)
+    # Re-read token from disk each call so a regenerated token takes effect
+    # without restarting the process.
+    importlib.reload(api_keys)
+    url = f"{BASE_URL}?t={ticker}&p={timeframe}&auth={api_keys.FINVIZ_AUTH_TOKEN}"
+    response = session.get(url)
 
     if response.status_code != 200:
         print(f"[FinViz] Error {response.status_code} for {ticker} ({timeframe})")
