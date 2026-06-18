@@ -135,7 +135,7 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CVD Pipeline")
-    parser.add_argument("--ticker",   type=str, default="NVDA", help="Stock ticker (default: NVDA)")
+    parser.add_argument("--ticker",   type=str, default="NVDA",  help="Stock ticker (default: NVDA)")
     parser.add_argument("--no-loop",  action="store_true",       help="Run once and exit")
     parser.add_argument("--interval", type=int, default=60,      help="Fetch interval in seconds (default: 60)")
     args = parser.parse_args()
