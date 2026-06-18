@@ -27,3 +27,6 @@ yfinance # TEMPORARY!!!!!!!
 
 ## For loading the website
 pytz
+
+# Plotly
+plotly
