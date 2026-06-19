@@ -25,6 +25,7 @@ python-dotenv
 
 yfinance # TEMPORARY!!!!!!!
 
+## Visualizations and Webapp
 ## For loading the website
 pytz
 

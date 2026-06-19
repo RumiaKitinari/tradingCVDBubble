@@ -34,9 +34,9 @@ def save_cookies(driver):
 
 driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
 
-################################################################################
-# --------- PART 2: Instantiating the Driver & Checking Login Status --------- #
-################################################################################
+#############################################################
+# --------- PART 2: TradingView Scraping via curl --------- #
+#############################################################
 
 async def tv_login_and_scrape():
     async with AsyncSession(impersonate="chrome") as s:
