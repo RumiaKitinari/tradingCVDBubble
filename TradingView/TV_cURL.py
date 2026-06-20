@@ -1,131 +1,98 @@
-import asyncio
-import json
-from curl_cffi import AsyncSession
+import os
+import time
+import pandas as pd
+from tradingview_screener import Query, Column
+import rookiepy
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
-
-import os, pickle
-from admin import DOWNLOAD_DIR, USERNAME, EMAIL, PASSWORD, COOKIES_FILE
+from admin import DOWNLOAD_DIR, INTERVAL
 
 ################################################
 # --------- PART 1: Helper Functions --------- #
 ################################################
 
-TRADING_VIEW_URL = "https://www.tradingview.com/"
-LOGIN_URL = "https://www.tradingview.com/accounts/signin/"
+cookies = None
 
-def load_cookies(driver):
-    if os.path.exists(COOKIES_FILE):
-        with open(COOKIES_FILE, 'rb') as cookiesfile:
-            cookies = pickle.load(cookiesfile)
-            for cookie in cookies:
-                driver.add_cookie(cookie)
+def create_data_dir():
+    try:
+        os.mkdir(DOWNLOAD_DIR)
+        print(f"Directory '{DOWNLOAD_DIR}' created successfully.")
+    except FileExistsError:
+        print(f"Directory '{DOWNLOAD_DIR}' already exists.")
+    except PermissionError:
+        print(f"Permission denied: Unable to create '{DOWNLOAD_DIR}'.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
-# Save cookies to a file
-def save_cookies(driver):
-    with open(COOKIES_FILE, 'wb') as cookiesfile:
-        pickle.dump(driver.get_cookies(), cookiesfile)
+def retrieve_cookies():
+    print("[ACTIVITY] Extracting active session cookies from browser")
+    
+    try: # (rookiepy.chrome -> .firefox / .edge)
+        cookies = rookiepy.to_cookiejar(rookiepy.chrome(['.tradingview.com']))
+    except Exception as e:
+        print(f"[ERROR] Could not load cookies automatically: {e}. Falling back to unauthenticated public request.")
+        cookies = None
 
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
+def scrape_TV_stocks():
+    # 1.) Query -> Stock market
+    q = (
+        Query()
+        .set_markets('america')
+    )
 
-#############################################################
-# --------- PART 2: TradingView Scraping via curl --------- #
-#############################################################
+    # 2.) Select specific columns (data points)
+    q = q.select(
+        'name',                     # Ticker
+        'description',              # Company
+        'close',                    # Price
+        'volume',                   # Volume (now)
+        'market_cap_basic',         # Market Cap
+        'pe_ratio',                 # P/E Ratio
+        'relative_volume_10d_calc'  # (EX: Relative Volume compared to 10-day average)
+    )
 
-async def tv_login_and_scrape():
-    async with AsyncSession(impersonate="chrome") as s:
-        # --- STEP 1: INITIALIZE SESSION STATE ---
-        print("Visiting homepage to capture CSRF configurations and cookies...")
-        init_response = await s.get(TRADING_VIEW_URL)
+    # 3.) Screening filters
+    # q = q.where(
+    #     Column('market_cap_basic') > 1_000_000_000,
+    #     Column('volume') > 500_000
+    # )
+
+    # 4.) Sort the results (e.g., by highest volume descending)
+    q = q.order_by('volume', ascending=False)
+
+    # 5. Limit fetches (e.g., first 100 matching rows)
+    q = q.offset(0).limit(100)
+
+    try:
+        # 6.) Execute the query
+        print("[PING] TradingView scanner API")
+        total_count, df = q.get_scanner_data(cookies=cookies)
         
-        if init_response.status_code != 200:
-            print(f"Initialization blocked by firewall. Status: {init_response.status_code}")
-            return
-
-        # --- STEP 2: EXECUTE AUTHENTICATION PIPELINE ---
-        print(f"Transmitting credentials for profile: {EMAIL}...")
-        login_res = await s.post(
-            LOGIN_URL, 
-            data={"username": EMAIL, "password": PASSWORD},
-            impersonate="chrome"
-        )
+        print(f"[QUERY] 1.) Stocks = {total_count} \t2.) Limit = {len(df)} records.")
         
-        print(f"Server response received. Status code: {login_res.status_code}")
+        # 7.) Renaming columns
+        # df.columns = ['Ticker', 'Company Name', 'Price', 'Volume', 'Market Cap', 'P/E Ratio', 'Relative Volume']
         
-        if login_res.status_code != 200:
-            print("Authentication rejected. Debug details below:")
-            print(login_res.text[:500])  # Print parsing fragments to detect CAPTCHA requirements
-            return
-
-        print("Login completely successful. Persistent cookies bound to active AsyncSession.")
-
-        # --- STEP 3: INTERACT WITH INTERNAL SCREENER PIPELINE ---
-        screener_api_url = "https://scanner.tradingview.com/global/scan"
+        # 8.) Snippet of the data
+        # print("\nTop 5 Results:")
+        # print(df.head())
         
-        screener_payload = {
-            "filter": [{"left": "name", "operation": "nempty"}],
-            "options": {"lang": "en"},
-            "markets": ["america"],
-            "symbols": {"query": {"types": []}, "tickers": []},
-            "columns": ["base_currency", "logoid", "name", "close", "change", "volume"]
-        }
+        # 9.) Save to local CSV file
+        output_file = f"tradingview_data_{int(time.time())}.csv"
+        df.to_csv(os.path.join(DOWNLOAD_DIR, output_file), index=False)        
+        print(f"[SAVE] Data successfully saved to '{output_file}'\n")
 
-        print("Querying backend screener matrix...")
-        response = await s.post(screener_api_url, json=screener_payload)
-        
-        if response.status_code == 200:
-            data = response.json()
-            print("\n--- Market Overview Metrics ---")
-            for stock in data.get("data", [])[:5]:
-                print(f"Ticker: {stock['d'][2]} | Price: ${stock['d'][3]:.2f} | Volume: {stock['d'][5]}")
-        else:
-            print(f"Screener connection dropped. Status: {response.status_code}")
+    except Exception as e:
+        print(f"[ERROR] {e}")
 
-async def tradingview_login_secure():
-    async with AsyncSession(impersonate="chrome") as s:
-        # 1. GET request to initialize session and retrieve CSRF cookie
-        resp = await s.get(LOGIN_URL)
-        
-        # 2. Extract the 'csrf' token from the session cookies
-        # curl_cffi handles cookiejar automatically
-        csrf_token = s.cookies.get("csrf")
-        
-        if not csrf_token:
-            print("Failed to retrieve CSRF token. The site may be blocking initial access.")
-            return
-
-        # 3. Prepare authenticated headers
-        # TradingView requires the CSRF token in both the cookie AND the header
-        auth_headers = {
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "X-CSRF-Token": csrf_token,
-            "Origin": "https://www.tradingview.com",
-            "Referer": "https://www.tradingview.com/accounts/signin/"
-        }
-
-        # 4. Perform the Login
-        print("Attempting authenticated login...")
-        login_res = await s.post(
-            LOGIN_URL,
-            data={"email": EMAIL, "password": PASSWORD},
-            headers=auth_headers,
-            impersonate="chrome"
-        )
-
-        if login_res.status_code == 200:
-            print("Login successful!")
-        else:
-            print(f"Login failed with status: {login_res.status_code}")
-            # If it's still 403, check if you need to solve a CAPTCHA
-            print(login_res.text[:200])
+###############################################################
+# --------- PART 2: Scraping Stock Data Per Interval -------- #
+###############################################################
 
 if __name__ == "__main__":
-    asyncio.run(tv_login_and_scrape())
-    # asyncio.run(tradingview_login_secure())
+    # Example: Run every 60 seconds indefinitely
+    create_data_dir()
+    retrieve_cookies()
+    while True:
+        scrape_TV_stocks()
+        print(f"Waiting {INTERVAL} seconds for the next pull...\n")
+        time.sleep(INTERVAL)
