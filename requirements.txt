@@ -1,18 +1,14 @@
-#########################################################################################
-# --------- TIP: To install all, run command "pip install -r requirements.txt" --------- #
-#########################################################################################
+# TIP: Use pip install -r requirements.txt
 
 ## Extracting data from TradingView/Finviz
 # Data fetching
 requests
 
-# Selenium (for FinViz token refresh), Web Scraper
-#selenium
+# Scraping
 webdriver-manager
 beautifulsoup4
-
-#Curl impersonate
 curl_cffi
+tradingview-screener
 
 # Data processing
 pandas
@@ -22,6 +18,7 @@ pymongo
 
 # Utilities
 python-dotenv
+rookiepy
 
 yfinance # TEMPORARY!!!!!!!
 
