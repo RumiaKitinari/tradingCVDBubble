@@ -2,7 +2,7 @@
 main.py
 -------
 Full pipeline:
-  1. Token regeneration  (finviz_curl.py)
+  1. Initialization      (finviz_curl.py)
   2. Fetch + save        (finviz/new_finviz.py  → MongoDB)
   3. CVD calculation     (cvd/calculator.py)
   4. Visualization       (cvd/visualizer.py)
@@ -14,6 +14,7 @@ Usage:
   python main.py --ticker TSLA --no-loop   # one-shot, no repeat
 """
 
+import os
 import argparse
 import random
 import time
@@ -23,12 +24,14 @@ from finviz.finviz_curl import login, get_token, update_api_keys
 from finviz.new_finviz import fetch_and_save
 from cvd.calculator import run_pipeline
 from cvd.visualizer import build_chart
+from TradingView.admin import DOWNLOAD_DIR
 
 
 # ─────────────────────────────────────────
-# 1. Token regeneration
+# 1. Initializing System Variables
 # ─────────────────────────────────────────
 
+# Refreshes the Finviz token
 def refresh_token():
     print("\n[Token] Regenerating FinViz API token...")
     try:
@@ -39,6 +42,17 @@ def refresh_token():
     except SystemExit:
         print("[Token] ❌ Token regeneration failed — continuing with existing token.")
 
+# Creates "data" directory (if needed)
+def create_data_dir():
+    try:
+        os.mkdir(DOWNLOAD_DIR)
+        print(f"Directory '{DOWNLOAD_DIR}' created successfully.")
+    except FileExistsError:
+        print(f"Directory '{DOWNLOAD_DIR}' already exists.")
+    except PermissionError:
+        print(f"Permission denied: Unable to create '{DOWNLOAD_DIR}'.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 # ─────────────────────────────────────────
 # 2. Fetch + save to MongoDB
@@ -134,6 +148,7 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    create_data_dir()
     parser = argparse.ArgumentParser(description="CVD Pipeline")
     parser.add_argument("--ticker",   type=str, default="NVDA", help="Stock ticker (default: NVDA)")
     parser.add_argument("--no-loop",  action="store_true",       help="Run once and exit")
