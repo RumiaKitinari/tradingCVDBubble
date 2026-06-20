@@ -13,12 +13,24 @@ collection = db["candles"]
 BASE_URL = "https://elite.finviz.com/quote_export"
 session = requests.Session()
 
+
+class FinvizTokenError(Exception):
+    """Raised when FinViz rejects the auth token (HTTP 401/403)."""
+    pass
+
+
 def get_candle_data(ticker: str, timeframe: str = 'd') -> list[dict]:
     # Re-read token from disk each call so a regenerated token takes effect
     # without restarting the process.
     importlib.reload(api_keys)
     url = f"{BASE_URL}?t={ticker}&p={timeframe}&auth={api_keys.FINVIZ_AUTH_TOKEN}"
     response = session.get(url)
+
+    # 401/403 = the token is wrong/expired → signal the caller to regenerate it.
+    if response.status_code in (401, 403):
+        raise FinvizTokenError(
+            f"FinViz rejected token (HTTP {response.status_code}) for {ticker} ({timeframe})"
+        )
 
     if response.status_code != 200:
         print(f"[FinViz] Error {response.status_code} for {ticker} ({timeframe})")

@@ -147,6 +147,27 @@ def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]
 
+    # ── Momentum: Pressure ROC (Rate of Change)
+    #   ROC_t = (Pressure_t − Pressure_{t-n}) / Pressure_{t-n} × 100
+    # 한 칸 전(n=1) 대비 변화율. buy/sell 압력의 가속/감속을 측정.
+    #
+    # 주의: 세션 경계(날짜)에서 끊어 계산 → 전날 마지막 봉과 비교하지 않음.
+    # 또한 프리마켓(저거래) → 정규장(고거래) 전환 시 분모가 작아 ROC가 폭발하므로
+    # ±ROC_CLIP%로 클리핑해 스파이크를 억제하고 추세만 남긴다.
+    ROC_CLIP = 200.0
+    d = df_agg.index.date
+    df_agg["buy_pressure_roc"]  = (df_agg.groupby(d)["buy_pressure"].pct_change()  * 100).clip(-ROC_CLIP, ROC_CLIP)
+    df_agg["sell_pressure_roc"] = (df_agg.groupby(d)["sell_pressure"].pct_change() * 100).clip(-ROC_CLIP, ROC_CLIP)
+
+    # ── 정규장(09:30~16:00)만으로 계산한 ROC
+    # 정규장 봉끼리만 비교 → 애프터/프리마켓 전환 점프가 생기지 않음.
+    minutes = df_agg.index.hour * 60 + df_agg.index.minute
+    reg_mask = (minutes >= 570) & (minutes < 960)   # 9:30 ~ 16:00
+    for src, dst in [("buy_pressure", "buy_roc_reg"), ("sell_pressure", "sell_roc_reg")]:
+        reg = df_agg.loc[reg_mask, src]
+        roc = (reg.groupby(reg.index.date).pct_change() * 100).clip(-ROC_CLIP, ROC_CLIP)
+        df_agg[dst] = roc.reindex(df_agg.index)      # 정규장 봉만 값, 나머지는 NaN
+
     return df_agg
 
 

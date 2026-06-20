@@ -21,12 +21,13 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         shared_xaxes=True,
         row_heights=[0.34, 0.15, 0.22, 0.15, 0.14],
         vertical_spacing=0.03,
+        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],  # row5 보조축
         subplot_titles=(
             f"{ticker} — Candlestick",
             "Buy / Sell Volume (per bar)",
             "Cumulative Volume — session-reset (solid) vs all-time (toggle in legend)",
             "CVD (Cumulative Volume Delta, session-reset)",
-            "Buy Ratio — buy / (buy + sell)"
+            "Buy Ratio (left) + Pressure ROC / Momentum (right, toggle in legend)"
         )
     )
 
@@ -135,7 +136,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             row=4, col=1
         )
 
-        # ── Buy Ratio (row 5) — buy / (buy+sell), 0~1
+        # ── Buy Ratio (row 5, 왼쪽 축) — buy / (buy+sell), 0~1
         ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
         fig.add_trace(
             go.Scatter(
@@ -146,10 +147,32 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
                 showlegend=(tf == default_tf),
                 hovertemplate="<b>%{x}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
             ),
-            row=5, col=1
+            row=5, col=1, secondary_y=False
         )
 
-    n_traces = 3 + 6 + 2  # 캔들 + buy/sell bar + cumulative 6 + CVD + ratio
+        # ── Pressure ROC / Momentum (row 5, 오른쪽 축) — 기본 숨김(legend 토글)
+        # 전체(all-hours) 2개 + 정규장(regular-hours) 2개
+        vis_mom = "legendonly" if visible else False
+        mom_specs = [
+            ("Buy ROC % (all)",  "buy_pressure_roc",  "#26a69a"),
+            ("Sell ROC % (all)", "sell_pressure_roc", "#ef5350"),
+            ("Buy ROC % (reg)",  "buy_roc_reg",       "#80cbc4"),
+            ("Sell ROC % (reg)", "sell_roc_reg",      "#ef9a9a"),
+        ]
+        for name, col, color in mom_specs:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index, y=df[col],
+                    mode="lines", name=name,
+                    line=dict(color=color, width=1.2, dash="dot"), connectgaps=True,
+                    visible=vis_mom,
+                    showlegend=(tf == default_tf),
+                    hovertemplate=f"<b>%{{x}}</b><br>{name}: %{{y:.1f}}%<extra></extra>",
+                ),
+                row=5, col=1, secondary_y=True
+            )
+
+    n_traces = 3 + 6 + 2 + 4  # 캔들 + buy/sell bar + cumulative 6 + CVD + ratio + momentum 4
 
     # x축 공백 제거 규칙 (intraday는 주말+장외, daily 이상은 주말만)
     # FinViz는 프리마켓(04:00) ~ 애프터마켓(20:00)까지 제공.
@@ -175,16 +198,17 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         for j in range(len(timeframes)):
             if j == i:
                 # candle + buy/sell bar + 3 reset lines = True (6),
-                # 3 all-time lines = legendonly (3), CVD + ratio = True (2)
-                visibility += [True] * 6 + ["legendonly"] * 3 + [True] * 2
+                # 3 all-time lines = legendonly (3), CVD + ratio = True (2),
+                # 4 momentum lines = legendonly (4)
+                visibility += [True] * 6 + ["legendonly"] * 3 + [True] * 2 + ["legendonly"] * 4
             else:
                 visibility += [False] * n_traces
 
-        # 선택된 tf의 trace만 legend에 표시 (candle 제외한 10개)
+        # 선택된 tf의 trace만 legend에 표시 (candle 제외한 14개)
         showlegend = []
         for j in range(len(timeframes)):
             if j == i:
-                showlegend += [False] + [True] * 10   # candle=False, 나머지 10개=True
+                showlegend += [False] + [True] * 14   # candle=False, 나머지 14개=True
             else:
                 showlegend += [False] * n_traces
 
@@ -206,6 +230,27 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             ]
         ))
 
+    # ── 시간대 필터 버튼 (rangebreak만 전환, intraday 전용)
+    weekend = dict(bounds=["sat", "mon"])
+    session_break_sets = {
+        "All hours":  [weekend, dict(bounds=[20, 4], pattern="hour")],                                    # 04:00~20:00
+        "Regular":    [weekend, dict(bounds=[16, 9.5], pattern="hour")],                                  # 09:30~16:00
+        "Extended":   [weekend, dict(bounds=[9.5, 16], pattern="hour"), dict(bounds=[20, 4], pattern="hour")],  # 프리+애프터만
+    }
+    session_buttons = []
+    for label, brk in session_break_sets.items():
+        session_buttons.append(dict(
+            label=label,
+            method="relayout",
+            args=[{
+                "xaxis.rangebreaks":  brk,
+                "xaxis2.rangebreaks": brk,
+                "xaxis3.rangebreaks": brk,
+                "xaxis4.rangebreaks": brk,
+                "xaxis5.rangebreaks": brk,
+            }]
+        ))
+
     # ── 레이아웃
     fig.update_layout(
         title=dict(
@@ -218,26 +263,42 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         bargap=0.1,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
-        margin=dict(l=60, r=40, t=100, b=40),
-        updatemenus=[dict(
-            type="buttons",
-            direction="right",
-            x=0.0, y=1.12,
-            xanchor="left",
-            buttons=buttons,
-            bgcolor="#2d2d2d",
-            bordercolor="#555",
-            font=dict(color="white"),
-            active=default_idx,
-        )]
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0),
+        margin=dict(l=60, r=40, t=130, b=120),
+        updatemenus=[
+            # 1) Timeframe 선택
+            dict(
+                type="buttons",
+                direction="right",
+                x=0.0, y=1.12,
+                xanchor="left",
+                buttons=buttons,
+                bgcolor="#2d2d2d",
+                bordercolor="#555",
+                font=dict(color="white"),
+                active=default_idx,
+            ),
+            # 2) 시간대 필터 (intraday 전용) — rangebreak만 전환
+            dict(
+                type="buttons",
+                direction="right",
+                x=0.0, y=1.06,
+                xanchor="left",
+                buttons=session_buttons,
+                bgcolor="#1e1e1e",
+                bordercolor="#555",
+                font=dict(color="#bbbbbb"),
+                active=0,
+            ),
+        ]
     )
 
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
     fig.update_yaxes(title_text="Cum. Volume", row=3, col=1)
     fig.update_yaxes(title_text="CVD", row=4, col=1)
-    fig.update_yaxes(title_text="Buy Ratio", row=5, col=1, tickformat=".0%", range=[0, 1])
+    fig.update_yaxes(title_text="Buy Ratio", row=5, col=1, tickformat=".0%", range=[0, 1], secondary_y=False)
+    fig.update_yaxes(title_text="ROC %", row=5, col=1, secondary_y=True)
     fig.update_xaxes(title_text="Time", row=5, col=1)
 
     # 기준선들
@@ -251,11 +312,22 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     return fig
 
 
-def show_chart(ticker: str = "NVDA", save_html: bool = True):
+def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = True):
+    ticker = ticker.upper()
     df_1min, frames = run_pipeline(ticker)
 
+    # 데이터가 없으면 FinViz에서 자동으로 받아온 뒤 재시도
+    if (df_1min.empty or not frames) and auto_fetch:
+        print(f"[Visualizer] No data for {ticker} — fetching from FinViz...")
+        try:
+            from finviz.new_finviz import fetch_and_save
+            fetch_and_save(ticker, timeframe="i1")
+            df_1min, frames = run_pipeline(ticker)
+        except Exception as e:
+            print(f"[Visualizer] Auto-fetch failed: {e}")
+
     if df_1min.empty or not frames:
-        print(f"[Visualizer] No data for {ticker}.")
+        print(f"[Visualizer] No data for {ticker}. Aborting.")
         return
 
     fig = build_chart(df_1min, frames, ticker)
@@ -269,4 +341,7 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True):
 
 
 if __name__ == "__main__":
-    show_chart("NVDA")
+    import sys
+    # 사용법: python -m cvd.visualizer [TICKER]
+    ticker = sys.argv[1] if len(sys.argv) > 1 else "NVDA"
+    show_chart(ticker)
