@@ -1,10 +1,13 @@
 """
 cvd/visualizer.py
 -----------------
-Bookmap-style Chart:
-  - 상단: 캔들스틱
-  - 하단: 양방향 바차트 (위=Buy, 아래=Sell)
-  - 버튼: 1min / 3min / 5min / 15min / 1hr 전환
+Bookmap-style chart (5 stacked panels):
+  1. Candlestick
+  2. Buy/Sell volume per bar (two-sided: Buy up, Sell down)
+  3. Cumulative volume (session-reset + all-time)
+  4. CVD (session-reset cumulative delta)
+  5. Buy ratio (left axis) + Pressure ROC / momentum (right axis)
+Timeframe buttons (1min ... 1month) + session-hours filter buttons.
 """
 
 import numpy as np
@@ -21,7 +24,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         shared_xaxes=True,
         row_heights=[0.34, 0.15, 0.22, 0.15, 0.14],
         vertical_spacing=0.03,
-        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],  # row5 보조축
+        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],  # row5 has a right-side axis
         subplot_titles=(
             f"{ticker} — Candlestick",
             "Buy / Sell Volume (per bar)",
@@ -35,13 +38,13 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     default_tf = "1hr"
     default_idx = timeframes.index(default_tf)
 
-    # ── 각 timeframe별 trace 쌍 추가 (처음엔 default만 visible)
-    # trace 순서: 각 tf마다 [캔들, buy bar, sell bar] = 3개씩
+    # ── Add every timeframe's traces up front (only the default is visible).
+    # Each timeframe contributes 15 traces; buttons just toggle visibility.
     for i, tf in enumerate(timeframes):
         df = frames[tf]
         visible = (tf == default_tf)
 
-        # 1. 캔들스틱
+        # 1. Candlestick
         fig.add_trace(
             go.Candlestick(
                 x=df.index,
@@ -58,7 +61,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             row=1, col=1
         )
 
-        # 2. Buy 바 (양수, 위)
+        # 2. Buy bar (positive, points up)
         fig.add_trace(
             go.Bar(
                 x=df.index,
@@ -72,11 +75,11 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             row=2, col=1
         )
 
-        # 3. Sell 바 (음수, 아래)
+        # 3. Sell bar (negative, points down)
         fig.add_trace(
             go.Bar(
                 x=df.index,
-                y=-df["sell_pressure"],   # 음수로 뒤집어서 아래로
+                y=-df["sell_pressure"],   # flipped negative so it points downward
                 name="Sell Volume",
                 marker_color="rgba(239, 83, 80, 0.8)",
                 visible=visible,
@@ -88,17 +91,17 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         )
 
         # ── Cumulative lines (row 3)
-        # 세션(하루)별 리셋 누적 — 기본 표시
+        # Session (daily) reset cumulative — shown by default
         d = df.index.date
         cumR_total = df["volume"].groupby(d).cumsum()
         cumR_buy   = df["buy_pressure"].groupby(d).cumsum()
         cumR_sell  = df["sell_pressure"].groupby(d).cumsum()
-        # 전체 누적 — legend에서 토글
+        # All-time cumulative — toggled from the legend
         cumA_total = df["volume"].cumsum()
         cumA_buy   = df["buy_pressure"].cumsum()
         cumA_sell  = df["sell_pressure"].cumsum()
 
-        # 표시 상태: 선택된 tf의 세션리셋은 보이고, 전체누적은 legendonly(숨김)
+        # Visibility: the selected tf shows reset lines; all-time lines are legendonly (hidden)
         vis_reset = visible
         vis_all   = "legendonly" if visible else False
 
@@ -123,7 +126,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
                 row=3, col=1
             )
 
-        # ── CVD (row 4) — 세션 리셋된 누적 델타, 0 기준 등락
+        # ── CVD (row 4) — session-reset cumulative delta, oscillates around 0
         fig.add_trace(
             go.Scatter(
                 x=df.index, y=df["cvd_end"],
@@ -136,7 +139,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             row=4, col=1
         )
 
-        # ── Buy Ratio (row 5, 왼쪽 축) — buy / (buy+sell), 0~1
+        # ── Buy Ratio (row 5, left axis) — buy / (buy+sell), range 0~1
         ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
         fig.add_trace(
             go.Scatter(
@@ -150,8 +153,8 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             row=5, col=1, secondary_y=False
         )
 
-        # ── Pressure ROC / Momentum (row 5, 오른쪽 축) — 기본 숨김(legend 토글)
-        # 전체(all-hours) 2개 + 정규장(regular-hours) 2개
+        # ── Pressure ROC / Momentum (row 5, right axis) — hidden by default (legend toggle)
+        # 2 all-hours lines + 2 regular-hours lines
         vis_mom = "legendonly" if visible else False
         mom_specs = [
             ("Buy ROC % (all)",  "buy_pressure_roc",  "#26a69a"),
@@ -172,17 +175,17 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
                 row=5, col=1, secondary_y=True
             )
 
-    n_traces = 3 + 6 + 2 + 4  # 캔들 + buy/sell bar + cumulative 6 + CVD + ratio + momentum 4
+    n_traces = 3 + 6 + 2 + 4  # candle + buy/sell bars + cumulative 6 + CVD + ratio + momentum 4
 
-    # x축 공백 제거 규칙 (intraday는 주말+장외, daily 이상은 주말만)
-    # FinViz는 프리마켓(04:00) ~ 애프터마켓(20:00)까지 제공.
-    # 데이터 없는 야간(20:00~04:00)만 숨겨 공백 제거.
+    # x-axis gap-removal rules (intraday: weekend + overnight; daily: weekend only).
+    # FinViz provides pre-market (04:00) through after-hours (20:00), so only the
+    # true overnight gap (20:00~04:00) is hidden.
     intraday_breaks = [
         dict(bounds=["sat", "mon"]),
         dict(bounds=[20, 4], pattern="hour"),
     ]
     daily_breaks = [dict(bounds=["sat", "mon"])]
-    no_breaks = []   # 주봉/월봉: 라벨이 주말에 걸릴 수 있어 break 미적용
+    no_breaks = []   # week/month: labels can land on weekends, so apply no breaks
 
     def breaks_for(tf):
         if tf in WEEK_OR_ABOVE:
@@ -191,24 +194,24 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             return daily_breaks
         return intraday_breaks
 
-    # ── 버튼: 각 timeframe 선택 시 해당 3개 trace만 visible + rangebreak 전환
+    # ── Buttons: selecting a timeframe makes only its traces visible + swaps rangebreaks
     buttons = []
     for i, tf in enumerate(timeframes):
         visibility = []
         for j in range(len(timeframes)):
             if j == i:
-                # candle + buy/sell bar + 3 reset lines = True (6),
+                # candle + buy/sell bars + 3 reset lines = True (6),
                 # 3 all-time lines = legendonly (3), CVD + ratio = True (2),
                 # 4 momentum lines = legendonly (4)
                 visibility += [True] * 6 + ["legendonly"] * 3 + [True] * 2 + ["legendonly"] * 4
             else:
                 visibility += [False] * n_traces
 
-        # 선택된 tf의 trace만 legend에 표시 (candle 제외한 14개)
+        # Only the selected tf's traces appear in the legend (14, excluding the candle)
         showlegend = []
         for j in range(len(timeframes)):
             if j == i:
-                showlegend += [False] + [True] * 14   # candle=False, 나머지 14개=True
+                showlegend += [False] + [True] * 14   # candle=False, the other 14=True
             else:
                 showlegend += [False] * n_traces
 
@@ -230,12 +233,12 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             ]
         ))
 
-    # ── 시간대 필터 버튼 (rangebreak만 전환, intraday 전용)
+    # ── Session-hours filter buttons (swap rangebreaks only; intraday-oriented)
     weekend = dict(bounds=["sat", "mon"])
     session_break_sets = {
-        "All hours":  [weekend, dict(bounds=[20, 4], pattern="hour")],                                    # 04:00~20:00
-        "Regular":    [weekend, dict(bounds=[16, 9.5], pattern="hour")],                                  # 09:30~16:00
-        "Extended":   [weekend, dict(bounds=[9.5, 16], pattern="hour"), dict(bounds=[20, 4], pattern="hour")],  # 프리+애프터만
+        "All hours":  [weekend, dict(bounds=[20, 4], pattern="hour")],                                    # show 04:00~20:00
+        "Regular":    [weekend, dict(bounds=[16, 9.5], pattern="hour")],                                  # show 09:30~16:00
+        "Extended":   [weekend, dict(bounds=[9.5, 16], pattern="hour"), dict(bounds=[20, 4], pattern="hour")],  # pre + after only
     }
     session_buttons = []
     for label, brk in session_break_sets.items():
@@ -251,7 +254,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             }]
         ))
 
-    # ── 레이아웃
+    # ── Layout
     fig.update_layout(
         title=dict(
             text=f"<b>{ticker}</b> — {default_tf} Bookmap-style CVD Chart",
@@ -266,7 +269,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0),
         margin=dict(l=60, r=40, t=130, b=120),
         updatemenus=[
-            # 1) Timeframe 선택
+            # 1) Timeframe selector
             dict(
                 type="buttons",
                 direction="right",
@@ -278,7 +281,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
                 font=dict(color="white"),
                 active=default_idx,
             ),
-            # 2) 시간대 필터 (intraday 전용) — rangebreak만 전환
+            # 2) Session-hours filter (intraday) — swaps rangebreaks only
             dict(
                 type="buttons",
                 direction="right",
@@ -301,12 +304,12 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     fig.update_yaxes(title_text="ROC %", row=5, col=1, secondary_y=True)
     fig.update_xaxes(title_text="Time", row=5, col=1)
 
-    # 기준선들
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)   # buy/sell
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=4, col=1)   # CVD 0
+    # Reference lines
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)   # buy/sell zero
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=4, col=1)   # CVD zero
     fig.add_hline(y=0.5, line=dict(color="gray", width=0.8, dash="dot"), row=5, col=1) # ratio 50%
 
-    # 장 마감 + 주말 공백 제거 (default = 1hr, intraday)
+    # Remove weekend/overnight gaps (default = 1hr, intraday)
     fig.update_xaxes(rangebreaks=breaks_for(default_tf))
 
     return fig
@@ -316,7 +319,7 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = 
     ticker = ticker.upper()
     df_1min, frames = run_pipeline(ticker)
 
-    # 데이터가 없으면 FinViz에서 자동으로 받아온 뒤 재시도
+    # If there's no data, auto-fetch from FinViz then retry once
     if (df_1min.empty or not frames) and auto_fetch:
         print(f"[Visualizer] No data for {ticker} — fetching from FinViz...")
         try:
@@ -342,6 +345,6 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = 
 
 if __name__ == "__main__":
     import sys
-    # 사용법: python -m cvd.visualizer [TICKER]
+    # Usage: python -m cvd.visualizer [TICKER]
     ticker = sys.argv[1] if len(sys.argv) > 1 else "NVDA"
     show_chart(ticker)

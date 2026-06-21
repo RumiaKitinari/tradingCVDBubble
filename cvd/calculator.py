@@ -14,7 +14,7 @@ from pymongo import MongoClient
 
 def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
     """
-    Returning buy/sell volumn from one candle(OHLCV).
+    Return estimated buy/sell volume from one candle (OHLCV).
     """
     spread = h - l
 
@@ -22,29 +22,29 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
     if spread == 0:
         return {"buying_volume": v / 2, "selling_volume": v / 2, "delta": 0.0}
 
-    # ── Wick Calculation
-    if c > o: #Bullish
+    # ── Wick calculation (direction-aware)
+    if c > o:  # Bullish
         upper_wick = h - c
         lower_wick = o - l
-    else: #Bearish
+    else:      # Bearish
         upper_wick = h - o
         lower_wick = c - l
 
     body = spread - upper_wick - lower_wick
 
-    # ── Calculate percentage
+    # ── Convert each component to a percentage of the spread
     pct_upper = upper_wick / spread
     pct_lower = lower_wick / spread
     pct_body  = body / spread
 
-    # Half of a wick -> assigned equally to buying/selling volumn
+    # Wicks are contested zones -> split equally between buyers and sellers
     half_wicks = (pct_upper + pct_lower) / 2
 
-    # ── Volumn Distribution
-    if c > o:   # Bullish: Buying = Body + half_wick
+    # ── Volume distribution
+    if c > o:   # Bullish: buyers take the body + half of the wicks
         buying_volume  = (pct_body + half_wicks) * v
         selling_volume = half_wicks * v
-    else:       # Bearish: Selling = body + half_wick
+    else:       # Bearish: sellers take the body + half of the wicks
         buying_volume  = half_wicks * v
         selling_volume = (pct_body + half_wicks) * v
 
@@ -63,18 +63,20 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
 
 def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    1분봉 DataFrame을 받아서 아래 컬럼 추가 후 반환:
-        buying_volume  - 해당 봉의 매수 거래량
-        selling_volume - 해당 봉의 매도 거래량
-        delta          - 봉 하나의 매수-매도 차이
-        cvd            - 누적 delta (CVD: Cumulative Volume Delta)
+    Take a 1-min DataFrame and return it with these added columns:
+        buying_volume  - estimated buy volume of that bar
+        selling_volume - estimated sell volume of that bar
+        delta          - buying_volume - selling_volume for that bar
+        cvd            - cumulative delta (CVD), reset each trading day
 
-    df에는 open/high/low/close/volume 컬럼이 있어야 함.
-    date 컬럼이 있으면 자동으로 인덱스로 변환.
+    The df must have open/high/low/close/volume columns.
+    If a 'date' column exists it is converted to the index automatically.
     """
     df = df.copy()
 
-    # date 컬럼 → datetime 인덱스로
+    # Convert the 'date' column into a datetime index.
+    # FinViz formats time as 24-hour but still appends AM/PM (e.g. "13:00 PM"),
+    # so strip the trailing AM/PM before parsing as %H:%M.
     if "date" in df.columns:
         df["date"] = pd.to_datetime(
             df["date"].str.replace(r'\s*(AM|PM)$', '', regex=True),
@@ -83,7 +85,8 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
         df = df.set_index("date").sort_index()
 
-    # 봉마다 분해 적용
+    # Apply decompose_candle to every row; result_type="expand" turns the
+    # returned dict into separate columns.
     results = df.apply(
         lambda row: decompose_candle(
             row["open"], row["high"], row["low"], row["close"], row["volume"]
@@ -96,14 +99,14 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["selling_volume"] = results["selling_volume"]
     df["delta"]          = results["delta"]
 
-    # CVD: 매일 세션(날짜)마다 0에서 리셋
+    # CVD: cumulative delta, reset to 0 at the start of each trading day (session)
     df["cvd"] = df.groupby(df.index.date)["delta"].cumsum()
 
     return df
 
 
 # ─────────────────────────────────────────
-# 3. 1분봉 → N분봉 Buy/Sell Pressure 집계
+# 3. Aggregate 1-min bars into N-min Buy/Sell Pressure
 # ─────────────────────────────────────────
 
 TIMEFRAME_RULE = {
@@ -126,10 +129,10 @@ WEEK_OR_ABOVE = {"1week", "1month"}
 
 def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.DataFrame:
     """
-    1분봉 DataFrame(add_cvd_columns 처리 완료)을 받아
-    지정한 timeframe으로 집계한 DataFrame 반환.
+    Take a 1-min DataFrame (already processed by add_cvd_columns) and
+    return it resampled/aggregated to the given timeframe.
 
-    timeframe: "1min" | "3min" | "5min" | "15min" | "1hr"
+    timeframe: one of the keys in TIMEFRAME_RULE (e.g. "1min", "1hr", "1day").
     """
     rule = TIMEFRAME_RULE.get(timeframe, "1h")
 
@@ -149,35 +152,37 @@ def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
 
     # ── Momentum: Pressure ROC (Rate of Change)
     #   ROC_t = (Pressure_t − Pressure_{t-n}) / Pressure_{t-n} × 100
-    # 한 칸 전(n=1) 대비 변화율. buy/sell 압력의 가속/감속을 측정.
+    # Percent change vs. the previous bar (n=1): measures how fast buy/sell
+    # pressure is accelerating or decelerating.
     #
-    # 주의: 세션 경계(날짜)에서 끊어 계산 → 전날 마지막 봉과 비교하지 않음.
-    # 또한 프리마켓(저거래) → 정규장(고거래) 전환 시 분모가 작아 ROC가 폭발하므로
-    # ±ROC_CLIP%로 클리핑해 스파이크를 억제하고 추세만 남긴다.
+    # Note: computed within each session (by date) so it never compares against
+    # the previous day's last bar. Also, the pre-market (low volume) -> regular
+    # open (high volume) transition makes the denominator tiny and blows the ROC
+    # up, so we clip to ±ROC_CLIP% to suppress spikes and keep only the trend.
     ROC_CLIP = 200.0
     d = df_agg.index.date
     df_agg["buy_pressure_roc"]  = (df_agg.groupby(d)["buy_pressure"].pct_change()  * 100).clip(-ROC_CLIP, ROC_CLIP)
     df_agg["sell_pressure_roc"] = (df_agg.groupby(d)["sell_pressure"].pct_change() * 100).clip(-ROC_CLIP, ROC_CLIP)
 
-    # ── 정규장(09:30~16:00)만으로 계산한 ROC
-    # 정규장 봉끼리만 비교 → 애프터/프리마켓 전환 점프가 생기지 않음.
+    # ── ROC computed using regular-hours bars only (09:30~16:00)
+    # Comparing regular-hours bars to each other avoids the after/pre-market jump.
     minutes = df_agg.index.hour * 60 + df_agg.index.minute
     reg_mask = (minutes >= 570) & (minutes < 960)   # 9:30 ~ 16:00
     for src, dst in [("buy_pressure", "buy_roc_reg"), ("sell_pressure", "sell_roc_reg")]:
         reg = df_agg.loc[reg_mask, src]
         roc = (reg.groupby(reg.index.date).pct_change() * 100).clip(-ROC_CLIP, ROC_CLIP)
-        df_agg[dst] = roc.reindex(df_agg.index)      # 정규장 봉만 값, 나머지는 NaN
+        df_agg[dst] = roc.reindex(df_agg.index)      # value on regular-hours bars only, NaN elsewhere
 
     return df_agg
 
 
 # ─────────────────────────────────────────
-# 4. MongoDB에서 데이터 불러오기
+# 4. Load data from MongoDB
 # ─────────────────────────────────────────
 
 def load_from_mongo(ticker: str, timeframe: str = "i1") -> pd.DataFrame:
     """
-    MongoDB finviz_db.candles에서 특정 ticker/timeframe 데이터 로드.
+    Load a given ticker/timeframe from MongoDB finviz_db.candles.
     """
     client = MongoClient("mongodb://localhost:27017/")
     collection = client["finviz_db"]["candles"]
@@ -197,16 +202,16 @@ def load_from_mongo(ticker: str, timeframe: str = "i1") -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────
-# 5. 전체 파이프라인 한 번에 실행
+# 5. Run the whole pipeline at once
 # ─────────────────────────────────────────
 
 def run_pipeline(ticker: str) -> tuple[pd.DataFrame, dict]:
     """
-    MongoDB에서 1분봉 로드 → CVD 계산 → 모든 timeframe 집계 → 반환.
+    Load 1-min bars from MongoDB -> compute CVD -> aggregate every timeframe.
 
     Returns:
-        df_1min : 1분봉 + buying_volume / selling_volume / delta / cvd 컬럼
-        frames  : {"1min": df, "3min": df, "5min": df, "15min": df, "1hr": df}
+        df_1min : 1-min bars + buying_volume / selling_volume / delta / cvd columns
+        frames  : {"1min": df, "3min": df, ..., "1month": df}
     """
     print(f"\n{'='*50}")
     print(f"  Pipeline: {ticker}")
@@ -229,7 +234,7 @@ def run_pipeline(ticker: str) -> tuple[pd.DataFrame, dict]:
     return df_1min, frames
 
 
-# ── 직접 실행 시 테스트
+# ── Quick test when run directly
 if __name__ == "__main__":
     df_1min, frames = run_pipeline("NVDA")
     if not df_1min.empty:
