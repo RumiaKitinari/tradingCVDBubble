@@ -99,8 +99,10 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["selling_volume"] = results["selling_volume"]
     df["delta"]          = results["delta"]
 
-    # CVD: cumulative delta, reset to 0 at the start of each trading day (session)
+    # CVD (session-reset): cumulative delta, reset to 0 each trading day
     df["cvd"] = df.groupby(df.index.date)["delta"].cumsum()
+    # CVD (all-time): cumulative delta over the entire series, never reset
+    df["cvd_all"] = df["delta"].cumsum()
 
     return df
 
@@ -145,7 +147,8 @@ def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         buy_pressure=("buying_volume",  "sum"),
         sell_pressure=("selling_volume","sum"),
         delta_sum=("delta",          "sum"),
-        cvd_end=("cvd",              "last"),
+        cvd_end=("cvd",              "last"),   # CVD session-reset at bar's end
+        cvd_all_end=("cvd_all",      "last"),   # CVD all-time at bar's end
     ).dropna(subset=["open"])
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]

@@ -1,316 +1,249 @@
 """
 cvd/visualizer.py
 -----------------
-Bookmap-style chart (5 stacked panels):
-  1. Candlestick
-  2. Buy/Sell volume per bar (two-sided: Buy up, Sell down)
-  3. Cumulative volume (session-reset + all-time)
-  4. CVD (session-reset cumulative delta)
-  5. Buy ratio (left axis) + Pressure ROC / momentum (right axis)
-Timeframe buttons (1min ... 1month) + session-hours filter buttons.
+Two-screen Bookmap-style chart:
+  Screen 1 (large): candlestick only
+  Screen 2:         Buy/Sell volume (default) + CVD all-time + CVD session-reset
+                    + Total cumulative volume + Buy ratio (right axis), all legend-toggled
+
+Timeframe buttons auto-scale the x-axis (and y-axis) to a sensible default span
+per timeframe. A second button row filters trading hours (All / Regular / Extended).
 """
 
-import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE
 
 
+# Default visible span per timeframe (how far back from the last bar to show).
+DEFAULT_SPAN = {
+    "1min":   pd.Timedelta(hours=12),
+    "3min":   pd.Timedelta(days=1),
+    "5min":   pd.Timedelta(days=1),
+    "15min":  pd.Timedelta(days=2),
+    "1hr":    pd.Timedelta(days=7),
+    "3hr":    pd.Timedelta(days=21),
+    "1day":   pd.Timedelta(days=90),
+    "1week":  pd.Timedelta(days=365),
+    "1month": pd.Timedelta(days=1095),
+}
+
+PAD = 0.05   # y-axis padding (5% above/below the data in view)
+
+
+def _span_window(df, tf):
+    """Return (x_start, x_end) for the default view of this timeframe."""
+    x_end = df.index.max()
+    x_start = x_end - DEFAULT_SPAN[tf]
+    # don't go before the first bar
+    if x_start < df.index.min():
+        x_start = df.index.min()
+    return x_start, x_end
+
+
+def _yrange(series, lo_extra=PAD, hi_extra=PAD):
+    """Min/max of a series with padding; returns None if empty/all-NaN."""
+    s = series.dropna()
+    if s.empty:
+        return None
+    lo, hi = float(s.min()), float(s.max())
+    if lo == hi:
+        lo, hi = lo - 1, hi + 1
+    rng = hi - lo
+    return [lo - rng * lo_extra, hi + rng * hi_extra]
+
+
 def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
 
     fig = make_subplots(
-        rows=5, cols=1,
+        rows=2, cols=1,
         shared_xaxes=True,
-        row_heights=[0.34, 0.15, 0.22, 0.15, 0.14],
-        vertical_spacing=0.03,
-        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],  # row5 has a right-side axis
+        row_heights=[0.60, 0.40],
+        vertical_spacing=0.05,
+        specs=[[{}], [{"secondary_y": True}]],   # screen 2 has a right axis (Buy Ratio)
         subplot_titles=(
             f"{ticker} — Candlestick",
-            "Buy / Sell Volume (per bar)",
-            "Cumulative Volume — session-reset (solid) vs all-time (toggle in legend)",
-            "CVD (Cumulative Volume Delta, session-reset)",
-            "Buy Ratio (left) + Pressure ROC / Momentum (right, toggle in legend)"
+            "Buy/Sell Volume (default) · CVD · Total Cumulative · Buy Ratio (toggle in legend)",
         )
     )
 
-    timeframes = list(TIMEFRAME_RULE.keys())   # ["1min","3min","5min","15min","1hr"]
+    timeframes = list(TIMEFRAME_RULE.keys())
     default_tf = "1hr"
     default_idx = timeframes.index(default_tf)
 
-    # ── Add every timeframe's traces up front (only the default is visible).
-    # Each timeframe contributes 15 traces; buttons just toggle visibility.
-    for i, tf in enumerate(timeframes):
+    # Each timeframe contributes this many traces, in this fixed order:
+    #   0 candle | 1 buy bar | 2 sell bar | 3 CVD all | 4 CVD reset
+    #   5 cum total | 6 buy ratio
+    N_TRACES = 7
+
+    for tf in timeframes:
         df = frames[tf]
-        visible = (tf == default_tf)
+        on = (tf == default_tf)
+        # default-ON traces: candle + buy/sell bars; the rest start legend-only
+        v_main = on                       # candle + bars
+        v_opt  = "legendonly" if on else False
 
-        # 1. Candlestick
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index,
-                open=df["open"], high=df["high"],
-                low=df["low"],   close=df["close"],
-                name=f"Candle ({tf})",
-                increasing_line_color="#26a69a",
-                decreasing_line_color="#ef5350",
-                increasing_fillcolor="#26a69a",
-                decreasing_fillcolor="#ef5350",
-                visible=visible,
-                showlegend=False,
-            ),
-            row=1, col=1
-        )
+        # 1. Candlestick (screen 1)
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name=f"Candle ({tf})",
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+            increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+            visible=v_main, showlegend=False,
+        ), row=1, col=1)
 
-        # 2. Buy bar (positive, points up)
-        fig.add_trace(
-            go.Bar(
-                x=df.index,
-                y=df["buy_pressure"],
-                name="Buy Volume",
-                marker_color="rgba(38, 166, 154, 0.8)",
-                visible=visible,
-                showlegend=(tf == default_tf),
-                hovertemplate="<b>%{x}</b><br>Buy: %{y:,.0f}<extra></extra>",
-            ),
-            row=2, col=1
-        )
+        # 2. Buy bar (screen 2, up)
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["buy_pressure"], name="Buy Volume",
+            marker_color="rgba(38,166,154,0.85)", visible=v_main, showlegend=on,
+            hovertemplate="<b>%{x}</b><br>Buy: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=False)
 
-        # 3. Sell bar (negative, points down)
-        fig.add_trace(
-            go.Bar(
-                x=df.index,
-                y=-df["sell_pressure"],   # flipped negative so it points downward
-                name="Sell Volume",
-                marker_color="rgba(239, 83, 80, 0.8)",
-                visible=visible,
-                showlegend=(tf == default_tf),
-                hovertemplate="<b>%{x}</b><br>Sell: %{customdata:,.0f}<extra></extra>",
-                customdata=df["sell_pressure"],
-            ),
-            row=2, col=1
-        )
+        # 3. Sell bar (screen 2, down)
+        fig.add_trace(go.Bar(
+            x=df.index, y=-df["sell_pressure"], name="Sell Volume",
+            marker_color="rgba(239,83,80,0.85)", visible=v_main, showlegend=on,
+            customdata=df["sell_pressure"],
+            hovertemplate="<b>%{x}</b><br>Sell: %{customdata:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=False)
 
-        # ── Cumulative lines (row 3)
-        # Session (daily) reset cumulative — shown by default
-        d = df.index.date
-        cumR_total = df["volume"].groupby(d).cumsum()
-        cumR_buy   = df["buy_pressure"].groupby(d).cumsum()
-        cumR_sell  = df["sell_pressure"].groupby(d).cumsum()
-        # All-time cumulative — toggled from the legend
-        cumA_total = df["volume"].cumsum()
-        cumA_buy   = df["buy_pressure"].cumsum()
-        cumA_sell  = df["sell_pressure"].cumsum()
+        # 4. CVD all-time
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
+            line=dict(color="#ba68c8", width=2), connectgaps=True,
+            visible=v_opt, showlegend=on,
+            hovertemplate="<b>%{x}</b><br>CVD all: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=False)
 
-        # Visibility: the selected tf shows reset lines; all-time lines are legendonly (hidden)
-        vis_reset = visible
-        vis_all   = "legendonly" if visible else False
+        # 5. CVD session-reset
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["cvd_end"], mode="lines", name="CVD (session)",
+            line=dict(color="#4fc3f7", width=2), connectgaps=True,
+            visible=v_opt, showlegend=on,
+            hovertemplate="<b>%{x}</b><br>CVD session: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=False)
 
-        cum_specs = [
-            ("Total (reset)", cumR_total, "#42a5f5", vis_reset),
-            ("Buy (reset)",   cumR_buy,   "#26a69a", vis_reset),
-            ("Sell (reset)",  cumR_sell,  "#ef5350", vis_reset),
-            ("Total (all)",   cumA_total, "#90caf9", vis_all),
-            ("Buy (all)",     cumA_buy,   "#80cbc4", vis_all),
-            ("Sell (all)",    cumA_sell,  "#ef9a9a", vis_all),
-        ]
-        for name, series, color, vis in cum_specs:
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index, y=series,
-                    mode="lines", name=f"Cum {name}",
-                    line=dict(color=color, width=2), connectgaps=True,
-                    visible=vis,
-                    showlegend=(tf == default_tf),
-                    hovertemplate=f"<b>%{{x}}</b><br>Cum {name}: %{{y:,.0f}}<extra></extra>",
-                ),
-                row=3, col=1
-            )
+        # 6. Total cumulative volume
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["volume"].cumsum(), mode="lines", name="Cumulative Volume",
+            line=dict(color="#ffd54f", width=2), connectgaps=True,
+            visible=v_opt, showlegend=on,
+            hovertemplate="<b>%{x}</b><br>Cum Vol: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=False)
 
-        # ── CVD (row 4) — session-reset cumulative delta, oscillates around 0
-        fig.add_trace(
-            go.Scatter(
-                x=df.index, y=df["cvd_end"],
-                mode="lines", name="CVD",
-                line=dict(color="#b39ddb", width=2), connectgaps=True,
-                visible=visible,
-                showlegend=(tf == default_tf),
-                hovertemplate="<b>%{x}</b><br>CVD: %{y:,.0f}<extra></extra>",
-            ),
-            row=4, col=1
-        )
-
-        # ── Buy Ratio (row 5, left axis) — buy / (buy+sell), range 0~1
+        # 7. Buy ratio (right axis)
         ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
-        fig.add_trace(
-            go.Scatter(
-                x=df.index, y=ratio,
-                mode="lines", name="Buy Ratio",
-                line=dict(color="#ffb74d", width=2), connectgaps=True,
-                visible=visible,
-                showlegend=(tf == default_tf),
-                hovertemplate="<b>%{x}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
-            ),
-            row=5, col=1, secondary_y=False
-        )
+        fig.add_trace(go.Scatter(
+            x=df.index, y=ratio, mode="lines", name="Buy Ratio",
+            line=dict(color="#ff9800", width=1.6, dash="dot"), connectgaps=True,
+            visible=v_opt, showlegend=on,
+            hovertemplate="<b>%{x}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
+        ), row=2, col=1, secondary_y=True)
 
-        # ── Pressure ROC / Momentum (row 5, right axis) — hidden by default (legend toggle)
-        # 2 all-hours lines + 2 regular-hours lines
-        vis_mom = "legendonly" if visible else False
-        mom_specs = [
-            ("Buy ROC % (all)",  "buy_pressure_roc",  "#26a69a"),
-            ("Sell ROC % (all)", "sell_pressure_roc", "#ef5350"),
-            ("Buy ROC % (reg)",  "buy_roc_reg",       "#80cbc4"),
-            ("Sell ROC % (reg)", "sell_roc_reg",      "#ef9a9a"),
-        ]
-        for name, col, color in mom_specs:
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index, y=df[col],
-                    mode="lines", name=name,
-                    line=dict(color=color, width=1.2, dash="dot"), connectgaps=True,
-                    visible=vis_mom,
-                    showlegend=(tf == default_tf),
-                    hovertemplate=f"<b>%{{x}}</b><br>{name}: %{{y:.1f}}%<extra></extra>",
-                ),
-                row=5, col=1, secondary_y=True
-            )
-
-    n_traces = 3 + 6 + 2 + 4  # candle + buy/sell bars + cumulative 6 + CVD + ratio + momentum 4
-
-    # x-axis gap-removal rules (intraday: weekend + overnight; daily: weekend only).
-    # FinViz provides pre-market (04:00) through after-hours (20:00), so only the
-    # true overnight gap (20:00~04:00) is hidden.
-    intraday_breaks = [
-        dict(bounds=["sat", "mon"]),
-        dict(bounds=[20, 4], pattern="hour"),
-    ]
+    # ── Rangebreak rules (hide empty x gaps) ──
+    intraday_breaks = [dict(bounds=["sat", "mon"]), dict(bounds=[20, 4], pattern="hour")]
     daily_breaks = [dict(bounds=["sat", "mon"])]
-    no_breaks = []   # week/month: labels can land on weekends, so apply no breaks
+    no_breaks = []
 
     def breaks_for(tf):
-        if tf in WEEK_OR_ABOVE:
-            return no_breaks
-        if tf in DAILY_OR_ABOVE:
-            return daily_breaks
+        if tf in WEEK_OR_ABOVE:  return no_breaks
+        if tf in DAILY_OR_ABOVE: return daily_breaks
         return intraday_breaks
 
-    # ── Buttons: selecting a timeframe makes only its traces visible + swaps rangebreaks
+    # ── Timeframe buttons: toggle visibility + auto x/y range + rangebreaks ──
     buttons = []
     for i, tf in enumerate(timeframes):
-        visibility = []
-        for j in range(len(timeframes)):
-            if j == i:
-                # candle + buy/sell bars + 3 reset lines = True (6),
-                # 3 all-time lines = legendonly (3), CVD + ratio = True (2),
-                # 4 momentum lines = legendonly (4)
-                visibility += [True] * 6 + ["legendonly"] * 3 + [True] * 2 + ["legendonly"] * 4
-            else:
-                visibility += [False] * n_traces
+        df = frames[tf]
 
-        # Only the selected tf's traces appear in the legend (14, excluding the candle)
+        # visibility for all timeframes' traces
+        visibility = []
+        for j, tf2 in enumerate(timeframes):
+            if j == i:
+                visibility += [True, True, True, "legendonly", "legendonly", "legendonly", "legendonly"]
+            else:
+                visibility += [False] * N_TRACES
         showlegend = []
         for j in range(len(timeframes)):
-            if j == i:
-                showlegend += [False] + [True] * 14   # candle=False, the other 14=True
-            else:
-                showlegend += [False] * n_traces
+            showlegend += ([False, True, True, True, True, True, True] if j == i
+                           else [False] * N_TRACES)
+
+        # auto x-range for the default view of this timeframe
+        x0, x1 = _span_window(df, tf)
+        in_view = df.loc[x0:x1]
+
+        # y-range: screen 1 (candle) fixed to high/low of the view;
+        # screen 2 uses autorange so it re-fits whenever you toggle a series.
+        y1 = _yrange(pd.concat([in_view["high"], in_view["low"]])) if not in_view.empty else None
 
         breaks = breaks_for(tf)
+        layout = {
+            "title": f"<b>{ticker}</b> — {tf}",
+            "xaxis.rangebreaks":  breaks,
+            "xaxis2.rangebreaks": breaks,
+            "xaxis.range":  [x0, x1],
+            "xaxis2.range": [x0, x1],
+            "yaxis2.autorange": True,   # screen 2 left axis re-fits on legend toggle
+        }
+        if y1: layout["yaxis.range"] = y1
 
         buttons.append(dict(
-            label=tf,
-            method="update",
-            args=[
-                {"visible": visibility, "showlegend": showlegend},
-                {
-                    "title": f"<b>{ticker}</b> — {tf} Bookmap-style CVD Chart",
-                    "xaxis.rangebreaks":  breaks,
-                    "xaxis2.rangebreaks": breaks,
-                    "xaxis3.rangebreaks": breaks,
-                    "xaxis4.rangebreaks": breaks,
-                    "xaxis5.rangebreaks": breaks,
-                }
-            ]
+            label=tf, method="update",
+            args=[{"visible": visibility, "showlegend": showlegend}, layout],
         ))
 
-    # ── Session-hours filter buttons (swap rangebreaks only; intraday-oriented)
+    # ── Session-hours filter buttons (rangebreaks only) ──
     weekend = dict(bounds=["sat", "mon"])
     session_break_sets = {
-        "All hours":  [weekend, dict(bounds=[20, 4], pattern="hour")],                                    # show 04:00~20:00
-        "Regular":    [weekend, dict(bounds=[16, 9.5], pattern="hour")],                                  # show 09:30~16:00
-        "Extended":   [weekend, dict(bounds=[9.5, 16], pattern="hour"), dict(bounds=[20, 4], pattern="hour")],  # pre + after only
+        "All hours": [weekend, dict(bounds=[20, 4], pattern="hour")],
+        "Regular":   [weekend, dict(bounds=[16, 9.5], pattern="hour")],
+        "Extended":  [weekend, dict(bounds=[9.5, 16], pattern="hour"), dict(bounds=[20, 4], pattern="hour")],
     }
-    session_buttons = []
-    for label, brk in session_break_sets.items():
-        session_buttons.append(dict(
-            label=label,
-            method="relayout",
-            args=[{
-                "xaxis.rangebreaks":  brk,
-                "xaxis2.rangebreaks": brk,
-                "xaxis3.rangebreaks": brk,
-                "xaxis4.rangebreaks": brk,
-                "xaxis5.rangebreaks": brk,
-            }]
-        ))
+    session_buttons = [
+        dict(label=lbl, method="relayout",
+             args=[{"xaxis.rangebreaks": brk, "xaxis2.rangebreaks": brk}])
+        for lbl, brk in session_break_sets.items()
+    ]
 
-    # ── Layout
+    # ── Layout ──
+    df0 = frames[default_tf]
+    x0, x1 = _span_window(df0, default_tf)
+    in0 = df0.loc[x0:x1]
+    y1_0 = _yrange(pd.concat([in0["high"], in0["low"]]))
+
     fig.update_layout(
-        title=dict(
-            text=f"<b>{ticker}</b> — {default_tf} Bookmap-style CVD Chart",
-            font=dict(size=18)
-        ),
+        title=dict(text=f"<b>{ticker}</b> — {default_tf}", font=dict(size=18)),
         template="plotly_dark",
-        height=1150,
+        height=900,
         barmode="overlay",
+        bargap=0.1,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        bargap=0.1,
-        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0),
-        margin=dict(l=60, r=40, t=130, b=120),
+        legend=dict(orientation="h", yanchor="top", y=-0.06, xanchor="left", x=0),
+        margin=dict(l=60, r=60, t=120, b=80),
         updatemenus=[
-            # 1) Timeframe selector
-            dict(
-                type="buttons",
-                direction="right",
-                x=0.0, y=1.12,
-                xanchor="left",
-                buttons=buttons,
-                bgcolor="#2d2d2d",
-                bordercolor="#555",
-                font=dict(color="white"),
-                active=default_idx,
-            ),
-            # 2) Session-hours filter (intraday) — swaps rangebreaks only
-            dict(
-                type="buttons",
-                direction="right",
-                x=0.0, y=1.06,
-                xanchor="left",
-                buttons=session_buttons,
-                bgcolor="#1e1e1e",
-                bordercolor="#555",
-                font=dict(color="#bbbbbb"),
-                active=0,
-            ),
-        ]
+            dict(type="buttons", direction="right", x=0.0, y=1.10, xanchor="left",
+                 buttons=buttons, bgcolor="#2d2d2d", bordercolor="#888",
+                 font=dict(color="white", size=12), active=default_idx),
+            dict(type="buttons", direction="right", x=0.0, y=1.04, xanchor="left",
+                 buttons=session_buttons, bgcolor="#1e1e1e", bordercolor="#888",
+                 font=dict(color="#cccccc", size=11), active=0),
+        ],
     )
 
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_yaxes(title_text="Cum. Volume", row=3, col=1)
-    fig.update_yaxes(title_text="CVD", row=4, col=1)
-    fig.update_yaxes(title_text="Buy Ratio", row=5, col=1, tickformat=".0%", range=[0, 1], secondary_y=False)
-    fig.update_yaxes(title_text="ROC %", row=5, col=1, secondary_y=True)
-    fig.update_xaxes(title_text="Time", row=5, col=1)
+    fig.update_yaxes(title_text="Volume / CVD", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Buy Ratio", row=2, col=1, secondary_y=True,
+                     tickformat=".0%", range=[0, 1])
+    fig.update_xaxes(title_text="Time", row=2, col=1)
 
-    # Reference lines
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)   # buy/sell zero
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=4, col=1)   # CVD zero
-    fig.add_hline(y=0.5, line=dict(color="gray", width=0.8, dash="dot"), row=5, col=1) # ratio 50%
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
 
-    # Remove weekend/overnight gaps (default = 1hr, intraday)
-    fig.update_xaxes(rangebreaks=breaks_for(default_tf))
+    # apply default rangebreaks + initial x/y view
+    fig.update_xaxes(rangebreaks=breaks_for(default_tf), range=[x0, x1])
+    if y1_0: fig.update_yaxes(range=y1_0, row=1, col=1)
+    fig.update_yaxes(autorange=True, row=2, col=1, secondary_y=False)  # re-fits on toggle
 
     return fig
 
