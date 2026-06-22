@@ -21,7 +21,7 @@ import time
 import traceback
 
 from finviz.finviz_curl import login, get_token, update_api_keys
-from finviz.new_finviz import fetch_and_save
+from finviz.new_finviz import fetch_and_save, FinvizTokenError
 from cvd.calculator import run_pipeline
 from cvd.visualizer import build_chart
 from TradingView.admin import DOWNLOAD_DIR
@@ -61,14 +61,6 @@ def create_data_dir():
 def fetch(ticker: str):
     print(f"\n[Fetch] Fetching 1-min candles for {ticker}...")
     candles = fetch_and_save(ticker, timeframe="i1")
-
-    # 0 candles usually means the token expired (HTTP 401).
-    # Regenerate the token and retry once.
-    if not candles:
-        print("[Fetch] ⚠️  0 candles — token may be expired. Regenerating...")
-        refresh_token()
-        candles = fetch_and_save(ticker, timeframe="i1")
-
     print(f"[Fetch] ✅ {len(candles)} candles fetched and saved.")
     return candles
 
@@ -131,6 +123,17 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
         try:
             fetch(ticker)
             calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1))
+        except FinvizTokenError as e:
+            # Wrong/expired token → regenerate and retry this iteration once.
+            print(f"[Loop] ⚠️  Token error: {e}")
+            print("[Loop] Regenerating token and retrying...")
+            refresh_token()
+            try:
+                fetch(ticker)
+                calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1))
+            except Exception:
+                print("[Loop] ❌ Retry after token refresh still failed:")
+                traceback.print_exc()
         except Exception:
             print("[Loop] ❌ Error during pipeline:")
             traceback.print_exc()
