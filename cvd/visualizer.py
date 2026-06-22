@@ -1,13 +1,14 @@
 """
 cvd/visualizer.py
 -----------------
-Two-screen Bookmap-style chart:
-  Screen 1 (large): candlestick only
-  Screen 2:         Buy/Sell volume (default) + CVD all-time + CVD session-reset
-                    + Total cumulative volume + Buy ratio (right axis), all legend-toggled
+Three-screen Bookmap-style chart:
+  Screen 1: candlestick
+  Screen 2: indicator panel A (Buy/Sell volume default + CVD/Cumulative/Ratio toggles)
+  Screen 3: indicator panel B — identical set, independently toggled (own legend)
 
-Timeframe buttons auto-scale the x-axis (and y-axis) to a sensible default span
-per timeframe. A second button row filters trading hours (All / Regular / Extended).
+So you can show Buy/Sell volume on one panel and, say, CVD on the other and
+compare them at the same time. Timeframe buttons auto-scale the x-axis (and the
+candle y-axis); a second button row filters trading hours.
 """
 
 import pandas as pd
@@ -19,10 +20,10 @@ from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_AB
 
 # Default visible span per timeframe (how far back from the last bar to show).
 DEFAULT_SPAN = {
-    "1min":   pd.Timedelta(hours=12),
-    "3min":   pd.Timedelta(days=1),
-    "5min":   pd.Timedelta(days=1),
-    "15min":  pd.Timedelta(days=2),
+    "1min":   pd.Timedelta(hours=6),
+    "3min":   pd.Timedelta(hours=18),
+    "5min":   pd.Timedelta(hours=30),
+    "15min":  pd.Timedelta(hours=90),
     "1hr":    pd.Timedelta(days=7),
     "3hr":    pd.Timedelta(days=21),
     "1day":   pd.Timedelta(days=90),
@@ -30,21 +31,18 @@ DEFAULT_SPAN = {
     "1month": pd.Timedelta(days=1095),
 }
 
-PAD = 0.05   # y-axis padding (5% above/below the data in view)
+PAD = 0.05   # y-axis padding for the candle panel
 
 
 def _span_window(df, tf):
-    """Return (x_start, x_end) for the default view of this timeframe."""
     x_end = df.index.max()
     x_start = x_end - DEFAULT_SPAN[tf]
-    # don't go before the first bar
     if x_start < df.index.min():
         x_start = df.index.min()
     return x_start, x_end
 
 
-def _yrange(series, lo_extra=PAD, hi_extra=PAD):
-    """Min/max of a series with padding; returns None if empty/all-NaN."""
+def _yrange(series, extra=PAD):
     s = series.dropna()
     if s.empty:
         return None
@@ -52,20 +50,89 @@ def _yrange(series, lo_extra=PAD, hi_extra=PAD):
     if lo == hi:
         lo, hi = lo - 1, hi + 1
     rng = hi - lo
-    return [lo - rng * lo_extra, hi + rng * hi_extra]
+    return [lo - rng * extra, hi + rng * extra]
+
+
+# One indicator panel's worth of traces (6): buy bar, sell bar, CVD all,
+# CVD session, cumulative volume, buy ratio (last one on the right axis).
+def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
+    """default_on: set of trace names shown by default in this panel."""
+    ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
+
+    def vis(name):
+        if not on:
+            return False
+        return True if name in default_on else "legendonly"
+
+    fig.add_trace(go.Bar(
+        x=df.index, y=df["buy_pressure"], name="Buy Volume",
+        marker_color="rgba(38,166,154,0.85)", visible=vis("Buy Volume"), showlegend=on,
+        legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>Buy: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Bar(
+        x=df.index, y=-df["sell_pressure"], name="Sell Volume",
+        marker_color="rgba(239,83,80,0.85)", visible=vis("Sell Volume"), showlegend=on,
+        legend=legend_id, customdata=df["sell_pressure"],
+        hovertemplate="<b>%{x}</b><br>Sell: %{customdata:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
+        line=dict(color="#ba68c8", width=2), connectgaps=True,
+        visible=vis("CVD (all-time)"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>CVD all: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["cvd_end"], mode="lines", name="CVD (session)",
+        line=dict(color="#4fc3f7", width=2), connectgaps=True,
+        visible=vis("CVD (session)"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>CVD session: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["volume"].cumsum(), mode="lines", name="Cum Total",
+        line=dict(color="#ffd54f", width=2), connectgaps=True,
+        visible=vis("Cum Total"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>Cum Total: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["buy_pressure"].cumsum(), mode="lines", name="Cum Buy",
+        line=dict(color="#66bb6a", width=1.6), connectgaps=True,
+        visible=vis("Cum Buy"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>Cum Buy: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["sell_pressure"].cumsum(), mode="lines", name="Cum Sell",
+        line=dict(color="#e57373", width=1.6), connectgaps=True,
+        visible=vis("Cum Sell"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>Cum Sell: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=ratio, mode="lines", name="Buy Ratio",
+        line=dict(color="#ff9800", width=1.6, dash="dot"), connectgaps=True,
+        visible=vis("Buy Ratio"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
+    ), row=row, col=1, secondary_y=True)
 
 
 def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
 
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=3, cols=1,
         shared_xaxes=True,
-        row_heights=[0.60, 0.40],
-        vertical_spacing=0.05,
-        specs=[[{}], [{"secondary_y": True}]],   # screen 2 has a right axis (Buy Ratio)
+        row_heights=[0.32, 0.34, 0.34],
+        vertical_spacing=0.06,
+        specs=[[{}], [{"secondary_y": True}], [{"secondary_y": True}]],
         subplot_titles=(
             f"{ticker} — Candlestick",
-            "Buy/Sell Volume (default) · CVD · Total Cumulative · Buy Ratio (toggle in legend)",
+            "Indicator Panel A — Buy/Sell Volume (toggle in upper legend)",
+            "Indicator Panel B — CVD (toggle in lower legend)",
         )
     )
 
@@ -73,76 +140,30 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     default_tf = "1hr"
     default_idx = timeframes.index(default_tf)
 
-    # Each timeframe contributes this many traces, in this fixed order:
-    #   0 candle | 1 buy bar | 2 sell bar | 3 CVD all | 4 CVD reset
-    #   5 cum total | 6 buy ratio
-    N_TRACES = 7
+    # Per timeframe: 1 candle + 8 (panel A) + 8 (panel B) = 17 traces
+    # panel order: buy, sell, CVD all, CVD session, cum total, cum buy, cum sell, ratio
+    N_TRACES = 17
 
     for tf in timeframes:
         df = frames[tf]
         on = (tf == default_tf)
-        # default-ON traces: candle + buy/sell bars; the rest start legend-only
-        v_main = on                       # candle + bars
-        v_opt  = "legendonly" if on else False
 
-        # 1. Candlestick (screen 1)
+        # Screen 1: candle
         fig.add_trace(go.Candlestick(
             x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
             name=f"Candle ({tf})",
             increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
             increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-            visible=v_main, showlegend=False,
+            visible=on, showlegend=False,
         ), row=1, col=1)
 
-        # 2. Buy bar (screen 2, up)
-        fig.add_trace(go.Bar(
-            x=df.index, y=df["buy_pressure"], name="Buy Volume",
-            marker_color="rgba(38,166,154,0.85)", visible=v_main, showlegend=on,
-            hovertemplate="<b>%{x}</b><br>Buy: %{y:,.0f}<extra></extra>",
-        ), row=2, col=1, secondary_y=False)
+        # Screen 2: defaults to Buy/Sell volume; Screen 3: defaults to CVD (session)
+        _add_indicator_panel(fig, df, row=2, legend_id="legend",  on=on,
+                             default_on={"Buy Volume", "Sell Volume"})
+        _add_indicator_panel(fig, df, row=3, legend_id="legend2", on=on,
+                             default_on={"CVD (session)"})
 
-        # 3. Sell bar (screen 2, down)
-        fig.add_trace(go.Bar(
-            x=df.index, y=-df["sell_pressure"], name="Sell Volume",
-            marker_color="rgba(239,83,80,0.85)", visible=v_main, showlegend=on,
-            customdata=df["sell_pressure"],
-            hovertemplate="<b>%{x}</b><br>Sell: %{customdata:,.0f}<extra></extra>",
-        ), row=2, col=1, secondary_y=False)
-
-        # 4. CVD all-time
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
-            line=dict(color="#ba68c8", width=2), connectgaps=True,
-            visible=v_opt, showlegend=on,
-            hovertemplate="<b>%{x}</b><br>CVD all: %{y:,.0f}<extra></extra>",
-        ), row=2, col=1, secondary_y=False)
-
-        # 5. CVD session-reset
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["cvd_end"], mode="lines", name="CVD (session)",
-            line=dict(color="#4fc3f7", width=2), connectgaps=True,
-            visible=v_opt, showlegend=on,
-            hovertemplate="<b>%{x}</b><br>CVD session: %{y:,.0f}<extra></extra>",
-        ), row=2, col=1, secondary_y=False)
-
-        # 6. Total cumulative volume
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["volume"].cumsum(), mode="lines", name="Cumulative Volume",
-            line=dict(color="#ffd54f", width=2), connectgaps=True,
-            visible=v_opt, showlegend=on,
-            hovertemplate="<b>%{x}</b><br>Cum Vol: %{y:,.0f}<extra></extra>",
-        ), row=2, col=1, secondary_y=False)
-
-        # 7. Buy ratio (right axis)
-        ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
-        fig.add_trace(go.Scatter(
-            x=df.index, y=ratio, mode="lines", name="Buy Ratio",
-            line=dict(color="#ff9800", width=1.6, dash="dot"), connectgaps=True,
-            visible=v_opt, showlegend=on,
-            hovertemplate="<b>%{x}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
-        ), row=2, col=1, secondary_y=True)
-
-    # ── Rangebreak rules (hide empty x gaps) ──
+    # ── Rangebreak rules ──
     intraday_breaks = [dict(bounds=["sat", "mon"]), dict(bounds=[20, 4], pattern="hour")]
     daily_breaks = [dict(bounds=["sat", "mon"])]
     no_breaks = []
@@ -152,48 +173,60 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         if tf in DAILY_OR_ABOVE: return daily_breaks
         return intraday_breaks
 
-    # ── Timeframe buttons: toggle visibility + auto x/y range + rangebreaks ──
+    # ── Timeframe buttons ──
     buttons = []
     for i, tf in enumerate(timeframes):
         df = frames[tf]
 
-        # visibility for all timeframes' traces
+        # panel order: buy, sell, CVD all, CVD session, cum total, cum buy, cum sell, ratio
+        # panel A default = buy/sell bars; panel B default = CVD (session)
+        LO = "legendonly"
+        panelA = [True, True, LO, LO, LO, LO, LO, LO]
+        panelB = [LO, LO, LO, True, LO, LO, LO, LO]
         visibility = []
-        for j, tf2 in enumerate(timeframes):
+        for j in range(len(timeframes)):
             if j == i:
-                visibility += [True, True, True, "legendonly", "legendonly", "legendonly", "legendonly"]
+                visibility += [True] + panelA + panelB
             else:
                 visibility += [False] * N_TRACES
+
         showlegend = []
         for j in range(len(timeframes)):
-            showlegend += ([False, True, True, True, True, True, True] if j == i
-                           else [False] * N_TRACES)
+            if j == i:
+                showlegend += [False] + [True] * 16
+            else:
+                showlegend += [False] * N_TRACES
 
-        # auto x-range for the default view of this timeframe
         x0, x1 = _span_window(df, tf)
         in_view = df.loc[x0:x1]
-
-        # y-range: screen 1 (candle) fixed to high/low of the view;
-        # screen 2 uses autorange so it re-fits whenever you toggle a series.
-        y1 = _yrange(pd.concat([in_view["high"], in_view["low"]])) if not in_view.empty else None
+        # candle y from high/low; panel A y from buy/sell; panel B y from CVD (session)
+        if not in_view.empty:
+            y1 = _yrange(pd.concat([in_view["high"], in_view["low"]]))
+            y_pa = _yrange(pd.concat([in_view["buy_pressure"], -in_view["sell_pressure"]]))
+            y_pb = _yrange(in_view["cvd_end"])
+        else:
+            y1 = y_pa = y_pb = None
 
         breaks = breaks_for(tf)
         layout = {
             "title": f"<b>{ticker}</b> — {tf}",
             "xaxis.rangebreaks":  breaks,
             "xaxis2.rangebreaks": breaks,
+            "xaxis3.rangebreaks": breaks,
             "xaxis.range":  [x0, x1],
             "xaxis2.range": [x0, x1],
-            "yaxis2.autorange": True,   # screen 2 left axis re-fits on legend toggle
+            "xaxis3.range": [x0, x1],
         }
-        if y1: layout["yaxis.range"] = y1
+        if y1:  layout["yaxis.range"]  = y1
+        if y_pa: layout["yaxis2.range"] = y_pa   # panel A (buy/sell scale)
+        if y_pb: layout["yaxis4.range"] = y_pb   # panel B (CVD scale)
 
         buttons.append(dict(
             label=tf, method="update",
             args=[{"visible": visibility, "showlegend": showlegend}, layout],
         ))
 
-    # ── Session-hours filter buttons (rangebreaks only) ──
+    # ── Session-hours filter buttons ──
     weekend = dict(bounds=["sat", "mon"])
     session_break_sets = {
         "All hours": [weekend, dict(bounds=[20, 4], pattern="hour")],
@@ -202,7 +235,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     }
     session_buttons = [
         dict(label=lbl, method="relayout",
-             args=[{"xaxis.rangebreaks": brk, "xaxis2.rangebreaks": brk}])
+             args=[{"xaxis.rangebreaks": brk, "xaxis2.rangebreaks": brk, "xaxis3.rangebreaks": brk}])
         for lbl, brk in session_break_sets.items()
     ]
 
@@ -211,19 +244,25 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     x0, x1 = _span_window(df0, default_tf)
     in0 = df0.loc[x0:x1]
     y1_0 = _yrange(pd.concat([in0["high"], in0["low"]]))
+    y_pa_0 = _yrange(pd.concat([in0["buy_pressure"], -in0["sell_pressure"]]))
+    y_pb_0 = _yrange(in0["cvd_end"])
 
     fig.update_layout(
         title=dict(text=f"<b>{ticker}</b> — {default_tf}", font=dict(size=18)),
         template="plotly_dark",
-        height=900,
+        height=1150,
         barmode="overlay",
         bargap=0.1,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=-0.06, xanchor="left", x=0),
-        margin=dict(l=60, r=60, t=120, b=80),
+        # two independent legends, one per indicator panel
+        legend=dict(orientation="h", yanchor="bottom", y=0.34, xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
+        legend2=dict(orientation="h", yanchor="top", y=-0.02, xanchor="left", x=0,
+                     bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
+        margin=dict(l=60, r=60, t=120, b=60),
         updatemenus=[
-            dict(type="buttons", direction="right", x=0.0, y=1.10, xanchor="left",
+            dict(type="buttons", direction="right", x=0.0, y=1.09, xanchor="left",
                  buttons=buttons, bgcolor="#2d2d2d", bordercolor="#888",
                  font=dict(color="white", size=12), active=default_idx),
             dict(type="buttons", direction="right", x=0.0, y=1.04, xanchor="left",
@@ -234,16 +273,22 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
 
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
     fig.update_yaxes(title_text="Volume / CVD", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Buy Ratio", row=2, col=1, secondary_y=True,
-                     tickformat=".0%", range=[0, 1])
-    fig.update_xaxes(title_text="Time", row=2, col=1)
+    fig.update_yaxes(title_text="Ratio", row=2, col=1, secondary_y=True, tickformat=".0%", range=[0, 1])
+    fig.update_yaxes(title_text="Volume / CVD", row=3, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Ratio", row=3, col=1, secondary_y=True, tickformat=".0%", range=[0, 1])
+    fig.update_xaxes(title_text="Time", row=3, col=1)
 
     fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
 
-    # apply default rangebreaks + initial x/y view
-    fig.update_xaxes(rangebreaks=breaks_for(default_tf), range=[x0, x1])
-    if y1_0: fig.update_yaxes(range=y1_0, row=1, col=1)
-    fig.update_yaxes(autorange=True, row=2, col=1, secondary_y=False)  # re-fits on toggle
+    # default rangebreaks + initial view; lock x so only y reacts to double-click
+    fig.update_xaxes(rangebreaks=breaks_for(default_tf), range=[x0, x1], fixedrange=True)
+    if y1_0:
+        fig.update_yaxes(range=y1_0, row=1, col=1)
+    if y_pa_0:
+        fig.update_yaxes(range=y_pa_0, row=2, col=1, secondary_y=False)
+    if y_pb_0:
+        fig.update_yaxes(range=y_pb_0, row=3, col=1, secondary_y=False)
 
     return fig
 
@@ -252,7 +297,6 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = 
     ticker = ticker.upper()
     df_1min, frames = run_pipeline(ticker)
 
-    # If there's no data, auto-fetch from FinViz then retry once
     if (df_1min.empty or not frames) and auto_fetch:
         print(f"[Visualizer] No data for {ticker} — fetching from FinViz...")
         try:
@@ -278,6 +322,5 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = 
 
 if __name__ == "__main__":
     import sys
-    # Usage: python -m cvd.visualizer [TICKER]
     ticker = sys.argv[1] if len(sys.argv) > 1 else "NVDA"
     show_chart(ticker)
