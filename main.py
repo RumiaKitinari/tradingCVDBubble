@@ -24,6 +24,7 @@ from finviz.finviz_curl import login, get_token, update_api_keys
 from finviz.new_finviz import fetch_and_save
 from cvd.calculator import run_pipeline
 from cvd.visualizer import build_chart
+from TradingView.TV_cURL import retrieve_cookies, scrape_TV_stocks
 from TradingView.admin import DOWNLOAD_DIR
 
 

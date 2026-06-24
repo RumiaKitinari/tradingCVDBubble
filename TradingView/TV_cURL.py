@@ -4,7 +4,7 @@ import pandas as pd
 from tradingview_screener import Query, Column
 import rookiepy
 
-from admin import DOWNLOAD_DIR, INTERVAL
+from .admin import DOWNLOAD_DIR, INTERVAL
 
 ################################################
 # --------- PART 1: Helper Functions --------- #
@@ -38,7 +38,7 @@ def scrape_TV_stocks():
         Query()
         .set_markets('america')
     )
-
+    
     # 2.) Select specific columns (data points)
     q = q.select(
         'name',                     # Ticker
@@ -89,7 +89,6 @@ def scrape_TV_stocks():
 ###############################################################
 
 if __name__ == "__main__":
-    # Example: Run every 60 seconds indefinitely
     create_data_dir()
     retrieve_cookies()
     while True:

@@ -15,6 +15,7 @@ pandas
 
 # Database
 pymongo
+django-mongodb-backend
 
 # Utilities
 python-dotenv
