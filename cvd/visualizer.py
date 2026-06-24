@@ -126,7 +126,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
-        row_heights=[0.32, 0.34, 0.34],
+        row_heights=[0.50, 0.25, 0.25],
         vertical_spacing=0.06,
         specs=[[{}], [{"secondary_y": True}], [{"secondary_y": True}]],
         subplot_titles=(
@@ -256,7 +256,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         # two independent legends, one per indicator panel
-        legend=dict(orientation="h", yanchor="bottom", y=0.34, xanchor="left", x=0,
+        legend=dict(orientation="h", yanchor="bottom", y=0.25, xanchor="left", x=0,
                     bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
         legend2=dict(orientation="h", yanchor="top", y=-0.02, xanchor="left", x=0,
                      bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
@@ -264,10 +264,10 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         updatemenus=[
             dict(type="buttons", direction="right", x=0.0, y=1.09, xanchor="left",
                  buttons=buttons, bgcolor="#2d2d2d", bordercolor="#888",
-                 font=dict(color="white", size=12), active=default_idx),
+                 font=dict(color="#aaaaaa", size=12), active=default_idx),
             dict(type="buttons", direction="right", x=0.0, y=1.04, xanchor="left",
                  buttons=session_buttons, bgcolor="#1e1e1e", bordercolor="#888",
-                 font=dict(color="#cccccc", size=11), active=0),
+                 font=dict(color="#aaaaaa", size=11), active=0),
         ],
     )
 
