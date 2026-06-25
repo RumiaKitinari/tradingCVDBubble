@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
 
-class CvdviewConfig(AppConfig):
+class SampleMflixConfig(AppConfig):
     default_auto_field = 'django_mongodb_backend.fields.ObjectIdAutoField'
-    name = 'cvdView'
+    name = 'sample_mflix'
