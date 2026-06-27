@@ -23,7 +23,7 @@ import traceback
 from finviz.finviz_curl import login, get_token, update_api_keys
 from finviz.new_finviz import fetch_and_save, FinvizTokenError
 from cvd.calculator import run_pipeline
-from cvd.visualizer import build_chart
+from cvd.visualizer import build_chart, write_chart_html
 from TradingView.admin import DOWNLOAD_DIR
 
 
@@ -81,7 +81,7 @@ def calculate_and_show(ticker: str, save_html: bool = True, open_browser: bool =
 
     if save_html:
         path = f"{ticker}_cvd_chart.html"
-        fig.write_html(path)
+        write_chart_html(fig, path)
         print(f"[Visualizer] Saved → {path}")
 
     if open_browser:

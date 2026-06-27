@@ -10,6 +10,14 @@ client = MongoClient("mongodb://localhost:27017/")
 db = client["finviz_db"]
 collection = db["candles"]
 
+# Index the upsert key. Without it, every upsert in save_candles_to_mongo does a
+# full collection scan, so re-saving ~22k bars each loop was O(n^2) (~80s); with
+# the index it's ~0.7s. create_index is idempotent (no-op if it already exists).
+collection.create_index(
+    [("ticker", 1), ("timeframe", 1), ("date", 1)],
+    unique=True, name="ticker_tf_date",
+)
+
 BASE_URL = "https://elite.finviz.com/quote_export"
 session = requests.Session()
 

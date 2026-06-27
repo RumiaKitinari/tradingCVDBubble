@@ -15,6 +15,17 @@ from pymongo import MongoClient
 def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
     """
     Return estimated buy/sell volume from one candle (OHLCV).
+
+    KNOWN LIMITATION — the closing auction (15:59 print):
+        US exchanges settle all Market-On-Close orders in a single closing
+        cross at one price, so the 15:59 bar carries a huge volume (often ~40x
+        a normal minute and ~2/3 of the final hour) packed into a near-zero
+        range / doji. This wick model then decides direction from a 1-2 cent
+        open/close difference and dumps almost the entire print onto one side,
+        so the buy/sell SIGN of that bar flips day to day and is unreliable
+        (e.g. a green buy spike on a down day). The volume itself is real; only
+        its buy/sell split is meaningless for a single-price auction print.
+        Per design decision (6/25) the logic is left as-is and documented here.
     """
     spread = h - l
 
@@ -61,6 +72,45 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
 # 2. Add buy/sell/delta/CVD to DataFrame
 # ─────────────────────────────────────────
 
+def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
+    """Boolean Series marking each day's closing-cross bars (15:59 + 16:00).
+
+    The closing auction footprint spans two bars: the main cross on 15:59
+    (~2500x a normal after-hours minute) plus an overflow/official print on
+    16:00 (~167x), after which volume drops back to normal by 16:01. So:
+      1. anchor = the afternoon (>=12:00) bar with the largest volume, flagged
+         only if it dwarfs that day's regular-session median (> `mult`x). This
+         lands on 15:59 normally, or the early-close print (e.g. 12:59) on a
+         half-day — no clock time is hardcoded.
+      2. spill  = walk FORWARD from the anchor, also flagging each following bar
+         while it stays elevated (> `spill_mult`x the regular median), stopping
+         at the first normal bar. This catches the 16:00 overflow but leaves
+         16:01 onward (genuine after-hours) and the pre-close ramp (15:55-15:58,
+         genuine continuous trading) untouched. See Personal Study Log §8.
+    """
+    minute = df.index.hour * 60 + df.index.minute
+    reg = (minute >= 570) & (minute < 960)                 # 09:30-16:00
+    reg_med = df.loc[reg].groupby(lambda ix: ix.date())["volume"].median()
+
+    flag = pd.Series(False, index=df.index)
+    afternoon = df[minute >= 720]                          # >= 12:00
+    for d, g in afternoon.groupby(lambda ix: ix.date()):
+        if g.empty:
+            continue
+        med = reg_med.get(d, float("nan"))
+        anchor = g["volume"].idxmax()
+        if not (pd.isna(med) or g.loc[anchor, "volume"] > mult * med):
+            continue
+        flag.loc[anchor] = True
+        gi = g.index
+        for k in range(gi.get_loc(anchor) + 1, len(gi)):   # forward spill
+            if g["volume"].iloc[k] > spill_mult * med:
+                flag.loc[gi[k]] = True
+            else:
+                break
+    return flag
+
+
 def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Take a 1-min DataFrame and return it with these added columns:
@@ -99,10 +149,25 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["selling_volume"] = results["selling_volume"]
     df["delta"]          = results["delta"]
 
-    # CVD (session-reset): cumulative delta, reset to 0 each trading day
-    df["cvd"] = df.groupby(df.index.date)["delta"].cumsum()
-    # CVD (all-time): cumulative delta over the entire series, never reset
-    df["cvd_all"] = df["delta"].cumsum()
+    # ── Closing-auction handling (neutralize direction, keep volume) ──────────
+    # The 15:59 closing cross is a single-price doji carrying ~99% of its minute
+    # as one batch auction; the wick model assigns its direction from a 1-2 cent
+    # open/close difference, so its buy/sell SIGN is noise that would otherwise
+    # dominate CVD (it alone drives the curve, ~26% of total |delta|). We KEEP its
+    # volume but NEUTRALIZE the split (buy = sell = volume/2, delta = 0) for the
+    # default CVD, and keep an un-neutralized `delta_raw` so a "CVD raw (incl.
+    # auction)" line stays available for comparison. See Personal Study Log §8.
+    df["is_auction"]     = _flag_auction(df)
+    df["delta_raw"]      = df["delta"]                       # before neutralization
+    auc = df["is_auction"]
+    df.loc[auc, "buying_volume"]  = df.loc[auc, "volume"] / 2
+    df.loc[auc, "selling_volume"] = df.loc[auc, "volume"] / 2
+    df.loc[auc, "delta"]          = 0.0
+    df["auction_volume"] = df["volume"].where(auc, 0.0)     # per-bar auction volume
+
+    # CVD (all-time): default = auction-neutralized; raw = includes the auction.
+    df["cvd_all"]     = df["delta"].cumsum()
+    df["cvd_all_raw"] = df["delta_raw"].cumsum()
 
     return df
 
@@ -147,11 +212,17 @@ def aggregate_pressure(df_1min: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         buy_pressure=("buying_volume",  "sum"),
         sell_pressure=("selling_volume","sum"),
         delta_sum=("delta",          "sum"),
-        cvd_end=("cvd",              "last"),   # CVD session-reset at bar's end
-        cvd_all_end=("cvd_all",      "last"),   # CVD all-time at bar's end
+        cvd_all_end=("cvd_all",      "last"),   # CVD all-time (auction-neutralized)
+        cvd_all_raw_end=("cvd_all_raw", "last"),# CVD all-time (includes auction)
+        auction_vol=("auction_volume", "sum"),  # auction volume falling in this bar
     ).dropna(subset=["open"])
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]
+
+    # Fraction of this bar's volume that came from the closing auction. Used to
+    # gray out auction-dominated bars in the chart (their direction isn't real):
+    # >0.5 on the 15:59-containing intraday bars, ~0.2 on a whole-day bar.
+    df_agg["auction_frac"] = (df_agg["auction_vol"] / df_agg["volume"]).fillna(0.0)
 
     # ── Momentum: Pressure ROC (Rate of Change)
     #   ROC_t = (Pressure_t − Pressure_{t-n}) / Pressure_{t-n} × 100
@@ -231,7 +302,10 @@ def run_pipeline(ticker: str) -> tuple[pd.DataFrame, dict]:
     print(f"[Pipeline] 1-min bars : {len(df_1min)}")
     for tf, df in frames.items():
         print(f"[Pipeline] {tf:>5} bars  : {len(df)}")
-    print(f"[Pipeline] CVD range  : {df_1min['cvd'].min():.0f} ~ {df_1min['cvd'].max():.0f}")
+    print(f"[Pipeline] CVD range  : {df_1min['cvd_all'].min():.0f} ~ {df_1min['cvd_all'].max():.0f}")
+    n_auc = int(df_1min["is_auction"].sum())
+    auc_vol = df_1min["auction_volume"].sum()
+    print(f"[Pipeline] Auctions   : {n_auc} closing-cross bars neutralized, total auction vol {auc_vol:,.0f}")
     print(f"[Pipeline] Done.\n")
 
     return df_1min, frames
@@ -242,6 +316,6 @@ if __name__ == "__main__":
     df_1min, frames = run_pipeline("NVDA")
     if not df_1min.empty:
         print("\n[1-min sample (last 3 rows)]")
-        print(df_1min[["open","close","volume","buying_volume","selling_volume","delta","cvd"]].tail(3).to_string())
+        print(df_1min[["open","close","volume","buying_volume","selling_volume","delta","cvd_all"]].tail(3).to_string())
         print("\n[1-hour sample (last 3 rows)]")
-        print(frames["1hr"][["open","close","buy_pressure","sell_pressure","net_pressure","cvd_end"]].tail(3).to_string())
+        print(frames["1hr"][["open","close","buy_pressure","sell_pressure","net_pressure","cvd_all_end"]].tail(3).to_string())

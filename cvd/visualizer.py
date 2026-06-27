@@ -18,27 +18,144 @@ from plotly.subplots import make_subplots
 from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE
 
 
-# Default visible span per timeframe (how far back from the last bar to show).
-DEFAULT_SPAN = {
-    "1min":   pd.Timedelta(hours=6),
-    "3min":   pd.Timedelta(hours=18),
-    "5min":   pd.Timedelta(hours=30),
-    "15min":  pd.Timedelta(hours=90),
-    "1hr":    pd.Timedelta(days=7),
-    "3hr":    pd.Timedelta(days=21),
-    "1day":   pd.Timedelta(days=90),
-    "1week":  pd.Timedelta(days=365),
-    "1month": pd.Timedelta(days=1095),
+# Injected into the saved HTML (via write_html post_script).
+#
+# Plotly does NOT re-scale the y-axis when the visible x-window or the set of
+# shown traces changes, so this script keeps every left y-axis fitted to
+# whatever is actually on screen. `refitY()` scans the *currently shown* traces
+# (visible===true, so legend-toggled-off traces are excluded), takes the
+# min/max of their values inside the visible x-window, and sets each left axis
+# (candles=y, panel A=y2, panel B=y4) to that range +/- 10% padding. The
+# Buy-Ratio axes (y3/y5) stay fixed at 0-100%.
+#
+# refitY() is triggered on three events:
+#   * plotly_relayout  -> pan / zoom the x-axis (Y follows the visible bars)
+#   * plotly_restyle   -> a legend toggle (or timeframe button) shows/hides a
+#                         trace, so the visible set changed
+#   * dblclick (DOM)    -> Plotly's native double-click ("autorange to ALL
+#                         data") is disabled via config doubleClick:false; we
+#                         catch the DOM dblclick and restore the active
+#                         timeframe's ~N_VISIBLE-candle default window (dfltX).
+#
+# NOTE on braces: write_html inserts this verbatim and only substitutes the
+# literal token {plot_id}, so this string uses normal single braces.
+REFIT_JS = """
+var gd = document.getElementById('{plot_id}');
+var YPAD = 0.10, busy = false;
+var LEFT = {'y':'yaxis', 'y2':'yaxis2', 'y4':'yaxis4'};
+// The "nice" default x-window for the active timeframe, restored on double-click.
+var dfltX = (gd._fullLayout.xaxis.range || []).slice();
+
+function visibleX() {
+    var ax = gd._fullLayout.xaxis;
+    if (!ax || !ax.range) return null;
+    return [new Date(ax.range[0]).getTime(), new Date(ax.range[1]).getTime()];
 }
+function refitY() {
+    var xr = visibleX(); if (!xr) return;
+    var t0 = xr[0], t1 = xr[1], upd = {};
+    Object.keys(LEFT).forEach(function(yref) {
+        var lo = Infinity, hi = -Infinity;
+        gd.data.forEach(function(tr, idx) {
+            if (tr.visible !== true) return;            // skip hidden / legendonly
+            if ((tr.yaxis || 'y') !== yref) return;
+            // IMPORTANT: Plotly 6.x serializes numeric arrays as base64 typed-array
+            // specs ({dtype, bdata}) on gd.data, which are NOT indexable. The decoded
+            // Float64Arrays live on gd._fullData, so read x/y/low/high from there.
+            var f = gd._fullData[idx]; if (!f) return;
+            var xs = f.x; if (!xs) return;
+            var isC = (tr.type === 'candlestick');
+            var ys = isC ? null : f.y, lows = isC ? f.low : null, highs = isC ? f.high : null;
+            for (var i = 0; i < xs.length; i++) {
+                var tx = new Date(xs[i]).getTime();
+                if (tx < t0 || tx > t1) continue;
+                if (isC) {
+                    if (lows[i]  < lo) lo = lows[i];
+                    if (highs[i] > hi) hi = highs[i];
+                } else {
+                    var v = ys[i];
+                    if (v == null || isNaN(v)) continue;
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            }
+        });
+        if (lo < hi) {
+            var pad = (hi - lo) * YPAD;
+            upd[LEFT[yref] + '.range'] = [lo - pad, hi + pad];
+        }
+    });
+    if (Object.keys(upd).length) {
+        busy = true;
+        Plotly.relayout(gd, upd).then(function() { busy = false; });
+    }
+}
+// Snap x back to the active timeframe's default ~100-candle window, then re-fit Y.
+function resetView() {
+    if (!dfltX || !dfltX.length) return;
+    busy = true;
+    Plotly.relayout(gd, {
+        'xaxis.range': dfltX.slice(), 'xaxis2.range': dfltX.slice(), 'xaxis3.range': dfltX.slice(),
+        'xaxis.autorange': false, 'xaxis2.autorange': false, 'xaxis3.autorange': false
+    }).then(function() { busy = false; refitY(); });
+}
+gd.on('plotly_relayout', function(ev) {
+    if (busy) return;
+    var keys = Object.keys(ev);
+    // fallback safety: if anything still autoranges, snap back to the default window
+    if (keys.some(function(k) { return k.indexOf('.autorange') > -1; })) { resetView(); return; }
+    // a timeframe button carries title/rangebreaks -> remember its window as the new default
+    if (keys.some(function(k) { return k.indexOf('rangebreaks') > -1 || k === 'title'; })) {
+        var r = gd._fullLayout.xaxis.range;
+        if (r) dfltX = [r[0], r[1]];
+    }
+    // pan / zoom the x-axis -> re-fit Y to the visible bars
+    if (keys.some(function(k) { return k.indexOf('xaxis') === 0; })) refitY();
+});
+// legend toggle / timeframe-button visibility change -> re-fit Y to what's shown now
+gd.on('plotly_restyle', function() { if (!busy) refitY(); });
+// Double-click handling. Plotly's native double-click is disabled via config
+// (doubleClick:false) because it autoranges X to the WHOLE dataset; instead we
+// catch the DOM dblclick and restore the default window. Skip clicks on the legend
+// so its built-in double-click-to-isolate still works.
+gd.addEventListener('dblclick', function(e) {
+    try { if (e.target && e.target.closest && e.target.closest('.legend')) return; } catch (_) {}
+    resetView();
+});
+refitY();
+"""
 
-PAD = 0.05   # y-axis padding for the candle panel
+
+def write_chart_html(fig, path: str):
+    """Save the figure to HTML with the y-axis auto-refit script attached.
+    doubleClick:false disables Plotly's native 'autorange to all data' so our
+    dblclick handler in REFIT_JS can restore the default window instead."""
+    fig.write_html(path, post_script=REFIT_JS, config={"doubleClick": False})
 
 
-def _span_window(df, tf):
-    x_end = df.index.max()
-    x_start = x_end - DEFAULT_SPAN[tf]
-    if x_start < df.index.min():
-        x_start = df.index.min()
+# How many candles to show by default, regardless of timeframe/interval.
+# The view is NOT locked — the user can pan/zoom freely; this is only the
+# initial window (and what each timeframe button snaps back to) so that any
+# timeframe opens at a comfortable ~50-60 candles instead of being squashed.
+N_VISIBLE = 100
+
+PAD = 0.10   # y-axis padding (fraction) so candles aren't flush against edges
+
+
+def _count_window(df, n: int = N_VISIBLE):
+    """Return (x_start, x_end) covering the last ~n bars, padded ~0.7 bar on
+    each side so the edge candles aren't clipped. Works on any timeframe
+    because it counts bars, not wall-clock time. Padding uses the *median* bar
+    spacing so an overnight/weekend gap inside the window doesn't blow it up."""
+    if df.empty:
+        return None, None
+    n = min(n, len(df))
+    sub = df.index[-n:]
+    x_start, x_end = sub[0], sub[-1]
+    if len(sub) > 1:
+        step = sub.to_series().diff().median()   # robust to gaps
+        x_start = x_start - step * 0.7
+        x_end = x_end + step * 0.7
     return x_start, x_end
 
 
@@ -59,6 +176,13 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     """default_on: set of trace names shown by default in this panel."""
     ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
 
+    # Gray out bars whose volume is dominated by the closing auction (>50%):
+    # their buy/sell split is neutralized (50/50) so the direction isn't real.
+    GRAY = "rgba(150,150,150,0.80)"
+    frac = df["auction_frac"] if "auction_frac" in df.columns else pd.Series(0.0, index=df.index)
+    buy_colors  = [GRAY if a > 0.5 else "rgba(38,166,154,0.85)" for a in frac]
+    sell_colors = [GRAY if a > 0.5 else "rgba(239,83,80,0.85)"  for a in frac]
+
     def vis(name):
         if not on:
             return False
@@ -66,14 +190,14 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
 
     fig.add_trace(go.Bar(
         x=df.index, y=df["buy_pressure"], name="Buy Volume",
-        marker_color="rgba(38,166,154,0.85)", visible=vis("Buy Volume"), showlegend=on,
+        marker_color=buy_colors, visible=vis("Buy Volume"), showlegend=on,
         legend=legend_id,
         hovertemplate="<b>%{x}</b><br>Buy: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
     fig.add_trace(go.Bar(
         x=df.index, y=-df["sell_pressure"], name="Sell Volume",
-        marker_color="rgba(239,83,80,0.85)", visible=vis("Sell Volume"), showlegend=on,
+        marker_color=sell_colors, visible=vis("Sell Volume"), showlegend=on,
         legend=legend_id, customdata=df["sell_pressure"],
         hovertemplate="<b>%{x}</b><br>Sell: %{customdata:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
@@ -86,10 +210,10 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     ), row=row, col=1, secondary_y=False)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["cvd_end"], mode="lines", name="CVD (session)",
-        line=dict(color="#4fc3f7", width=2), connectgaps=True,
-        visible=vis("CVD (session)"), showlegend=on, legend=legend_id,
-        hovertemplate="<b>%{x}</b><br>CVD session: %{y:,.0f}<extra></extra>",
+        x=df.index, y=df["cvd_all_raw_end"], mode="lines", name="CVD raw (incl. auction)",
+        line=dict(color="#9575cd", width=1.4, dash="dot"), connectgaps=True,
+        visible=vis("CVD raw (incl. auction)"), showlegend=on, legend=legend_id,
+        hovertemplate="<b>%{x}</b><br>CVD raw: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
     fig.add_trace(go.Scatter(
@@ -141,7 +265,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     default_idx = timeframes.index(default_tf)
 
     # Per timeframe: 1 candle + 8 (panel A) + 8 (panel B) = 17 traces
-    # panel order: buy, sell, CVD all, CVD session, cum total, cum buy, cum sell, ratio
+    # panel order: buy, sell, CVD all, CVD raw, cum total, cum buy, cum sell, ratio
     N_TRACES = 17
 
     for tf in timeframes:
@@ -161,7 +285,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         _add_indicator_panel(fig, df, row=2, legend_id="legend",  on=on,
                              default_on={"Buy Volume", "Sell Volume"})
         _add_indicator_panel(fig, df, row=3, legend_id="legend2", on=on,
-                             default_on={"CVD (session)"})
+                             default_on={"CVD (all-time)"})
 
     # ── Rangebreak rules ──
     intraday_breaks = [dict(bounds=["sat", "mon"]), dict(bounds=[20, 4], pattern="hour")]
@@ -178,11 +302,11 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     for i, tf in enumerate(timeframes):
         df = frames[tf]
 
-        # panel order: buy, sell, CVD all, CVD session, cum total, cum buy, cum sell, ratio
-        # panel A default = buy/sell bars; panel B default = CVD (session)
+        # panel order: buy, sell, CVD all, CVD raw, cum total, cum buy, cum sell, ratio
+        # panel A default = buy/sell bars; panel B default = CVD (all-time, neutralized)
         LO = "legendonly"
         panelA = [True, True, LO, LO, LO, LO, LO, LO]
-        panelB = [LO, LO, LO, True, LO, LO, LO, LO]
+        panelB = [LO, LO, True, LO, LO, LO, LO, LO]
         visibility = []
         for j in range(len(timeframes)):
             if j == i:
@@ -197,13 +321,13 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             else:
                 showlegend += [False] * N_TRACES
 
-        x0, x1 = _span_window(df, tf)
+        x0, x1 = _count_window(df)
         in_view = df.loc[x0:x1]
         # candle y from high/low; panel A y from buy/sell; panel B y from CVD (session)
         if not in_view.empty:
             y1 = _yrange(pd.concat([in_view["high"], in_view["low"]]))
             y_pa = _yrange(pd.concat([in_view["buy_pressure"], -in_view["sell_pressure"]]))
-            y_pb = _yrange(in_view["cvd_end"])
+            y_pb = _yrange(in_view["cvd_all_end"])
         else:
             y1 = y_pa = y_pb = None
 
@@ -241,11 +365,11 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
 
     # ── Layout ──
     df0 = frames[default_tf]
-    x0, x1 = _span_window(df0, default_tf)
+    x0, x1 = _count_window(df0)
     in0 = df0.loc[x0:x1]
     y1_0 = _yrange(pd.concat([in0["high"], in0["low"]]))
     y_pa_0 = _yrange(pd.concat([in0["buy_pressure"], -in0["sell_pressure"]]))
-    y_pb_0 = _yrange(in0["cvd_end"])
+    y_pb_0 = _yrange(in0["cvd_all_end"])
 
     fig.update_layout(
         title=dict(text=f"<b>{ticker}</b> — {default_tf}", font=dict(size=18)),
@@ -281,8 +405,10 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
     fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
 
-    # default rangebreaks + initial view; lock x so only y reacts to double-click
-    fig.update_xaxes(rangebreaks=breaks_for(default_tf), range=[x0, x1], fixedrange=True)
+    # default rangebreaks + initial ~55-candle window. x is NOT fixed: the user
+    # can pan/zoom freely, and the injected JS (see REFIT_JS) re-fits the y-axes
+    # to whatever bars are in view as they scroll.
+    fig.update_xaxes(rangebreaks=breaks_for(default_tf), range=[x0, x1])
     if y1_0:
         fig.update_yaxes(range=y1_0, row=1, col=1)
     if y_pa_0:
@@ -314,7 +440,7 @@ def show_chart(ticker: str = "NVDA", save_html: bool = True, auto_fetch: bool = 
 
     if save_html:
         path = f"{ticker}_cvd_chart.html"
-        fig.write_html(path)
+        write_chart_html(fig, path)
         print(f"[Visualizer] Saved → {path}")
 
     fig.show()
