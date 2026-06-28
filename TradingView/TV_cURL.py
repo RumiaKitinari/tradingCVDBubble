@@ -1,98 +1,103 @@
-import os
-import time
-import pandas as pd
-from tradingview_screener import Query, Column
-import rookiepy
+import asyncio
+import json
+from datetime import datetime
+from curl_cffi import AsyncSession
 
-from admin import DOWNLOAD_DIR, INTERVAL
+# Assuming these variables are properly exported by your local admin.py
+from admin import DOWNLOAD_DIR, USERNAME, EMAIL, PASSWORD, COOKIES_FILE
 
-################################################
-# --------- PART 1: Helper Functions --------- #
-################################################
+TRADING_VIEW_URL = "https://www.tradingview.com/"
+LOGIN_URL = "https://www.tradingview.com/accounts/signin/"
 
-cookies = None
-
-def create_data_dir():
-    try:
-        os.mkdir(DOWNLOAD_DIR)
-        print(f"Directory '{DOWNLOAD_DIR}' created successfully.")
-    except FileExistsError:
-        print(f"Directory '{DOWNLOAD_DIR}' already exists.")
-    except PermissionError:
-        print(f"Permission denied: Unable to create '{DOWNLOAD_DIR}'.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-def retrieve_cookies():
-    print("[ACTIVITY] Extracting active session cookies from browser")
-    
-    try: # (rookiepy.chrome -> .firefox / .edge)
-        cookies = rookiepy.to_cookiejar(rookiepy.chrome(['.tradingview.com']))
-    except Exception as e:
-        print(f"[ERROR] Could not load cookies automatically: {e}. Falling back to unauthenticated public request.")
-        cookies = None
-
-def scrape_TV_stocks():
-    # 1.) Query -> Stock market
-    q = (
-        Query()
-        .set_markets('america')
-    )
-
-    # 2.) Select specific columns (data points)
-    q = q.select(
-        'name',                     # Ticker
-        'description',              # Company
-        'close',                    # Price
-        'volume',                   # Volume (now)
-        'market_cap_basic',         # Market Cap
-        'pe_ratio',                 # P/E Ratio
-        'relative_volume_10d_calc'  # (EX: Relative Volume compared to 10-day average)
-    )
-
-    # 3.) Screening filters
-    # q = q.where(
-    #     Column('market_cap_basic') > 1_000_000_000,
-    #     Column('volume') > 500_000
-    # )
-
-    # 4.) Sort the results (e.g., by highest volume descending)
-    q = q.order_by('volume', ascending=False)
-
-    # 5. Limit fetches (e.g., first 100 matching rows)
-    q = q.offset(0).limit(100)
-
-    try:
-        # 6.) Execute the query
-        print("[PING] TradingView scanner API")
-        total_count, df = q.get_scanner_data(cookies=cookies)
+async def tv_login_and_scrape():
+    async with AsyncSession(impersonate="chrome") as s:
         
-        print(f"[QUERY] 1.) Stocks = {total_count} \t2.) Limit = {len(df)} records.")
+        # --- STEP 1: INITIALIZE SESSION STATE ---
+        print("Visiting homepage to capture CSRF configurations and cookies...")
+        init_response = await s.get(TRADING_VIEW_URL)
         
-        # 7.) Renaming columns
-        # df.columns = ['Ticker', 'Company Name', 'Price', 'Volume', 'Market Cap', 'P/E Ratio', 'Relative Volume']
-        
-        # 8.) Snippet of the data
-        # print("\nTop 5 Results:")
-        # print(df.head())
-        
-        # 9.) Save to local CSV file
-        output_file = f"tradingview_data_{int(time.time())}.csv"
-        df.to_csv(os.path.join(DOWNLOAD_DIR, output_file), index=False)        
-        print(f"[SAVE] Data successfully saved to '{output_file}'\n")
+        if init_response.status_code != 200:
+            print(f"Initialization blocked by firewall. Status: {init_response.status_code}")
+            return
 
-    except Exception as e:
-        print(f"[ERROR] {e}")
+        # --- STEP 2: EXECUTE AUTHENTICATION PIPELINE ---
+        print(f"Transmitting credentials for profile: {EMAIL}...")
+        login_res = await s.post(
+            LOGIN_URL, 
+            data={"username": EMAIL, "password": PASSWORD},
+        )
+        
+        if login_res.status_code == 200:
+            print("Login completely successful. Persistent cookies bound to active AsyncSession.")
+        else:
+            print("Authentication skipped/rejected. Proceeding as public scraper...")
 
-###############################################################
-# --------- PART 2: Scraping Stock Data Per Interval -------- #
-###############################################################
+        # --- STEP 3: INTERACT WITH INTERNAL SCREENER PIPELINE ---
+        screener_api_url = "https://scanner.tradingview.com/america/scan"
+        
+        # Added "open_time" to the columns layout to extract the underlying bar timestamp
+        screener_payload = {
+            "filter": [
+                {"left": "market_cap_basic", "operation": "nempty"},
+                {"left": "type", "operation": "in_range", "right": ["stock", "dr", "bdr"]}
+            ],
+            "options": {"lang": "en"},
+            "markets": ["america"],
+            "symbols": {"query": {"types": []}, "tickers": []},
+            "columns": [
+                "base_currency", 
+                "logoid", 
+                "name", 
+                "close", 
+                "change", 
+                "volume", 
+                "description",
+                "time"  # <--- Added to pull the UNIX timestamp (seconds) of the last data update
+            ],
+            "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+            "range": [0, 10]  # Scrape top 10 positions
+        }
+
+        print("Querying backend screener matrix...")
+        headers = {
+            "Referer": "https://www.tradingview.com/",
+            "Content-Type": "application/json"
+        }
+        
+        response = await s.post(screener_api_url, json=screener_payload, headers=headers)
+        
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                stock_rows = data.get("data", [])
+                
+                print(f"\n--- Market Overview Metrics (Retrieved {len(stock_rows)} items) ---")
+                for stock in stock_rows:
+                    metrics = stock.get("d", [])
+                    
+                    # Mapping based explicitly on index tracking in the "columns" array:
+                    ticker = metrics[2] if len(metrics) > 2 else "N/A"
+                    price = metrics[3] if len(metrics) > 3 else 0.0
+                    volume = metrics[5] if len(metrics) > 5 else 0
+                    desc = metrics[6] if len(metrics) > 6 else "N/A"
+                    
+                    # Extract and parse timestamp field (Index 7)
+                    raw_timestamp = metrics[7] if len(metrics) > 7 else None
+                    human_time = "N/A"
+                    
+                    if raw_timestamp:
+                        try:
+                            # TradingView's open_time is returned as a standard UNIX integer timestamp
+                            human_time = datetime.fromtimestamp(int(raw_timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+                        except (ValueError, TypeError):
+                            human_time = f"Raw: {raw_timestamp}"
+
+                    print(f"[{human_time}] Ticker: {ticker:<6} | Price: ${price:>8.2f} | Volume: {volume:>10,}")
+                    
+            except json.JSONDecodeError:
+                print("Failed to parse data matrix.")
+        else:
+            print(f"Screener connection dropped. Status: {response.status_code}")
 
 if __name__ == "__main__":
-    # Example: Run every 60 seconds indefinitely
-    create_data_dir()
-    retrieve_cookies()
-    while True:
-        scrape_TV_stocks()
-        print(f"Waiting {INTERVAL} seconds for the next pull...\n")
-        time.sleep(INTERVAL)
+    asyncio.run(tv_login_and_scrape())
