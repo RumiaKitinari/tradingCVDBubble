@@ -16,4 +16,9 @@ __pycache__/
 
 # Generated chart outputs
 *_cvd_chart.html
+
+# Claude
 .claudeignore
+CLAUDE.md
+.claude/
+claude/

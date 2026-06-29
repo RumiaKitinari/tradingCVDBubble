@@ -28,3 +28,13 @@ pytz
 
 # Plotly
 plotly
+
+## Interactive Brokers (IBKR) — tick-by-tick collection (Step 1-4)
+# ib_async is the actively maintained fork of ib_insync (original author deceased).
+# Requires IB Gateway or TWS running locally.  Paper account works for dev/testing.
+ib_async
+# IANA timezone database for zoneinfo (macOS may lack it; needed for ET conversion)
+tzdata
+
+# Alpaca for testing
+alpaca-py

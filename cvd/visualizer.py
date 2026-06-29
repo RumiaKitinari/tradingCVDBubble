@@ -15,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE
+from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE, TIMEFRAME_RULE_IBKR
 
 
 # Injected into the saved HTML (via write_html post_script).
@@ -260,8 +260,9 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         )
     )
 
-    timeframes = list(TIMEFRAME_RULE.keys())
-    default_tf = "1hr"
+    # Use the actual keys present in frames (FinViz: 9 TFs, IBKR: 11 TFs with 1sec/5sec).
+    timeframes = list(frames.keys())
+    default_tf = "1hr" if "1hr" in timeframes else timeframes[-1]
     default_idx = timeframes.index(default_tf)
 
     # Per timeframe: 1 candle + 8 (panel A) + 8 (panel B) = 17 traces
