@@ -4,15 +4,19 @@ cvd/calculator.py
 Buy/Sell Volume Decomposition + CVD Calculator
 
 Source-aware pipeline:
-  source='ibkr_tick'  — real-time tick data; buying_volume/selling_volume/delta
-                        are pre-computed by tick_collector.py from quote-based
-                        aggressor classification.  Wick decomposition is skipped.
-  source='ibkr_hist'  — 1-sec bars from reqHistoricalData (no tick-level quotes).
-                        Wick decomposition is applied (same as FinViz).
-  source='finviz_wick'— FinViz Elite 1-min bars.  Wick decomposition applied.
+  source='ibkr_tick'   — IBKR real-time tick data; buying_volume/selling_volume/delta
+                         pre-computed by tick_collector.py (quote-based aggressor).
+                         Wick decomposition is SKIPPED.
+  source='alpaca_tick' — Alpaca real-time/historical tick data; buying_volume/selling_volume/delta
+                         pre-computed by alpaca_collector.py / alpaca_backfill.py.
+                         Wick decomposition is SKIPPED.
+  source='ibkr_hist'   — 1-sec bars from reqHistoricalData (no tick-level quotes).
+                         Wick decomposition applied (same as FinViz).
+  source='finviz_wick' — FinViz Elite 1-min bars.  Wick decomposition applied.
 
 add_cvd_columns() detects which rows have pre-computed values and branches
-accordingly, so mixed DataFrames (ibkr_tick + finviz_wick) work transparently.
+accordingly, so mixed DataFrames (ibkr_tick + alpaca_tick + finviz_wick) work
+transparently.
 """
 
 import pandas as pd
@@ -190,9 +194,11 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     if has_precomputed and has_source:
-        # Rows that need wick decomposition: either not ibkr_tick, or missing values.
+        # Rows that need wick decomposition: any source that isn't a real-tick source,
+        # or rows where buying_volume is missing despite being tagged as tick data.
+        # Real-tick sources (ibkr_tick, alpaca_tick) have pre-computed buy/sell/delta.
         needs_wick = (
-            ~df["source"].isin(["ibkr_tick"])
+            ~df["source"].isin(["ibkr_tick", "alpaca_tick"])
         ) | df["buying_volume"].isna()
 
         if needs_wick.any():

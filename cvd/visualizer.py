@@ -245,6 +245,71 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     ), row=row, col=1, secondary_y=True)
 
 
+def _add_source_annotations(fig: go.Figure, df_base: pd.DataFrame) -> None:
+    """
+    Step 3: Add shaded background zones marking wick-estimated data regions.
+
+    For each source that uses wick decomposition (finviz_wick, ibkr_hist,
+    alpaca_wick) a light semi-transparent rectangle is drawn across the full
+    chart height, plus a small text label at the left edge of the zone.
+    Real-tick sources (ibkr_tick, alpaca_tick) are left unmarked — they are
+    the ground truth and need no disclaimer.
+
+    Uses xref='x' (shared x-axis) and yref='paper' (full height) so the shape
+    spans all three rows simultaneously.
+    """
+    if "source" not in df_base.columns:
+        return
+
+    EST_SOURCES = {
+        "finviz_wick": dict(
+            fillcolor="rgba(255,210,100,0.07)",
+            label="FinViz (est.)",
+            font_color="rgba(220,180,80,0.75)",
+        ),
+        "ibkr_hist": dict(
+            fillcolor="rgba(100,160,255,0.07)",
+            label="IBKR hist (est.)",
+            font_color="rgba(100,160,220,0.75)",
+        ),
+        "alpaca_wick": dict(
+            fillcolor="rgba(200,120,255,0.07)",
+            label="Alpaca wick (est.)",
+            font_color="rgba(180,100,220,0.75)",
+        ),
+    }
+
+    for src, style in EST_SOURCES.items():
+        mask = df_base["source"] == src
+        if not mask.any():
+            continue
+        x0 = df_base.index[mask].min()
+        x1 = df_base.index[mask].max()
+
+        # Shaded rectangle spanning the full chart height
+        fig.add_shape(
+            type="rect",
+            x0=x0, x1=x1,
+            y0=0, y1=1,
+            yref="paper", xref="x",
+            fillcolor=style["fillcolor"],
+            line_width=0,
+            layer="below",
+        )
+        # Text label at the left edge of the shaded zone
+        fig.add_annotation(
+            x=x0,
+            y=0.98,
+            yref="paper",
+            xref="x",
+            text=style["label"],
+            showarrow=False,
+            xanchor="left",
+            yanchor="top",
+            font=dict(size=8, color=style["font_color"]),
+        )
+
+
 def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
 
     fig = make_subplots(
@@ -416,6 +481,9 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         fig.update_yaxes(range=y_pa_0, row=2, col=1, secondary_y=False)
     if y_pb_0:
         fig.update_yaxes(range=y_pb_0, row=3, col=1, secondary_y=False)
+
+    # Step 3: Source-aware annotations — shade wick-estimated data regions.
+    _add_source_annotations(fig, df_1min)
 
     return fig
 
