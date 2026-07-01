@@ -90,6 +90,28 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
 def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
     """Boolean Series marking each day's closing-cross bars (15:59 + 16:00).
 
+    The volume thresholds below are calibrated for 1-MINUTE bars. At 1-second
+    granularity the volume distribution has a much heavier tail (a single
+    block trade easily exceeds 10x the median 1-sec volume), so running the
+    detection directly on sub-minute bars flags ordinary intraday spikes as
+    auctions almost every day. For sub-minute data we therefore aggregate the
+    volume to 1-minute buckets, run the detection there, and map the flagged
+    minutes back onto the underlying bars.
+    """
+    if len(df) >= 2:
+        spacing = df.index.to_series().diff().dt.total_seconds().median()
+        if pd.notna(spacing) and spacing < 60:
+            vol_1min = df["volume"].resample("1min").sum()
+            vol_1min = vol_1min[vol_1min > 0]          # drop empty minutes
+            minute_flags = _flag_auction_1min(vol_1min.to_frame("volume"), mult, spill_mult)
+            flagged = minute_flags[minute_flags].index
+            return pd.Series(df.index.floor("min").isin(flagged), index=df.index)
+    return _flag_auction_1min(df, mult, spill_mult)
+
+
+def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
+    """Core closing-cross detection on minute-level (or coarser) volume bars.
+
     The closing auction footprint spans two bars: the main cross on 15:59
     (~2500x a normal after-hours minute) plus an overflow/official print on
     16:00 (~167x), after which volume drops back to normal by 16:01. So:
@@ -102,6 +124,10 @@ def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0)
          at the first normal bar. This catches the 16:00 overflow but leaves
          16:01 onward (genuine after-hours) and the pre-close ramp (15:55-15:58,
          genuine continuous trading) untouched. See Personal Study Log §8.
+
+    Note: feeds that don't carry the official closing cross (e.g. Alpaca's
+    IEX-only feed — the cross prints on the listing exchange) simply won't
+    have an anchor exceeding `mult`x the median, so nothing gets flagged.
     """
     minute = df.index.hour * 60 + df.index.minute
     reg = (minute >= 570) & (minute < 960)                 # 09:30-16:00
@@ -285,7 +311,7 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
     rule = _all_rules.get(timeframe, "1h")
     df_1min = df_base  # rename kept for clarity; works for any base granularity
 
-    df_agg = df_1min.resample(rule).agg(
+    agg_spec = dict(
         open=("open",                "first"),
         high=("high",                "max"),
         low=("low",                  "min"),
@@ -297,7 +323,13 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         cvd_all_end=("cvd_all",      "last"),   # CVD all-time (auction-neutralized)
         cvd_all_raw_end=("cvd_all_raw", "last"),# CVD all-time (includes auction)
         auction_vol=("auction_volume", "sum"),  # auction volume falling in this bar
-    ).dropna(subset=["open"])
+    )
+    if "source" in df_1min.columns:
+        # Carry the (dominant) data source so the visualizer can shade
+        # wick-estimated regions on every timeframe, not just the base one.
+        agg_spec["source"] = ("source", "first")
+
+    df_agg = df_1min.resample(rule).agg(**agg_spec).dropna(subset=["open"])
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]
 
@@ -336,19 +368,33 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
 # 4. Load data from MongoDB
 # ─────────────────────────────────────────
 
-def load_from_mongo(ticker: str, timeframe: str = "i1") -> pd.DataFrame:
+def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None) -> pd.DataFrame:
     """
     Load a given ticker/timeframe from MongoDB finviz_db.candles.
 
     Returns all OHLCV columns plus pre-computed IBKR columns when present:
     buying_volume, selling_volume, delta, source.  add_cvd_columns() uses
     these to skip wick decomposition for ibkr_tick rows.
+
+    days: only load bars from the last `days` calendar days. Keeps chart
+          regeneration fast once weeks of 1-sec data accumulate. Only valid
+          for tick-based timeframes whose `date` field is a real datetime
+          (FinViz 'i1' docs store dates as strings, which a datetime range
+          query would silently exclude).
     """
     client = MongoClient("mongodb://localhost:27017/")
     collection = client["finviz_db"]["candles"]
 
+    query = {"ticker": ticker, "timeframe": timeframe}
+    if days is not None:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        # Stored dates are ET-naive, so compute the cutoff in ET as well.
+        now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+        query["date"] = {"$gte": now_et - timedelta(days=days)}
+
     docs = list(collection.find(
-        {"ticker": ticker, "timeframe": timeframe},
+        query,
         {
             "_id": 0,
             "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
@@ -373,6 +419,7 @@ def load_from_mongo(ticker: str, timeframe: str = "i1") -> pd.DataFrame:
 def run_pipeline(
     ticker: str,
     base_timeframe: str = "i1",
+    days: int | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Load bars from MongoDB → compute CVD → aggregate into every timeframe.
@@ -382,6 +429,8 @@ def run_pipeline(
         base_timeframe : MongoDB timeframe field to load.
                          'i1'   → FinViz 1-min bars (default, backward-compat)
                          '1sec' → IBKR 1-second bars (tick_collector output)
+        days           : only load the last N days (tick timeframes only;
+                         see load_from_mongo). None = everything.
 
     Returns:
         df_base : base-granularity bars with buy/sell/delta/cvd columns
@@ -393,7 +442,7 @@ def run_pipeline(
     print(f"  Pipeline: {ticker}  (base_timeframe={base_timeframe})")
     print(f"{'='*50}")
 
-    df_raw = load_from_mongo(ticker, timeframe=base_timeframe)
+    df_raw = load_from_mongo(ticker, timeframe=base_timeframe, days=days)
     if df_raw.empty:
         return pd.DataFrame(), {}
 

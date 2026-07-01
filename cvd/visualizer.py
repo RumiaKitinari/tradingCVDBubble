@@ -115,14 +115,18 @@ gd.on('plotly_restyle', function() { if (!busy) requestRefit(); });
 
 document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    // Timeframe hotkeys: 1-9 = buttons 1-9, 0 = 10th, - = 11th
     var keyInt = parseInt(e.key);
-    if (!isNaN(keyInt) && keyInt >= 1 && keyInt <= 9) {
+    var tfIdx = null;
+    if (!isNaN(keyInt) && keyInt >= 1 && keyInt <= 9) tfIdx = keyInt - 1;
+    else if (e.key === '0') tfIdx = 9;
+    else if (e.key === '-') tfIdx = 10;
+    if (tfIdx !== null) {
         var btnGrp = document.querySelectorAll('.updatemenu-container')[0];
         if (btnGrp) {
             var btns = btnGrp.querySelectorAll('.updatemenu-button');
-            var idx = keyInt - 1;
-            if (idx < btns.length) {
-                btns[idx].dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            if (tfIdx < btns.length) {
+                btns[tfIdx].dispatchEvent(new MouseEvent('click', {bubbles: true}));
             }
         }
     }
@@ -266,22 +270,25 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     ), row=row, col=1, secondary_y=True)
 
 
-def _add_source_annotations(fig: go.Figure, df_base: pd.DataFrame) -> None:
+def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
     """
     Step 3: Add shaded background zones marking wick-estimated data regions.
 
     For each source that uses wick decomposition (finviz_wick, ibkr_hist,
     alpaca_wick) a light semi-transparent rectangle is drawn across the full
-    chart height, plus a small text label at the left edge of the zone.
+    chart height, plus a small text label at the left edge of each zone.
     Real-tick sources (ibkr_tick, alpaca_tick) are left unmarked — they are
     the ground truth and need no disclaimer.
+
+    Every timeframe occupies its own disjoint x_idx interval, so rects for
+    all timeframes can be drawn at once: only the active timeframe's region
+    is ever inside the visible x-window. Mixed-source data is handled by
+    splitting into contiguous runs per source (instead of one first→last
+    rect that would also cover tick regions in between).
 
     Uses xref='x' (shared x-axis) and yref='paper' (full height) so the shape
     spans all three rows simultaneously.
     """
-    if "source" not in df_base.columns:
-        return
-
     EST_SOURCES = {
         "finviz_wick": dict(
             fillcolor="rgba(255,210,100,0.07)",
@@ -300,35 +307,40 @@ def _add_source_annotations(fig: go.Figure, df_base: pd.DataFrame) -> None:
         ),
     }
 
-    for src, style in EST_SOURCES.items():
-        mask = df_base["source"] == src
-        if not mask.any():
+    for df in frames.values():
+        if "source" not in df.columns or "x_idx" not in df.columns:
             continue
-        x0 = df_base['x_idx'][mask].iloc[0]
-        x1 = df_base['x_idx'][mask].iloc[-1]
+        src_col = df["source"]
+        # Contiguous runs of the same source value
+        run_id = (src_col != src_col.shift()).cumsum()
+        for _, run in df.groupby(run_id):
+            src = run["source"].iloc[0]
+            style = EST_SOURCES.get(src)
+            if style is None:
+                continue
+            x0 = run["x_idx"].iloc[0]
+            x1 = run["x_idx"].iloc[-1]
 
-        # Shaded rectangle spanning the full chart height
-        fig.add_shape(
-            type="rect",
-            x0=x0, x1=x1,
-            y0=0, y1=1,
-            yref="paper", xref="x",
-            fillcolor=style["fillcolor"],
-            line_width=0,
-            layer="below",
-        )
-        # Text label at the left edge of the shaded zone
-        fig.add_annotation(
-            x=x0,
-            y=0.98,
-            yref="paper",
-            xref="x",
-            text=style["label"],
-            showarrow=False,
-            xanchor="left",
-            yanchor="top",
-            font=dict(size=8, color=style["font_color"]),
-        )
+            fig.add_shape(
+                type="rect",
+                x0=x0, x1=x1,
+                y0=0, y1=1,
+                yref="paper", xref="x",
+                fillcolor=style["fillcolor"],
+                line_width=0,
+                layer="below",
+            )
+            fig.add_annotation(
+                x=x0,
+                y=0.98,
+                yref="paper",
+                xref="x",
+                text=style["label"],
+                showarrow=False,
+                xanchor="left",
+                yanchor="top",
+                font=dict(size=8, color=style["font_color"]),
+            )
 
 
 
@@ -356,13 +368,15 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     current_idx = 0
     MAX_CANDLES = 6000
     for i, tf in enumerate(timeframes):
-        df = frames[tf]
-        
+        # Copy so x_idx/time_str additions never mutate the caller's frames
+        # (and never trigger SettingWithCopyWarning on the truncated slice).
+        df = frames[tf].copy()
+
         # ── DOM Optimization: Limit short timeframes to the most recent 6000 bars
         if len(df) > MAX_CANDLES:
-            df = df.iloc[-MAX_CANDLES:].copy()
-            frames[tf] = df
-            
+            df = df.iloc[-MAX_CANDLES:]
+
+        frames[tf] = df
         df['x_idx'] = np.arange(len(df)) + current_idx
         if tf in DAILY_OR_ABOVE:
             df['time_str'] = df.index.strftime('%Y-%m-%d')
@@ -519,7 +533,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         fig.update_yaxes(range=y_pb_0, row=3, col=1, secondary_y=False)
 
     # Step 3: Source-aware annotations — shade wick-estimated data regions.
-    _add_source_annotations(fig, frames[timeframes[0]])
+    _add_source_annotations(fig, frames)
 
     return fig
 

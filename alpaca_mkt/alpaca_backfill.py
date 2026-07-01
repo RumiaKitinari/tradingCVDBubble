@@ -1,20 +1,27 @@
 """
-alpaca/alpaca_backfill.py — Step 4: Historical backfill via Alpaca.
+alpaca_mkt/alpaca_backfill.py — Step 4: Historical backfill via Alpaca.
 
 Retrieves historical trade + quote ticks from the Alpaca IEX free feed,
 classifies each trade's aggressor direction using the nearest prior quote
-(same quote-based logic as alpaca_collector.py), and saves to MongoDB in
-one or both of two modes:
+(shared logic in cvd/aggressor.py), and saves to MongoDB in one or both of
+two modes:
 
   --mode 1sec  (default) : aggregate to 1-second OHLCV bars (timeframe='1sec',
                            source='alpaca_tick'). Used by calculator/visualizer.
-  --mode tick            : store every raw trade tick as-is (timeframe='tick',
-                           source='alpaca_tick'). Useful for re-aggregating at
-                           any granularity or for Level-2 research later.
+  --mode tick            : store every raw trade tick as-is with trade id and
+                           condition codes. Useful for re-aggregating at any
+                           granularity or for Level-2 research later.
   --mode both            : save both simultaneously.
 
+Data is fetched in hourly chunks (memory-bounded: a full day of IEX quotes can
+run into millions of rows). Classification state (previous price / tick
+direction / last quote) carries across chunk boundaries, so the result is
+identical to processing the whole range in one pass.
+
 Tick documents have microsecond-precision timestamps (ET-naive) and include
-the matched bid/ask at the time of the trade.
+the matched bid/ask, the Alpaca trade id and the condition codes. The unique
+(ticker, date, id) index makes re-running a range idempotent (duplicates are
+skipped, not re-inserted).
 
 Unlike ibkr/backfill.py (which gets OHLCV bars only → wick decomposition),
 this module uses tick-level bid/ask for REAL aggressor classification even
@@ -23,7 +30,7 @@ for historical data.
 Limitations:
     - IEX free feed: ~2.5% of total market volume; bid/ask is IEX-only (not NBBO).
     - Retention period for tick-level history varies (typically a few years).
-    - 15-min delay on free tier (data up to 15 min ago is available).
+    - The most recent ~15 minutes are unavailable on the free tier.
 
 Usage:
     python -m alpaca_mkt.alpaca_backfill --ticker NVDA --days 1
@@ -45,7 +52,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockTradesRequest, StockQuotesRequest
 from alpaca.data.enums import DataFeed
 
+from cvd.aggressor import classify_vectorized
 from .alpaca_keys import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from .alpaca_collector import _ensure_tick_index, _insert_ticks
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -53,24 +62,33 @@ UTC = ZoneInfo("UTC")
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "finviz_db"
 
+# A trade is only matched to a quote at most this old; older quotes are
+# considered stale (e.g. the previous session's last quote before a
+# pre-market trade) and the tick rule takes over instead.
+QUOTE_TOLERANCE = pd.Timedelta("5s")
+
+# Fetch window per API call. Bounds memory: a full day of IEX quotes can be
+# millions of rows, an hour stays in the hundreds of thousands.
+CHUNK = timedelta(hours=1)
+
 
 # ─────────────────────────────────────────
 # Fetch helpers
 # ─────────────────────────────────────────
 
-def _to_et_naive(ts: datetime) -> datetime:
-    """Convert any tz-aware timestamp to ET-naive (for consistent MongoDB storage)."""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return ts.astimezone(ET).replace(tzinfo=None)
+def _to_et_naive_col(ts: pd.Series) -> pd.Series:
+    """Vectorized: tz-aware timestamp column → ET-naive."""
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("UTC")
+    return ts.dt.tz_convert("America/New_York").dt.tz_localize(None)
 
 
 def _fetch_trades(client: StockHistoricalDataClient, ticker: str,
                   start: datetime, end: datetime) -> pd.DataFrame:
     """
     Fetch historical trade ticks for `ticker` from `start` to `end`.
-    Returns a DataFrame indexed by ET-naive timestamp with columns: price, size.
-    Returns empty DataFrame if no data.
+    Returns a DataFrame with columns: ts, price, size (+id, conditions when
+    provided by the API), sorted by ts. Empty DataFrame if no data.
     """
     try:
         req = StockTradesRequest(
@@ -88,17 +106,19 @@ def _fetch_trades(client: StockHistoricalDataClient, ticker: str,
         return pd.DataFrame()
 
     df = result.df.reset_index()
-    df = df[df["symbol"] == ticker][["timestamp", "price", "size"]].copy()
-    df["timestamp"] = df["timestamp"].apply(_to_et_naive)
-    return df.set_index("timestamp").sort_index()
+    df = df[df["symbol"] == ticker]
+    keep = [c for c in ("timestamp", "price", "size", "id", "conditions") if c in df.columns]
+    df = df[keep].rename(columns={"timestamp": "ts"}).copy()
+    df["ts"] = _to_et_naive_col(df["ts"])
+    return df.sort_values("ts").reset_index(drop=True)
 
 
 def _fetch_quotes(client: StockHistoricalDataClient, ticker: str,
                   start: datetime, end: datetime) -> pd.DataFrame:
     """
     Fetch historical quote ticks for `ticker` from `start` to `end`.
-    Returns a DataFrame indexed by ET-naive timestamp with columns: bid_price, ask_price.
-    Returns empty DataFrame if no data.
+    Returns a DataFrame with columns: ts, bid_price, ask_price, sorted by ts.
+    Empty DataFrame if no data.
     """
     try:
         req = StockQuotesRequest(
@@ -117,76 +137,47 @@ def _fetch_quotes(client: StockHistoricalDataClient, ticker: str,
 
     df = result.df.reset_index()
     df = df[df["symbol"] == ticker][["timestamp", "bid_price", "ask_price"]].copy()
-    df["timestamp"] = df["timestamp"].apply(_to_et_naive)
-    return df.set_index("timestamp").sort_index()
+    df = df.rename(columns={"timestamp": "ts"})
+    df["ts"] = _to_et_naive_col(df["ts"])
+    return df.sort_values("ts").reset_index(drop=True)
 
 
 # ─────────────────────────────────────────
-# Aggressor classification (vectorized)
-# ─────────────────────────────────────────
-
-def _classify_vectorized(price: np.ndarray, size: np.ndarray,
-                         bid: np.ndarray, ask: np.ndarray) -> np.ndarray:
-    """
-    Vectorized aggressor classification.  Same logic as alpaca_collector.classify_aggressor.
-
-    Priority:
-      1. Quote-based: if bid < ask and price >= ask → buy (+size); <= bid → sell (-size).
-      2. Tick-rule fallback for mid-market trades: uptick → buy, downtick → sell.
-      3. Zero for indeterminate.
-    """
-    delta = np.zeros(len(price))
-    prev = np.empty(len(price))
-    prev[0] = np.nan
-    prev[1:] = price[:-1]
-
-    bid_nan = np.isnan(bid)
-    ask_nan = np.isnan(ask)
-    has_spread = ~bid_nan & ~ask_nan & (bid < ask)
-
-    # Quote-based
-    buy_q  = has_spread & (price >= ask)
-    sell_q = has_spread & (price <= bid)
-    delta[buy_q]  =  size[buy_q]
-    delta[sell_q] = -size[sell_q]
-
-    # Tick-rule for mid-market or quotes absent
-    prev_valid = ~np.isnan(prev)
-    needs_tick = ~buy_q & ~sell_q
-    uptick   = needs_tick & prev_valid & (price > prev)
-    downtick = needs_tick & prev_valid & (price < prev)
-    delta[uptick]   =  size[uptick]
-    delta[downtick] = -size[downtick]
-
-    return delta
-
-
-# ─────────────────────────────────────────
-# Aggregate one day's ticks → 1-sec bars
+# Aggregate classified ticks → 1-sec bars
 # ─────────────────────────────────────────
 
 def _aggregate_to_1sec_from_merged(merged: pd.DataFrame, ticker: str) -> list[dict]:
     """
     Aggregate a classified+merged trade DataFrame to 1-second OHLCV bars.
-    Expects columns: ts, price, size, buying_volume, selling_volume, delta.
+    Expects columns: ts, price, size, buying_volume, selling_volume.
     Returns a list of MongoDB documents (timeframe='1sec').
     """
-    merged = merged.copy()
-    merged["second"] = merged["ts"].dt.floor("s")
+    agg = (
+        merged.assign(second=merged["ts"].dt.floor("s"))
+        .groupby("second")
+        .agg(
+            open=("price", "first"),
+            high=("price", "max"),
+            low=("price", "min"),
+            close=("price", "last"),
+            volume=("size", "sum"),
+            buying_volume=("buying_volume", "sum"),
+            selling_volume=("selling_volume", "sum"),
+        )
+    )
 
     docs = []
-    for second, group in merged.groupby("second"):
-        bv = float(group["buying_volume"].sum())
-        sv = float(group["selling_volume"].sum())
+    for row in agg.itertuples():
+        bv, sv = float(row.buying_volume), float(row.selling_volume)
         docs.append({
             "ticker":          ticker,
             "timeframe":       "1sec",
-            "date":            second.to_pydatetime(),
-            "open":            float(group["price"].iloc[0]),
-            "high":            float(group["price"].max()),
-            "low":             float(group["price"].min()),
-            "close":           float(group["price"].iloc[-1]),
-            "volume":          float(group["size"].sum()),
+            "date":            row.Index.to_pydatetime(),
+            "open":            float(row.open),
+            "high":            float(row.high),
+            "low":             float(row.low),
+            "close":           float(row.close),
+            "volume":          float(row.volume),
             "buying_volume":   bv,
             "selling_volume":  sv,
             "delta":           bv - sv,
@@ -196,32 +187,31 @@ def _aggregate_to_1sec_from_merged(merged: pd.DataFrame, ticker: str) -> list[di
 
 
 # ─────────────────────────────────────────
-# Main backfill function
-# ─────────────────────────────────────────
-
-# ─────────────────────────────────────────
 # Raw tick documents
 # ─────────────────────────────────────────
 
 def _build_tick_docs(merged: pd.DataFrame, ticker: str) -> list[dict]:
     """
     Build one MongoDB document per trade tick from a classified+merged DataFrame.
-    timeframe='tick', microsecond-precision ET-naive date.
-
-    conditions list is preserved so odd-lot / out-of-sequence trades can be
-    filtered later (e.g. condition 'I' = odd lot, 'Z' = out of sequence).
+    Microsecond-precision ET-naive date, plus the Alpaca trade id and condition
+    codes so odd-lot / out-of-sequence trades can be filtered later
+    (e.g. condition 'I' = odd lot, 'Z' = out of sequence).
     """
+    has_id   = "id" in merged.columns
+    has_cond = "conditions" in merged.columns
+
     docs = []
     for row in merged.itertuples(index=False):
         docs.append({
             "ticker":     ticker,
-            "timeframe":  "tick",
             "date":       row.ts,            # ET-naive, microsecond precision
             "price":      float(row.price),
             "size":       float(row.size),
             "bid":        float(row.bid_price) if not pd.isna(row.bid_price) else None,
             "ask":        float(row.ask_price) if not pd.isna(row.ask_price) else None,
             "delta":      float(row.delta),
+            "id":         getattr(row, "id", None) if has_id else None,
+            "conditions": list(row.conditions) if has_cond and row.conditions is not None else None,
             "source":     "alpaca_tick",
         })
     return docs
@@ -233,16 +223,16 @@ def _build_tick_docs(merged: pd.DataFrame, ticker: str) -> list[dict]:
 
 def backfill_ticker(ticker: str, start: datetime, end: datetime, mode: str = "1sec"):
     """
-    Backfill Alpaca data for `ticker` from `start` to `end`.
-    Processes one calendar day at a time to keep memory usage bounded.
+    Backfill Alpaca data for `ticker` from `start` to `end` (tz-aware datetimes).
+    Fetches in hourly chunks; classification state carries across chunks.
 
     Args:
         ticker : Stock symbol (e.g. 'NVDA').
-        start  : Start UTC-aware datetime.
-        end    : End UTC-aware datetime.
+        start  : Start tz-aware datetime.
+        end    : End tz-aware datetime.
         mode   : '1sec' | 'tick' | 'both'
                  '1sec' — aggregate to 1-sec OHLCV bars (timeframe='1sec')
-                 'tick' — store raw trade ticks (timeframe='tick')
+                 'tick' — store raw trade ticks (finviz_db.ticks)
                  'both' — save both simultaneously
     """
     save_1sec = mode in ("1sec", "both")
@@ -260,49 +250,54 @@ def backfill_ticker(ticker: str, start: datetime, end: datetime, mode: str = "1s
             unique=True, name="ticker_tf_date", background=True,
         )
     if save_tick:
-        # Non-unique: many ticks per second. Index for range queries by ticker+date.
-        tick_col.create_index(
-            [("ticker", 1), ("date", 1)],
-            name="ticker_date", background=True,
-        )
+        _ensure_tick_index(tick_col)
 
-    logging.info(f"[Backfill] {ticker}: {start.date()} → {end.date()}  mode={mode}")
+    logging.info(f"[Backfill] {ticker}: {start} → {end}  mode={mode}")
     total_1sec = 0
     total_tick = 0
     current = start
 
+    # Classification state carried across hourly chunks
+    prev_price: float | None = None
+    prev_dir: float = 0.0
+    last_quote: pd.DataFrame | None = None   # 1-row df: last quote of the previous chunk
+
     while current < end:
-        chunk_end = min(current + timedelta(days=1), end)
-        logging.info(f"  Day {current.date()} …")
+        chunk_end = min(current + CHUNK, end)
 
-        trades_df = _fetch_trades(client, ticker, current, chunk_end)
-        quotes_df = _fetch_quotes(client, ticker, current, chunk_end)
-        logging.info(f"    {len(trades_df)} trades, {len(quotes_df)} quotes")
+        trades = _fetch_trades(client, ticker, current, chunk_end)
+        quotes = _fetch_quotes(client, ticker, current, chunk_end)
 
-        if trades_df.empty:
-            logging.info("    No trades (market closed or no IEX data).")
+        if trades.empty:
             current = chunk_end
             continue
+        logging.info(f"  {current:%Y-%m-%d %H:%M %Z}: {len(trades)} trades, {len(quotes)} quotes")
 
-        # Build the classified+merged DataFrame once; reuse for both modes.
-        trades = trades_df.reset_index().rename(columns={"timestamp": "ts"})
-        if not quotes_df.empty:
-            quotes = quotes_df.reset_index().rename(columns={"timestamp": "ts"})
+        # Prepend the previous chunk's last quote so trades at the start of
+        # this chunk still match a recent quote (subject to QUOTE_TOLERANCE).
+        if last_quote is not None:
+            quotes = pd.concat([last_quote, quotes], ignore_index=True)
+
+        if not quotes.empty:
             merged = pd.merge_asof(
-                trades.sort_values("ts"),
-                quotes[["ts", "bid_price", "ask_price"]].sort_values("ts"),
+                trades,
+                quotes[["ts", "bid_price", "ask_price"]],
                 on="ts", direction="backward",
+                tolerance=QUOTE_TOLERANCE,
             )
+            last_quote = quotes.iloc[[-1]][["ts", "bid_price", "ask_price"]]
         else:
-            trades["bid_price"] = np.nan
-            trades["ask_price"] = np.nan
             merged = trades.copy()
+            merged["bid_price"] = np.nan
+            merged["ask_price"] = np.nan
 
         price = merged["price"].to_numpy(dtype=float)
         size  = merged["size"].to_numpy(dtype=float)
         bid   = pd.to_numeric(merged["bid_price"], errors="coerce").to_numpy(dtype=float)
         ask   = pd.to_numeric(merged["ask_price"], errors="coerce").to_numpy(dtype=float)
-        delta = _classify_vectorized(price, size, bid, ask)
+        delta, prev_price, prev_dir = classify_vectorized(
+            price, size, bid, ask, prev_price, prev_dir
+        )
         merged["delta"]          = delta
         merged["buying_volume"]  = np.where(delta > 0, delta, 0.0)
         merged["selling_volume"] = np.where(delta < 0, -delta, 0.0)
@@ -319,17 +314,12 @@ def backfill_ticker(ticker: str, start: datetime, end: datetime, mode: str = "1s
                     for d in docs_1sec
                 ]
                 r = col.bulk_write(ops)
-                saved = r.upserted_count + r.modified_count
-                total_1sec += saved
-                logging.info(f"    [1sec] Saved {saved} bars. Total: {total_1sec}")
+                total_1sec += r.upserted_count + r.modified_count
 
         # ── Save raw ticks (separate collection: finviz_db.ticks) ───────────
         if save_tick:
             docs_tick = _build_tick_docs(merged, ticker)
-            if docs_tick:
-                tick_col.insert_many(docs_tick, ordered=False)
-                total_tick += len(docs_tick)
-                logging.info(f"    [tick] Saved {len(docs_tick)} ticks. Total: {total_tick}")
+            total_tick += _insert_ticks(tick_col, docs_tick, f"{ticker} {current:%Y-%m-%d %H}h")
 
         current = chunk_end
 
@@ -352,8 +342,10 @@ def main():
                         help="Ticker(s) to backfill (space-separated)")
     parser.add_argument("--days", type=int, default=1,
                         help="Calendar days to backfill ending now (default: 1)")
-    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD UTC")
-    parser.add_argument("--end",   default=None, help="End date   YYYY-MM-DD UTC")
+    parser.add_argument("--start", default=None,
+                        help="Start date YYYY-MM-DD (ET, midnight)")
+    parser.add_argument("--end", default=None,
+                        help="End date YYYY-MM-DD (ET, inclusive — covers that whole day)")
     parser.add_argument(
         "--mode", default="1sec", choices=["1sec", "tick", "both"],
         help=(
@@ -365,12 +357,17 @@ def main():
     args = parser.parse_args()
 
     now = datetime.now(timezone.utc)
+
+    def _parse_et(s: str) -> datetime:
+        # Trading days are ET days; parse CLI dates as ET midnight.
+        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=ET)
+
     end_dt = (
-        datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        min(_parse_et(args.end) + timedelta(days=1), now)   # inclusive end day
         if args.end else now
     )
     start_dt = (
-        datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        _parse_et(args.start)
         if args.start else (now - timedelta(days=args.days))
     )
 

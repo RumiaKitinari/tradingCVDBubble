@@ -38,53 +38,17 @@ from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 from ib_async import IB, Stock
 
+# Shared aggressor classification (same logic as the Alpaca pipeline).
+# Note: during the closing auction (15:59 ET) the entire MOC order book
+# clears at one price, so all ticks land on either pure-buy or pure-sell —
+# same noise issue as wick decomp; _flag_auction() in calculator.py
+# neutralizes those bars.
+from cvd.aggressor import classify_aggressor, next_tick_dir
+
 ET = ZoneInfo("America/New_York")
 
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "finviz_db"
-
-
-# ─────────────────────────────────────────
-# Aggressor classification
-# ─────────────────────────────────────────
-
-def classify_aggressor(
-    price: float,
-    size: float,
-    bid: float | None,
-    ask: float | None,
-    prev_price: float | None,
-) -> float:
-    """
-    Return the signed delta contribution of one trade tick.
-      + size  → buy aggressor  (market buy hitting the ask)
-      - size  → sell aggressor (market sell hitting the bid)
-      0       → indeterminate  (mid-market, no prior trade)
-
-    Priority:
-      1. Quote-based: price >= ask → buy; price <= bid → sell.
-      2. Tick-rule fallback (when price is between bid and ask): compare
-         to the previous trade price — uptick → buy, downtick → sell.
-      3. Zero if neither quote nor tick-rule can determine direction.
-
-    Note: during the closing auction (15:59 ET) the entire MOC order book
-    clears at one price. All ticks appear at that single price and will land
-    on either pure-buy or pure-sell depending on whether the clearing price
-    equals the ask or bid. This is the same noise issue as with wick decomp;
-    _flag_auction() in calculator.py neutralizes these bars.
-    """
-    if bid is not None and ask is not None and bid < ask:
-        if price >= ask:
-            return size
-        if price <= bid:
-            return -size
-    # Tick-rule fallback
-    if prev_price is not None:
-        if price > prev_price:
-            return size
-        if price < prev_price:
-            return -size
-    return 0.0
 
 
 # ─────────────────────────────────────────
@@ -111,6 +75,7 @@ class TickCollector:
         self.bid: float | None = None
         self.ask: float | None = None
         self.prev_trade_price: float | None = None
+        self.prev_tick_dir: float = 0.0
 
         self.current_second: datetime | None = None
         self.tick_buffer: list[tuple[float, float, float]] = []
@@ -148,9 +113,13 @@ class TickCollector:
 
             price = float(tick.price)
             size = float(tick.size)
-            delta = classify_aggressor(price, size, self.bid, self.ask, self.prev_trade_price)
-            self.tick_buffer.append((price, size, delta))
+            delta = classify_aggressor(
+                price, size, self.bid, self.ask,
+                self.prev_trade_price, self.prev_tick_dir,
+            )
+            self.prev_tick_dir = next_tick_dir(price, self.prev_trade_price, self.prev_tick_dir)
             self.prev_trade_price = price
+            self.tick_buffer.append((price, size, delta))
 
     def _on_bidask_tick(self, ticker_obj):
         """Called by ib_async when new BidAsk (quote) ticks arrive."""

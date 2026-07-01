@@ -29,7 +29,7 @@ from .alpaca_collector import AlpacaCollectorGroup
 # Chart regeneration loop
 # ─────────────────────────────────────────
 
-def _chart_loop(ticker: str, interval_s: int):
+def _chart_loop(ticker: str, interval_s: int, chart_days: int | None):
     """Regenerate the CVD chart every `interval_s` seconds using 1-sec Alpaca data."""
     while True:
         time.sleep(interval_s)
@@ -38,7 +38,7 @@ def _chart_loop(ticker: str, interval_s: int):
             from cvd.visualizer import build_chart, write_chart_html
 
             logging.info(f"[Chart] Regenerating for {ticker}...")
-            df_base, frames = run_pipeline(ticker, base_timeframe="1sec")
+            df_base, frames = run_pipeline(ticker, base_timeframe="1sec", days=chart_days)
             if not df_base.empty and frames:
                 fig = build_chart(df_base, frames, ticker)
                 path = f"{ticker}_alpaca_chart.html"
@@ -67,6 +67,11 @@ def main():
         "--chart-interval", type=int, default=0, dest="chart_interval",
         help="Seconds between chart regenerations (0 = off, e.g. 300 = every 5 min)",
     )
+    parser.add_argument(
+        "--chart-days", type=int, default=0, dest="chart_days",
+        help="Only chart the last N days of 1-sec data (0 = everything). "
+             "Keeps regeneration and the HTML small once weeks of data accumulate.",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--save-ticks", action="store_true", dest="save_ticks",
@@ -88,10 +93,11 @@ def main():
 
     # Optional chart threads (one per ticker)
     if args.chart_interval > 0:
+        chart_days = args.chart_days if args.chart_days > 0 else None
         for ticker in args.ticker:
             ct = threading.Thread(
                 target=_chart_loop,
-                args=(ticker, args.chart_interval),
+                args=(ticker, args.chart_interval, chart_days),
                 daemon=True,
                 name=f"chart-{ticker}",
             )
