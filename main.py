@@ -80,12 +80,14 @@ def calculate_and_show(ticker: str, save_html: bool = True, open_browser: bool =
     fig = build_chart(df_1min, frames, ticker)
 
     if save_html:
-        path = f"{ticker}_cvd_chart.html"
+        path = "chart.html"
         write_chart_html(fig, path)
         print(f"[Visualizer] Saved → {path}")
 
     if open_browser:
-        fig.show()
+        import webbrowser
+        import os
+        webbrowser.open(f"file://{os.path.abspath(path)}")
 
 
 # ─────────────────────────────────────────

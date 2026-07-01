@@ -167,10 +167,10 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # FinViz dates are strings "MM/DD/YYYY HH:MM AM/PM"; IBKR dates come from
     # MongoDB as native datetimes.  Detect by dtype and handle each separately.
     if "date" in df.columns:
-        if df["date"].dtype == object:
+        if pd.api.types.is_string_dtype(df["date"]):
             # FinViz format: "13:00 PM" suffix is redundant but present; strip it.
             df["date"] = pd.to_datetime(
-                df["date"].str.replace(r'\s*(AM|PM)$', '', regex=True),
+                df["date"].astype(str).str.replace(r'\s*(AM|PM)$', '', regex=True),
                 format="%m/%d/%Y %H:%M",
                 errors="coerce",
             )
