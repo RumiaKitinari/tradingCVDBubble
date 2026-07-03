@@ -31,6 +31,7 @@ from .alpaca_collector import AlpacaCollectorGroup
 
 def _chart_loop(ticker: str, interval_s: int, chart_days: int | None):
     """Regenerate the CVD chart every `interval_s` seconds using 1-sec Alpaca data."""
+    is_first = True
     while True:
         time.sleep(interval_s)
         try:
@@ -44,6 +45,12 @@ def _chart_loop(ticker: str, interval_s: int, chart_days: int | None):
                 path = f"{ticker}_alpaca_chart.html"
                 write_chart_html(fig, path)
                 logging.info(f"[Chart] Saved → {path}")
+                
+                if is_first:
+                    import webbrowser
+                    import os
+                    webbrowser.open(f"file://{os.path.abspath(path)}")
+                    is_first = False
             else:
                 logging.warning(f"[Chart] No data yet for {ticker} — skipping (run backfill first).")
         except Exception as e:

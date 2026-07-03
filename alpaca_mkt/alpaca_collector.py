@@ -297,21 +297,40 @@ class AlpacaCollectorGroup:
             await col.on_quote(data)
 
     def run(self):
-        """Subscribe to all tickers and start the blocking stream loop."""
+        """Subscribe to all tickers and start the blocking stream loop.
+
+        On connection failure (e.g. Alpaca's 1-connection limit), waits 30s
+        before retrying so we don't hammer the server with rapid reconnects.
+        """
         self.stream.subscribe_trades(self._on_trade, *self.tickers)
         self.stream.subscribe_quotes(self._on_quote, *self.tickers)
         logging.info(
             f"[Alpaca] Streaming ticks for {self.tickers} → MongoDB (1-sec bars). "
             "Press Ctrl+C to stop."
         )
-        try:
-            self.stream.run()
-        except (KeyboardInterrupt, SystemExit):
-            pass
-        finally:
-            for col in self.collectors.values():
-                col.flush_last()
-            logging.info("[Alpaca] Collector stopped.")
+        import time
+        retry_delay = 30
+        while True:
+            try:
+                self.stream.run()
+                break  # clean exit (KeyboardInterrupt handled inside stream.run)
+            except (KeyboardInterrupt, SystemExit):
+                break
+            except ValueError as e:
+                if "connection limit" in str(e).lower():
+                    logging.error(
+                        f"[Alpaca] Connection limit exceeded — another session may be open. "
+                        f"Retrying in {retry_delay}s... (kill other alpaca_main processes first)"
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    raise
+            except Exception as e:
+                logging.error(f"[Alpaca] Stream error: {e}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+        for col in self.collectors.values():
+            col.flush_last()
+        logging.info("[Alpaca] Collector stopped.")
 
     def stop(self):
         """Flush all partial buffers and stop the stream."""

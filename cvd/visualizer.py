@@ -111,8 +111,69 @@ gd.on('plotly_relayout', function(ev) {
     if (keys.some(function(k) { return k.indexOf('xaxis') === 0; })) requestRefit();
 });
 
-gd.on('plotly_restyle', function() { if (!busy) requestRefit(); });
+// ── Toggle Bubble Button ──
+var toggleBtn = document.createElement('button');
+toggleBtn.innerHTML = 'Toggle Bubble Chart';
+toggleBtn.style.position = 'absolute';
+toggleBtn.style.top = '10px';
+toggleBtn.style.left = '10px';
+toggleBtn.style.zIndex = '1000';
+toggleBtn.style.padding = '8px 12px';
+toggleBtn.style.backgroundColor = '#444';
+toggleBtn.style.color = '#fff';
+toggleBtn.style.border = '1px solid #777';
+toggleBtn.style.borderRadius = '4px';
+toggleBtn.style.cursor = 'pointer';
+toggleBtn.style.fontFamily = 'sans-serif';
+toggleBtn.style.fontSize = '12px';
 
+var bubble_state = false;
+var enforcing_bubbles = false;
+
+function applyBubbleState() {
+    if (enforcing_bubbles) return;
+    enforcing_bubbles = true;
+    
+    var update_indices = [];
+    var new_visibility = [];
+    
+    for(var i=0; i<gd.data.length; i++) {
+        if(gd.data[i].name && gd.data[i].name.indexOf('Bubble') > -1) {
+            var is_outer = gd.data[i].name.indexOf('Outer') > -1;
+            // The candle trace is 1 or 2 indices before the bubble trace
+            var candle_idx = is_outer ? i - 1 : i - 2;
+            var candle_visible = gd.data[candle_idx].visible === true;
+            
+            var target_visible = bubble_state && candle_visible;
+            if (gd.data[i].visible !== target_visible) {
+                update_indices.push(i);
+                new_visibility.push(target_visible);
+            }
+        }
+    }
+    
+    if (update_indices.length > 0) {
+        Plotly.restyle(gd, {'visible': new_visibility}, update_indices).then(function() {
+            enforcing_bubbles = false;
+            requestRefit();
+        });
+    } else {
+        enforcing_bubbles = false;
+    }
+}
+
+toggleBtn.onclick = function() {
+    bubble_state = !bubble_state;
+    toggleBtn.style.backgroundColor = bubble_state ? '#26a69a' : '#444';
+    applyBubbleState();
+};
+
+document.body.appendChild(toggleBtn);
+
+gd.on('plotly_restyle', function() { 
+    if (!busy) requestRefit(); 
+    applyBubbleState();
+});
 document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     // Timeframe hotkeys: 1-9 = buttons 1-9, 0 = 10th, - = 11th
@@ -385,7 +446,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         tf_offsets[tf] = current_idx
         current_idx += len(df)
 
-    N_TRACES = 17
+    N_TRACES = 19
 
     for tf in timeframes:
         df = frames[tf]
@@ -398,8 +459,55 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
             increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
             visible=on, showlegend=False, customdata=df['time_str'],
-            hovertemplate="<b>%{customdata}</b><br>Open: %{open:.2f}<br>High: %{high:.2f}<br>Low: %{low:.2f}<br>Close: %{close:.2f}<extra></extra>"
-        ), row=1, col=1)
+            hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
+        ), row=1, col=1, secondary_y=False)
+
+        # ── Phase 3: Bullseye Bubble Chart Overlay ──
+        # Determine dominant direction
+        actual_buy_vol = df["buy_pressure"].fillna(0)
+        actual_sell_vol = df["sell_pressure"].fillna(0)
+        is_buy_dom = actual_buy_vol >= actual_sell_vol
+        
+        outer_color = np.where(is_buy_dom, "rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)")
+        inner_color = np.where(is_buy_dom, "rgba(239,83,80,0.9)", "rgba(38,166,154,0.9)")
+        
+        actual_min_vol = np.minimum(actual_buy_vol, actual_sell_vol)
+        actual_tot_vol = df["volume"].fillna(0)
+        
+        # Option 1: Compress the overall bubble size using square root (power=0.5) 
+        # so huge spikes don't crush the typical candles into tiny dots.
+        # Plotly's sizemode='area' means the 'size' array maps linearly to visual area.
+        power = 0.5
+        tot_vol = actual_tot_vol ** power
+        
+        # To strictly preserve the visual ratio, the inner bubble's area MUST be 
+        # the outer area multiplied by the actual volume ratio.
+        ratio = np.where(actual_tot_vol > 0, actual_min_vol / actual_tot_vol, 0)
+        min_vol = tot_vol * ratio
+        
+        # We calculate the y-position of the bubble as the typical price (H+L+C)/3, or simply close.
+        # But to place it on the candle body, VWAP or (Open+Close)/2 is nice.
+        bubble_y = (df["open"] + df["close"]) / 2
+
+        # Sizing ref: scale the average compressed volume to a nice 12px radius
+        ref_vol = tot_vol.mean() if not tot_vol.empty else 1
+        ref_vol = max(ref_vol, 1)
+        sizeref = 2.0 * ref_vol / (12 ** 2)
+
+        fig.add_trace(go.Scatter(
+            x=df['x_idx'], y=bubble_y,
+            mode='markers', name=f"Bubble Outer ({tf})",
+            marker=dict(size=tot_vol, sizemode='area', sizeref=sizeref, sizemin=1, color=outer_color, line=dict(width=0)),
+            visible=False, showlegend=False, hoverinfo="skip"
+        ), row=1, col=1, secondary_y=False)
+
+        fig.add_trace(go.Scatter(
+            x=df['x_idx'], y=bubble_y,
+            mode='markers', name=f"Bubble Inner ({tf})",
+            marker=dict(size=min_vol, sizemode='area', sizeref=sizeref, sizemin=0, color=inner_color, line=dict(width=0)),
+            visible=False, showlegend=False, hoverinfo="skip"
+        ), row=1, col=1, secondary_y=False)
+
 
         # Screen 2: defaults to Buy/Sell volume; Screen 3: defaults to CVD (session)
         _add_indicator_panel(fig, df, row=2, legend_id="legend",  on=on,
@@ -420,14 +528,15 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         visibility = []
         for j in range(len(timeframes)):
             if j == i:
-                visibility += [True] + panelA + panelB
+                # Candle, Bubble Outer, Bubble Inner
+                visibility += [True, False, False] + panelA + panelB
             else:
                 visibility += [False] * N_TRACES
 
         showlegend = []
         for j in range(len(timeframes)):
             if j == i:
-                showlegend += [False] + [True] * 16
+                showlegend += [False, False, False] + [True] * 16
             else:
                 showlegend += [False] * N_TRACES
 

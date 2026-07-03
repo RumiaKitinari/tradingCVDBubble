@@ -134,8 +134,13 @@ def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float =
     reg_med = df.loc[reg].groupby(lambda ix: ix.date())["volume"].median()
 
     flag = pd.Series(False, index=df.index)
-    afternoon = df[minute >= 720]                          # >= 12:00
-    for d, g in afternoon.groupby(lambda ix: ix.date()):
+    
+    # Restrict anchor search to typical closing cross windows: 12:59-13:01 (early close) and 15:59-16:01 (regular close).
+    # This prevents massive after-hours news spikes (e.g. 16:20) from being misidentified as the closing auction.
+    is_candidate = ((minute >= 779) & (minute <= 781)) | ((minute >= 959) & (minute <= 961))
+    candidates = df[is_candidate]
+    
+    for d, g in candidates.groupby(lambda ix: ix.date()):
         if g.empty:
             continue
         med = reg_med.get(d, float("nan"))
@@ -143,10 +148,12 @@ def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float =
         if not (pd.isna(med) or g.loc[anchor, "volume"] > mult * med):
             continue
         flag.loc[anchor] = True
-        gi = g.index
-        for k in range(gi.get_loc(anchor) + 1, len(gi)):   # forward spill
-            if g["volume"].iloc[k] > spill_mult * med:
-                flag.loc[gi[k]] = True
+        
+        # Spill logic must iterate over the full day's index, not just the candidates
+        day_idx = df[df.index.date == d].index
+        for k in range(day_idx.get_loc(anchor) + 1, len(day_idx)):   # forward spill
+            if df.loc[day_idx[k], "volume"] > spill_mult * med:
+                flag.loc[day_idx[k]] = True
             else:
                 break
     return flag
@@ -254,6 +261,13 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # default CVD, and keep an un-neutralized `delta_raw` so a "CVD raw (incl.
     # auction)" line stays available for comparison. See Personal Study Log §8.
     df["is_auction"]     = _flag_auction(df)
+    
+    # Do not neutralize real tick sources. Their high volume at 16:00 represents genuine 
+    # directional aggressive trades with real Bid/Ask matching, not a single MOC print.
+    if "source" in df.columns:
+        real_ticks = df["source"].isin(["alpaca_tick", "ibkr_tick"])
+        df.loc[real_ticks, "is_auction"] = False
+
     df["delta_raw"]      = df["delta"]                       # before neutralization
     auc = df["is_auction"]
     df.loc[auc, "buying_volume"]  = df.loc[auc, "volume"] / 2
