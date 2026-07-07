@@ -260,6 +260,11 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     """default_on: set of trace names shown by default in this panel."""
     ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
 
+    # Determine if this panel contains estimated data
+    has_wick = "source" in df.columns and df["source"].astype(str).str.contains("wick").any()
+    buy_name = "Buy Volume (est.)" if has_wick else "Buy Volume"
+    sell_name = "Sell Volume (est.)" if has_wick else "Sell Volume"
+
     # Gray out bars whose volume is dominated by the closing auction (>50%):
     # their buy/sell split is neutralized (50/50) so the direction isn't real.
     GRAY = "rgba(150,150,150,0.80)"
@@ -275,14 +280,14 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     sell_custom = np.stack((df['time_str'], df["sell_pressure"]), axis=-1)
 
     fig.add_trace(go.Bar(
-        x=df['x_idx'], y=df["buy_pressure"], name="Buy Volume",
+        x=df['x_idx'], y=df["buy_pressure"], name=buy_name,
         marker_color=buy_colors, visible=vis("Buy Volume"), showlegend=on,
         legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Buy: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
     fig.add_trace(go.Bar(
-        x=df['x_idx'], y=-df["sell_pressure"], name="Sell Volume",
+        x=df['x_idx'], y=-df["sell_pressure"], name=sell_name,
         marker_color=sell_colors, visible=vis("Sell Volume"), showlegend=on,
         legend=legend_id, customdata=sell_custom,
         hovertemplate="<b>%{customdata[0]}</b><br>Sell: %{customdata[1]:,.0f}<extra></extra>",
@@ -406,7 +411,7 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
 
 
 
-def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
+def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None) -> go.Figure:
 
     fig = make_subplots(
         rows=3, cols=1,
@@ -422,8 +427,13 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     )
 
     timeframes = list(frames.keys())
-    default_tf = "1hr" if "1hr" in timeframes else timeframes[-1]
-    default_idx = timeframes.index(default_tf)
+    if active_timeframe and active_timeframe in timeframes:
+        timeframes = [active_timeframe]
+        default_tf = active_timeframe
+        default_idx = 0
+    else:
+        default_tf = "1hr" if "1hr" in timeframes else timeframes[-1]
+        default_idx = timeframes.index(default_tf)
 
     tf_offsets = {}
     current_idx = 0
@@ -445,6 +455,14 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             df['time_str'] = df.index.strftime('%Y-%m-%d %H:%M')
         tf_offsets[tf] = current_idx
         current_idx += len(df)
+        
+    # Get predominant source for title
+    df_active = frames[default_tf]
+    if not df_active.empty and "source" in df_active.columns:
+        top_src = df_active["source"].mode()
+        src_str = top_src.iloc[0] if not top_src.empty else "unknown"
+    else:
+        src_str = "unknown"
 
     N_TRACES = 19
 
@@ -587,14 +605,15 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     y_pa_0 = _yrange(pd.concat([in0["buy_pressure"], -in0["sell_pressure"]]))
     y_pb_0 = _yrange(in0["cvd_all_end"])
 
-    fig.update_layout(
-        title=dict(text=f"<b>{ticker}</b> — {default_tf}", font=dict(size=18)),
+    layout_kwargs = dict(
+        title=dict(text=f"<b>{ticker}</b> — {default_tf} <span style='font-size:12px;color:gray;'>(Source: {src_str})</span>", font=dict(size=18)),
         template="plotly_dark",
         height=1150,
         barmode="overlay",
         bargap=0.1,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
+        hoverlabel=dict(bgcolor="rgba(25, 25, 25, 0.95)", font_size=12, font_color="white", bordercolor="#444"),
         dragmode="pan",  # Left-click drags to pan instead of selecting a zoom box
         # two independent legends, one per indicator panel
         legend=dict(orientation="h", yanchor="bottom", y=0.25, xanchor="left", x=0,
@@ -603,12 +622,15 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
                      bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
         margin=dict(l=60, r=60, t=120, b=60),
         uirevision="constant",  # Prevents Plotly from resetting UI state on relayout
-        updatemenus=[
+    )
+    if not active_timeframe:
+        layout_kwargs["updatemenus"] = [
             dict(type="buttons", direction="right", x=0.0, y=1.09, xanchor="left",
                  buttons=buttons, bgcolor="#2d2d2d", bordercolor="#888",
                  font=dict(color="#aaaaaa", size=12), active=default_idx),
-        ],
-    )
+        ]
+        
+    fig.update_layout(**layout_kwargs)
 
     fig.update_xaxes(type="linear", showticklabels=False, showspikes=True, spikemode="across", spikedash="solid", spikecolor="gray", spikethickness=1)
     fig.update_yaxes(title_text="Price (USD)", fixedrange=True, row=1, col=1, showspikes=True, spikemode="across", spikedash="solid", spikecolor="gray", spikethickness=1)
