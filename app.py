@@ -279,6 +279,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
+            uirevision=ticker,
         )
         
         import datetime
