@@ -336,6 +336,8 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
         # Return fig, text, empty string for loading, new state, and base_tf (for radio button)
         return fig, msg, "", current_state, new_base_tf
         
+    except PreventUpdate:
+        raise
     except Exception as e:
         logging.error(f"Error building chart: {e}")
         import traceback
