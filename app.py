@@ -24,18 +24,14 @@ app.layout = html.Div([
     dbc.Container([
         dbc.Row([
             dbc.Col([
-                html.Label("Select Ticker:", style={"fontWeight": "bold", "color": "#eee"}),
-                dcc.Dropdown(
-                    id='ticker-dropdown',
-                    options=[
-                        {'label': 'NVDA', 'value': 'NVDA'},
-                        {'label': 'AAPL', 'value': 'AAPL'},
-                        {'label': 'TSLA', 'value': 'TSLA'},
-                        {'label': 'MOCK_NVDA (Test Ticks)', 'value': 'MOCK_NVDA'}
-                    ],
-                    value='MOCK_NVDA',
-                    clearable=False,
-                    style={"color": "#000"} 
+                html.Label("Search Ticker:", style={"fontWeight": "bold", "color": "#eee"}),
+                dbc.Input(
+                    id='ticker-input', 
+                    value='MOCK_NVDA', 
+                    type='text', 
+                    debounce=True, 
+                    placeholder="Enter Ticker & hit Enter...",
+                    style={"color": "#000", "backgroundColor": "white"}
                 )
             ], width=2),
             
@@ -68,42 +64,51 @@ app.layout = html.Div([
             
             dbc.Col([
                 html.Button("Manual Refresh", id="refresh-btn", className="btn btn-outline-info btn-sm mt-4 w-100")
-            ], width=2),
+            ], width=1),
             
             dbc.Col([
-                html.Div(id='last-updated-text', className="mt-4 text-muted text-end", style={"fontSize": "14px"})
-            ], width=3)
+                html.Div(id='last-updated-text', className="mt-4 text-muted text-end", style={"fontSize": "14px", "marginRight": "10px"})
+            ], width=3),
+            
+            # Isolated Loading Spinner (does not wrap the main chart)
+            dbc.Col([
+                html.Div([
+                    dcc.Loading(
+                        id="loading-spinner",
+                        type="circle",
+                        color="#29b6f6",
+                        children=html.Div(id='loading-dummy', style={"width": "30px", "height": "30px"})
+                    )
+                ], className="mt-3")
+            ], width=1)
+            
         ], className="mb-3 align-items-center"),
         
-        # Main Chart Area with Darker Glassmorphism wrapper and Loading Spinner
+        # Main Chart Area
         html.Div([
-            dcc.Loading(
-                id="loading-chart",
-                type="dot",
-                color="#29b6f6",
-                children=[
-                    dcc.Graph(
-                        id='main-chart',
-                        style={'height': '1100px'},
-                        config={'scrollZoom': True, 'displayModeBar': False}
-                    )
-                ]
+            dcc.Graph(
+                id='main-chart',
+                style={'height': '1100px'},
+                config={'scrollZoom': True, 'displayModeBar': False}
             )
         ], style={
             "padding": "10px", 
-            "backgroundColor": "rgba(10, 10, 10, 0.8)", # Darker for better text contrast
+            "backgroundColor": "rgba(10, 10, 10, 0.8)", 
             "backdropFilter": "blur(15px)",
             "borderRadius": "12px",
             "border": "1px solid rgba(255, 255, 255, 0.1)",
             "boxShadow": "0 8px 32px 0 rgba(0, 0, 0, 0.5)"
         }),
         
-        # Auto-refresh interval (every 10 seconds to prevent overlapping callback hell)
         dcc.Interval(
             id='interval-component',
             interval=10 * 1000, 
             n_intervals=0
-        )
+        ),
+        
+        # Dummy div for clientside callback to prevent invalid ID errors
+        html.Div(id='clientside-dummy', style={'display': 'none'})
+        
     ], fluid=True, style={"padding": "0 2% 50px 2%"})
 ], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
 
@@ -117,25 +122,23 @@ app.layout = html.Div([
     [State('timeframe-dropdown', 'value')]
 )
 def update_timeframes(base_tf, current_value):
-    # Determine available timeframes based on base source
     if base_tf == 'raw_tick':
         tfs = ["raw_tick"] + list(TIMEFRAME_RULE_IBKR.keys())
     elif base_tf == '1sec':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
-    else: # i1 (FinViz)
+    else: 
         tfs = list(TIMEFRAME_RULE.keys())
         
     options = [{'label': t, 'value': t} for t in tfs]
-    
-    # Keep current value if it's still valid, otherwise default to '1hr' or the last option
     new_value = current_value if current_value in tfs else ("1hr" if "1hr" in tfs else tfs[-1])
     return options, new_value
 
 
 @app.callback(
     [Output('main-chart', 'figure'),
-     Output('last-updated-text', 'children')],
-    [Input('ticker-dropdown', 'value'),
+     Output('last-updated-text', 'children'),
+     Output('loading-dummy', 'children')],
+    [Input('ticker-input', 'value'),
      Input('source-radio', 'value'),
      Input('timeframe-dropdown', 'value'),
      Input('interval-component', 'n_intervals'),
@@ -143,6 +146,10 @@ def update_timeframes(base_tf, current_value):
 )
 def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
     trigger = ctx.triggered_id
+    if not ticker:
+        raise PreventUpdate
+    
+    ticker = str(ticker).strip().upper()
     logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf}")
     
     try:
@@ -153,7 +160,6 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
             logging.info(f"No data for {ticker}. Attempting auto-fetch...")
             try:
                 from finviz.new_finviz import fetch_and_save
-                # We can always try to fetch 1-min data from finviz as fallback
                 fetch_and_save(ticker, timeframe="i1")
                 df_base, frames = run_pipeline(ticker, base_timeframe=base_tf)
             except Exception as e:
@@ -169,12 +175,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data"
+            return empty_fig, "No Data", ""
             
-        # Passing active_timeframe dramatically speeds up rendering
         fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf)
         
-        # Remove the paper background so the glassmorphism div shows through
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
@@ -183,7 +187,9 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
         import datetime
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger})"
-        return fig, msg
+        
+        # Return fig, text, and empty string for the loading dummy
+        return fig, msg, ""
         
     except Exception as e:
         logging.error(f"Error building chart: {e}")
@@ -193,18 +199,17 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
 
 
 # ── Clientside Callback for Y-Axis Auto-Scaling ──
-# Dash ignores post_script from write_html, so we port the logic to clientside_callback.
 app.clientside_callback(
     """
     function(relayoutData) {
         if (!relayoutData) return window.dash_clientside.no_update;
         
-        // Check if x-axis range changed
         var keys = Object.keys(relayoutData);
         var hasX = keys.some(function(k) { return k.indexOf('xaxis') === 0; });
         if (!hasX) return window.dash_clientside.no_update;
 
-        // Give the DOM a tiny moment to settle before refitting
+        if (window.__is_refitting) return window.dash_clientside.no_update;
+
         setTimeout(function() {
             var gd = document.getElementById('main-chart');
             if (!gd || !gd._fullLayout) return;
@@ -247,18 +252,29 @@ app.clientside_callback(
                 });
                 if (lo < hi && lo !== Infinity) {
                     var pad = (hi - lo) * YPAD;
-                    upd[LEFT[yref] + '.range'] = [lo - pad, hi + pad];
+                    var new_lo = lo - pad;
+                    var new_hi = hi + pad;
+                    
+                    // Only update if range changed significantly to avoid jitter loops
+                    var old_range = gd._fullLayout[LEFT[yref]] ? gd._fullLayout[LEFT[yref]].range : null;
+                    if (!old_range || Math.abs(old_range[0] - new_lo) > 0.05 || Math.abs(old_range[1] - new_hi) > 0.05) {
+                        upd[LEFT[yref] + '.range'] = [new_lo, new_hi];
+                    }
                 }
             });
+            
             if (Object.keys(upd).length > 0) {
-                Plotly.relayout(gd, upd);
+                window.__is_refitting = true;
+                Plotly.relayout(gd, upd).then(function() {
+                    setTimeout(function() { window.__is_refitting = false; }, 200);
+                });
             }
-        }, 100);
+        }, 150);
         
         return window.dash_clientside.no_update;
     }
     """,
-    Output('main-chart', 'id'), # Dummy output
+    Output('clientside-dummy', 'children'),
     Input('main-chart', 'relayoutData')
 )
 
