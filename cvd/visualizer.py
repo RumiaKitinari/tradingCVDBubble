@@ -452,15 +452,28 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         df = frames[tf]
         on = (tf == default_tf)
 
-        # Screen 1: candle
-        fig.add_trace(go.Candlestick(
-            x=df['x_idx'], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-            name=f"Candle ({tf})",
-            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-            increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-            visible=on, showlegend=False, customdata=df['time_str'],
-            hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
-        ), row=1, col=1, secondary_y=False)
+        # Screen 1: candle or scatter (for raw ticks)
+        if tf == "raw_tick":
+            # For raw ticks, OHLC are all the same, so we plot a simple line or scatter.
+            # Using markers allows seeing individual trades clearly.
+            fig.add_trace(go.Scatter(
+                x=df['x_idx'], y=df["close"],
+                mode="lines+markers",
+                name=f"Raw Ticks",
+                line=dict(color="#29b6f6", width=1),
+                marker=dict(size=3, color="#29b6f6"),
+                visible=on, showlegend=False, customdata=df['time_str'],
+                hovertemplate="<b>%{customdata}</b><br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1, secondary_y=False)
+        else:
+            fig.add_trace(go.Candlestick(
+                x=df['x_idx'], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                name=f"Candle ({tf})",
+                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+                visible=on, showlegend=False, customdata=df['time_str'],
+                hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
+            ), row=1, col=1, secondary_y=False)
 
         # ── Phase 3: Bullseye Bubble Chart Overlay ──
         # Determine dominant direction

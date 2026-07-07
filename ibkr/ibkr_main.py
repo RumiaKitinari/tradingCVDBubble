@@ -33,7 +33,7 @@ async def _chart_loop(ticker: str, interval_s: int):
             from cvd.visualizer import build_chart, write_chart_html
 
             logging.info(f"[Chart] Regenerating for {ticker}...")
-            df_base, frames = run_pipeline(ticker, base_timeframe="1sec")
+            df_base, frames = run_pipeline(ticker, base_timeframe="raw_tick")
             if not df_base.empty and frames:
                 fig = build_chart(df_base, frames, ticker)
                 path = f"{ticker}_ibkr_chart.html"

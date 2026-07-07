@@ -79,9 +79,12 @@ class TickCollector:
 
         self.current_second: datetime | None = None
         self.tick_buffer: list[tuple[float, float, float]] = []
+        self.raw_buffer = []
 
         mongo = MongoClient(MONGO_URI)
         self.col = mongo[DB_NAME]["candles"]
+        self.raw_col = mongo[DB_NAME]["raw_ticks"]
+        self.raw_col.create_index([("ticker", 1), ("date", 1)], background=True)
         self.col.create_index(
             [("ticker", 1), ("timeframe", 1), ("date", 1)],
             unique=True,
@@ -120,6 +123,16 @@ class TickCollector:
             self.prev_tick_dir = next_tick_dir(price, self.prev_trade_price, self.prev_tick_dir)
             self.prev_trade_price = price
             self.tick_buffer.append((price, size, delta))
+            
+            # Save raw tick
+            self.raw_buffer.append({
+                "ticker": self.ticker,
+                "date": ts, # Exact datetime with microsecond precision
+                "price": price,
+                "size": size,
+                "delta": delta,
+                "source": "ibkr_tick"
+            })
 
     def _on_bidask_tick(self, ticker_obj):
         """Called by ib_async when new BidAsk (quote) ticks arrive."""
@@ -137,6 +150,14 @@ class TickCollector:
         """Aggregate tick_buffer into a 1-sec OHLCV bar and upsert to MongoDB."""
         if not self.tick_buffer:
             return
+            
+        # Bulk insert raw ticks
+        if self.raw_buffer:
+            try:
+                self.raw_col.insert_many(self.raw_buffer)
+            except Exception as e:
+                logging.error(f"MongoDB raw tick insert error: {e}")
+            self.raw_buffer = []
 
         prices = [t[0] for t in self.tick_buffer]
         sizes = [t[1] for t in self.tick_buffer]

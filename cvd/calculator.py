@@ -302,6 +302,7 @@ TIMEFRAME_RULE = {
 # These two extra keys are omitted from TIMEFRAME_RULE (FinViz base) because
 # resampling 1-min bars to 1-sec would upsample and produce empty rows.
 TIMEFRAME_RULE_IBKR = {
+    "raw_tick": "0S", # Special case for raw ticks
     "1sec":   "1s",
     "5sec":   "5s",
     **TIMEFRAME_RULE,
@@ -397,25 +398,41 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
           query would silently exclude).
     """
     client = MongoClient("mongodb://localhost:27017/")
-    collection = client["finviz_db"]["candles"]
-
-    query = {"ticker": ticker, "timeframe": timeframe}
-    if days is not None:
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-        # Stored dates are ET-naive, so compute the cutoff in ET as well.
-        now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
-        query["date"] = {"$gte": now_et - timedelta(days=days)}
-
-    docs = list(collection.find(
-        query,
-        {
-            "_id": 0,
-            "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
-            # Pre-computed by tick_collector (ibkr_tick) — absent for FinViz docs.
-            "buying_volume": 1, "selling_volume": 1, "delta": 1, "source": 1,
-        }
-    ))
+    if timeframe == "raw_tick":
+        collection = client["finviz_db"]["raw_ticks"]
+        query = {"ticker": ticker}
+        if days is not None:
+            now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            query["date"] = {"$gte": now_et - timedelta(days=days)}
+        docs = list(collection.find(
+            query,
+            {"_id": 0, "date": 1, "price": 1, "size": 1, "delta": 1, "source": 1}
+        ))
+        # Convert raw ticks to OHLCV format so the rest of the pipeline works seamlessly
+        for doc in docs:
+            p = doc.pop("price")
+            s = doc.pop("size")
+            d = doc["delta"]
+            doc["open"] = doc["high"] = doc["low"] = doc["close"] = p
+            doc["volume"] = s
+            doc["buying_volume"] = s if d > 0 else 0.0
+            doc["selling_volume"] = s if d < 0 else 0.0
+    else:
+        collection = client["finviz_db"]["candles"]
+        query = {"ticker": ticker, "timeframe": timeframe}
+        if days is not None:
+            now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            query["date"] = {"$gte": now_et - timedelta(days=days)}
+        
+        docs = list(collection.find(
+            query,
+            {
+                "_id": 0,
+                "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+                # Pre-computed by tick_collector (ibkr_tick) — absent for FinViz docs.
+                "buying_volume": 1, "selling_volume": 1, "delta": 1, "source": 1,
+            }
+        ))
 
     if not docs:
         print(f"[MongoDB] No data found for {ticker} ({timeframe})")
@@ -463,8 +480,16 @@ def run_pipeline(
     df_base = add_cvd_columns(df_raw)
 
     # Choose the right timeframe map: IBKR adds 1sec / 5sec buttons to the chart.
-    tf_map = TIMEFRAME_RULE_IBKR if base_timeframe == "1sec" else TIMEFRAME_RULE
-    frames = {tf: aggregate_pressure(df_base, tf) for tf in tf_map}
+    if base_timeframe in ["1sec", "raw_tick"]:
+        tf_map = TIMEFRAME_RULE_IBKR
+    else:
+        tf_map = TIMEFRAME_RULE
+        
+    frames = {}
+    for tf, rule in tf_map.items():
+        if tf == "raw_tick":
+            continue # Don't aggregate raw ticks
+        frames[tf] = aggregate_pressure(df_base, tf)
 
     sources = df_base["source"].value_counts().to_dict() if "source" in df_base.columns else {}
     print(f"[Pipeline] Base bars  : {len(df_base)}  sources={sources}")
