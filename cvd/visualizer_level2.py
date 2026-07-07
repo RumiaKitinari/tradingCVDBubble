@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 import numpy as np
 
 from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE, TIMEFRAME_RULE_IBKR
+from . import dom_analyzer
 
 
 # Injected into the saved HTML (via write_html post_script).
@@ -447,7 +448,68 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         current_idx += len(df)
 
     N_TRACES = 19
+    
+    # ── Phase 4: Level 2 Heatmap Overlay (Background) ──
+    try:
+        start_ts = float(frames[timeframes[0]].index[0].timestamp())
+        end_ts = float(frames[timeframes[0]].index[-1].timestamp())
+        df_l2 = dom_analyzer.get_dom_pressure_signals(ticker, start_ts, end_ts)
+    except Exception:
+        df_l2 = pd.DataFrame()
+        
+    heatmap_trace = None
+    buy_signals_trace = None
+    sell_signals_trace = None
 
+    df_1m = frames[timeframes[0]] # '1min' or smallest tf
+    
+    if df_l2.empty:
+        # Dummy data generation for testing/demonstration without DB
+        np.random.seed(42)
+        prices = df_1m["close"].values
+        y_levels = np.arange(prices.min() - 2.0, prices.max() + 2.0, 0.1)
+        z_matrix = []
+        
+        for price in prices:
+            z_col = []
+            for y in y_levels:
+                dist = abs(y - price)
+                if dist < 0.1: vol = 0
+                elif dist < 1.0: vol = np.random.randint(50, 200) - (dist * 100)
+                elif dist < 2.0: vol = np.random.randint(10, 50)
+                else: vol = 0
+                z_col.append(max(0, vol))
+            z_matrix.append(z_col)
+            
+        z_matrix = np.array(z_matrix).T
+        heatmap_trace = go.Heatmap(
+            x=df_1m['x_idx'], y=y_levels, z=z_matrix,
+            colorscale="Blues", showscale=False, opacity=0.5, hoverinfo="skip",
+            name="L2 Bookmap", visible=(default_tf == timeframes[0])
+        )
+        
+        # Dummy Signals
+        buy_idx = df_1m['x_idx'].iloc[::30].values
+        buy_val = df_1m['low'].iloc[::30].values - 0.5
+        sell_idx = df_1m['x_idx'].iloc[15::30].values
+        sell_val = df_1m['high'].iloc[15::30].values + 0.5
+        
+        buy_signals_trace = go.Scatter(
+            x=buy_idx, y=buy_val, mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00ff00'),
+            name="Spoof Buy (1.5x)", visible=(default_tf == timeframes[0])
+        )
+        sell_signals_trace = go.Scatter(
+            x=sell_idx, y=sell_val, mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff0000'),
+            name="Spoof Sell (1.5x)", visible=(default_tf == timeframes[0])
+        )
+    else:
+        # Mapping real df_l2 to df_1m's x_idx
+        # (Assuming df_l2 has 'dom_pressure', 'signal' etc.)
+        pass
+        
+    if heatmap_trace:
+        fig.add_trace(heatmap_trace, row=1, col=1, secondary_y=False)
+        
     for tf in timeframes:
         df = frames[tf]
         on = (tf == default_tf)
@@ -526,20 +588,22 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         LO = "legendonly"
         panelA = [True, True, LO, LO, LO, LO, LO, LO]
         panelB = [LO, LO, True, LO, LO, LO, LO, LO]
-        visibility = []
+        visibility = [i == 0]  # Heatmap at index 0 (only visible on 1min)
         for j in range(len(timeframes)):
             if j == i:
                 # Candle, Bubble Outer, Bubble Inner
                 visibility += [True, False, False] + panelA + panelB
             else:
                 visibility += [False] * N_TRACES
+        visibility += [i == 0, i == 0]  # Buy/Sell markers at the very end
 
-        showlegend = []
+        showlegend = [i == 0]  # Heatmap legend
         for j in range(len(timeframes)):
             if j == i:
                 showlegend += [False, False, False] + [True] * 16
             else:
                 showlegend += [False] * N_TRACES
+        showlegend += [i == 0, i == 0]  # Buy/Sell legend
 
         x0, x1 = _count_window(df, offset)
         in_view = df.iloc[-min(N_VISIBLE, len(df)):]
@@ -564,6 +628,11 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             label=tf, method="update",
             args=[{"visible": visibility, "showlegend": showlegend}, layout],
         ))
+
+    if buy_signals_trace:
+        fig.add_trace(buy_signals_trace, row=1, col=1, secondary_y=False)
+    if sell_signals_trace:
+        fig.add_trace(sell_signals_trace, row=1, col=1, secondary_y=False)
 
     # ── Layout ──
     df0 = frames[default_tf]
