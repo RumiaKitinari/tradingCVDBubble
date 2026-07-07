@@ -28,12 +28,18 @@ app.index_string = '''
             <script>
                 window.dash_clientside = window.dash_clientside || {};
                 window.dash_clientside.clientside = window.dash_clientside.clientside || {};
-                window.dash_clientside.clientside.refit_y = function(relayoutData) {
-                    if (!relayoutData) return window.dash_clientside.no_update;
+                window.dash_clientside.clientside.refit_y = function(relayoutData, figureData) {
+                    // Triggered by EITHER user pan (relayoutData) OR data refresh (figureData)
                     
-                    var keys = Object.keys(relayoutData);
-                    var hasX = keys.some(function(k) { return k.indexOf('xaxis') === 0; });
-                    if (!hasX) return window.dash_clientside.no_update;
+                    var trigger = dash_clientside.callback_context.triggered;
+                    var isFigUpdate = trigger && trigger.length > 0 && trigger[0].prop_id === 'main-chart.figure';
+                    
+                    if (!isFigUpdate) {
+                        if (!relayoutData) return window.dash_clientside.no_update;
+                        var keys = Object.keys(relayoutData);
+                        var hasX = keys.some(function(k) { return k.indexOf('xaxis') === 0; });
+                        if (!hasX) return window.dash_clientside.no_update;
+                    }
 
                     if (window.__is_refitting) return window.dash_clientside.no_update;
 
@@ -204,7 +210,10 @@ app.layout = html.Div([
         ),
         
         # Dummy div for clientside callback to prevent invalid ID errors
-        html.Div(id='clientside-dummy', style={'display': 'none'})
+        html.Div(id='clientside-dummy', style={'display': 'none'}),
+        
+        # State tracking store to prevent unnecessary renders
+        dcc.Store(id='last-data-state', data="")
         
     ], fluid=True, style={"padding": "0 2% 50px 2%"})
 ], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
@@ -234,14 +243,16 @@ def update_timeframes(base_tf, current_value):
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
-     Output('loading-dummy', 'children')],
+     Output('loading-dummy', 'children'),
+     Output('last-data-state', 'data')],
     [Input('ticker-input', 'value'),
      Input('source-radio', 'value'),
      Input('timeframe-dropdown', 'value'),
      Input('interval-component', 'n_intervals'),
-     Input('refresh-btn', 'n_clicks')]
+     Input('refresh-btn', 'n_clicks')],
+    [State('last-data-state', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
     trigger = ctx.triggered_id
     if not ticker:
         raise PreventUpdate
@@ -272,7 +283,12 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", ""
+            return empty_fig, "No Data", "", ""
+            
+        # Optimization: Only re-render if data has actually grown/changed
+        current_state = f"{ticker}_{base_tf}_{active_tf}_{len(df_base)}_{df_base.index[-1] if not df_base.empty else 'empty'}"
+        if current_state == last_state and trigger == 'interval-component':
+            raise PreventUpdate
             
         fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf)
         
@@ -286,8 +302,8 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks):
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger})"
         
-        # Return fig, text, and empty string for the loading dummy
-        return fig, msg, ""
+        # Return fig, text, empty string for loading, and new state
+        return fig, msg, "", current_state
         
     except Exception as e:
         logging.error(f"Error building chart: {e}")
@@ -302,7 +318,8 @@ app.clientside_callback(
         function_name='refit_y'
     ),
     Output('clientside-dummy', 'children'),
-    Input('main-chart', 'relayoutData')
+    [Input('main-chart', 'relayoutData'),
+     Input('main-chart', 'figure')]
 )
 
 
