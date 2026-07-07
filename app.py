@@ -130,7 +130,7 @@ app.layout = html.Div([
                 html.Label("Search Ticker:", style={"fontWeight": "bold", "color": "#eee"}),
                 dbc.Input(
                     id='ticker-input', 
-                    value='MOCK_NVDA', 
+                    value='NVDA', 
                     type='text', 
                     debounce=True, 
                     placeholder="Enter Ticker & hit Enter...",
@@ -240,11 +240,16 @@ def update_timeframes(base_tf, current_value):
     return options, new_value
 
 
+# Global state to prevent spamming FinViz fetches
+import time
+last_finviz_fetch = {}
+
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
      Output('loading-dummy', 'children'),
-     Output('last-data-state', 'data')],
+     Output('last-data-state', 'data'),
+     Output('source-radio', 'value')],
     [Input('ticker-input', 'value'),
      Input('source-radio', 'value'),
      Input('timeframe-dropdown', 'value'),
@@ -261,17 +266,43 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
     logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf}")
     
     try:
-        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf)
+        # Periodic FinViz fetch (every 60 seconds) or forced by Manual Refresh
+        now = time.time()
+        should_fetch_finviz = False
         
-        # Auto-Fetch Logic for missing FinViz data
-        if df_base.empty:
-            logging.info(f"No data for {ticker}. Attempting auto-fetch...")
+        if trigger == 'refresh-btn':
+            should_fetch_finviz = True
+        elif base_tf == 'i1':
+            if ticker not in last_finviz_fetch or (now - last_finviz_fetch[ticker]) > 60:
+                should_fetch_finviz = True
+                
+        if should_fetch_finviz:
+            logging.info(f"Fetching latest FinViz data for {ticker}...")
             try:
                 from finviz.new_finviz import fetch_and_save
                 fetch_and_save(ticker, timeframe="i1")
-                df_base, frames = run_pipeline(ticker, base_timeframe=base_tf)
+                last_finviz_fetch[ticker] = now
             except Exception as e:
                 logging.error(f"Auto-fetch failed: {e}")
+                
+        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf)
+        
+        # Fallback Logic: If user requested raw_tick or 1sec, but DB has no data,
+        # fallback to FinViz (i1) automatically.
+        fallback_msg = ""
+        new_base_tf = base_tf
+        
+        if df_base.empty and base_tf != 'i1':
+            logging.info(f"No data for {ticker} in {base_tf}. Falling back to FinViz i1...")
+            try:
+                from finviz.new_finviz import fetch_and_save
+                fetch_and_save(ticker, timeframe="i1")
+                last_finviz_fetch[ticker] = now
+                new_base_tf = 'i1'
+                df_base, frames = run_pipeline(ticker, base_timeframe='i1')
+                fallback_msg = f" (Fell back to FinViz 1-Min for {ticker})"
+            except Exception as e:
+                logging.error(f"Fallback fetch failed: {e}")
         
         if df_base.empty:
             empty_fig = go.Figure()
@@ -283,10 +314,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", "", ""
+            return empty_fig, "No Data", "", "", base_tf
             
         # Optimization: Only re-render if data has actually grown/changed
-        current_state = f"{ticker}_{base_tf}_{active_tf}_{len(df_base)}_{df_base.index[-1] if not df_base.empty else 'empty'}"
+        current_state = f"{ticker}_{new_base_tf}_{active_tf}_{len(df_base)}_{df_base.index[-1] if not df_base.empty else 'empty'}"
         if current_state == last_state and trigger == 'interval-component':
             raise PreventUpdate
             
@@ -300,10 +331,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
         
         import datetime
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
-        msg = f"Last Updated: {now_str} (Trigger: {trigger})"
+        msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
         
-        # Return fig, text, empty string for loading, and new state
-        return fig, msg, "", current_state
+        # Return fig, text, empty string for loading, new state, and base_tf (for radio button)
+        return fig, msg, "", current_state, new_base_tf
         
     except Exception as e:
         logging.error(f"Error building chart: {e}")
