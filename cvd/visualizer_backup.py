@@ -293,42 +293,42 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
         hovertemplate="<b>%{customdata[0]}</b><br>Sell: %{customdata[1]:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
         line=dict(color="#ba68c8", width=2), connectgaps=True,
         visible=vis("CVD (all-time)"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>CVD all: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=df["cvd_all_raw_end"], mode="lines", name="CVD raw (incl. auction)",
         line=dict(color="#9575cd", width=1.4, dash="dot"), connectgaps=True,
         visible=vis("CVD raw (incl. auction)"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>CVD raw: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=df["volume"].cumsum(), mode="lines", name="Cum Total",
         line=dict(color="#ffd54f", width=2), connectgaps=True,
         visible=vis("Cum Total"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Cum Total: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=df["buy_pressure"].cumsum(), mode="lines", name="Cum Buy",
         line=dict(color="#66bb6a", width=1.6), connectgaps=True,
         visible=vis("Cum Buy"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Cum Buy: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=df["sell_pressure"].cumsum(), mode="lines", name="Cum Sell",
         line=dict(color="#e57373", width=1.6), connectgaps=True,
         visible=vis("Cum Sell"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Cum Sell: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=df['x_idx'], y=ratio, mode="lines", name="Buy Ratio",
         line=dict(color="#ff9800", width=1.6, dash="dot"), connectgaps=True,
         visible=vis("Buy Ratio"), showlegend=on, legend=legend_id, customdata=df['time_str'],
@@ -474,7 +474,7 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
         if tf == "raw_tick":
             # For raw ticks, OHLC are all the same, so we plot a simple line or scatter.
             # Using markers allows seeing individual trades clearly.
-            fig.add_trace(go.Scattergl(
+            fig.add_trace(go.Scatter(
                 x=df['x_idx'], y=df["close"],
                 mode="lines+markers",
                 name=f"Raw Ticks",
@@ -526,14 +526,14 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
         ref_vol = max(ref_vol, 1)
         sizeref = 2.0 * ref_vol / (24 ** 2)
 
-        fig.add_trace(go.Scattergl(
+        fig.add_trace(go.Scatter(
             x=df['x_idx'], y=bubble_y,
             mode='markers', name=f"Bubble Outer ({tf})",
             marker=dict(size=tot_vol, sizemode='area', sizeref=sizeref, sizemin=1, color=outer_color, line=dict(width=0)),
             visible=False, showlegend=False, hoverinfo="skip"
         ), row=1, col=1, secondary_y=False)
 
-        fig.add_trace(go.Scattergl(
+        fig.add_trace(go.Scatter(
             x=df['x_idx'], y=bubble_y,
             mode='markers', name=f"Bubble Inner ({tf})",
             marker=dict(size=min_vol, sizemode='area', sizeref=sizeref, sizemin=0, color=inner_color, line=dict(width=0)),

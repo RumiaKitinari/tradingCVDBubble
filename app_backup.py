@@ -41,15 +41,9 @@ app.index_string = '''
                         if (!hasX) return window.dash_clientside.no_update;
                     }
 
-                    if (window.__refit_timer) {
-                        clearTimeout(window.__refit_timer);
-                    }
+                    if (window.__is_refitting) return window.dash_clientside.no_update;
 
-                    window.__refit_timer = setTimeout(function() {
-                        if (window.__is_refitting) {
-                            return; // Wait until current refit is done
-                        }
-
+                    setTimeout(function() {
                         var wrapper = document.getElementById('main-chart');
                         if (!wrapper) return;
                         var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
@@ -106,9 +100,7 @@ app.index_string = '''
                         if (Object.keys(upd).length > 0) {
                             window.__is_refitting = true;
                             Plotly.relayout(gd, upd).then(function() {
-                                window.__is_refitting = false;
-                            }).catch(function() {
-                                window.__is_refitting = false;
+                                setTimeout(function() { window.__is_refitting = false; }, 200);
                             });
                         }
                     }, 150);

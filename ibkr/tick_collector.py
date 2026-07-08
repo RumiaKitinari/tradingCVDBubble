@@ -32,7 +32,7 @@ Ports: TWS paper=7497, TWS live=7496, IB Gateway paper=4002, live=4001
 import asyncio
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from pymongo import MongoClient
@@ -101,11 +101,11 @@ class TickCollector:
             # Normalize to an ET naive datetime (second precision)
             if isinstance(ts, datetime):
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=ET)
-                ts = ts.astimezone(ET)
+                    ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.astimezone(ET).replace(tzinfo=None)
             else:
-                ts = datetime.fromtimestamp(float(ts), tz=ET)
-            sec = ts.replace(microsecond=0, tzinfo=None)
+                ts = datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(ET).replace(tzinfo=None)
+            sec = ts.replace(microsecond=0)
 
             # Boundary: flush completed second, start new bucket
             if sec != self.current_second:
