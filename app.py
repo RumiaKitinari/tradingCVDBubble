@@ -240,7 +240,7 @@ app.layout = html.Div([
 def update_timeframes(base_tf, current_value):
     if base_tf == 'raw_tick':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
-        new_value = "1min"  # Default to 1min to prevent UI lag from 1hr aggregation
+        new_value = "raw_tick"  # Default to raw_tick as user requested
     elif base_tf == '1sec':
         tfs = [t for t in TIMEFRAME_RULE_IBKR.keys() if t != 'raw_tick']
         new_value = current_value if current_value in tfs else "1hr"
@@ -297,7 +297,9 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             except Exception as e:
                 logging.error(f"Auto-fetch failed: {e}")
                 
-        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=days_to_load)
+        # For raw_tick, aggressively limit lookback to 20 minutes to prevent memory/UI crashes
+        actual_days = (20.0 / 1440.0) if base_tf == 'raw_tick' else days_to_load
+        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=actual_days)
         
         # Fallback Logic: If user requested raw_tick or 1sec, but DB has no data,
         # fallback to FinViz (i1) gracefully without changing the radio button to avoid circular dependency.
