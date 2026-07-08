@@ -491,7 +491,17 @@ def run_pipeline(
     frames = {}
     for tf, rule in tf_map.items():
         if tf == "raw_tick":
-            frames["raw_tick"] = df_base.copy() # Pass the raw ticks directly without aggregating
+            raw_df = df_base.copy()
+            raw_df = raw_df.rename(columns={
+                "buying_volume": "buy_pressure",
+                "selling_volume": "sell_pressure",
+                "cvd_all": "cvd_all_end",
+                "cvd_all_raw": "cvd_all_raw_end",
+                "auction_volume": "auction_vol"
+            })
+            raw_df["net_pressure"] = raw_df["buy_pressure"] - raw_df["sell_pressure"]
+            raw_df["auction_frac"] = (raw_df["auction_vol"] / raw_df["volume"]).fillna(0.0) if "auction_vol" in raw_df.columns else 0.0
+            frames["raw_tick"] = raw_df
             continue
         frames[tf] = aggregate_pressure(df_base, tf)
 
