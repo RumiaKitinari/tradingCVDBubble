@@ -422,13 +422,10 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
     else:
         collection = client["finviz_db"]["candles"]
         query = {"ticker": ticker, "timeframe": timeframe}
-        if days is not None:
+        if days is not None and timeframe != "i1":
             now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
             cutoff = now_et - timedelta(days=days)
-            if timeframe == "i1":
-                query["date"] = {"$gte": cutoff.strftime("%Y-%m-%d %H:%M:%S")}
-            else:
-                query["date"] = {"$gte": cutoff}
+            query["date"] = {"$gte": cutoff}
         
         docs = list(collection.find(
             query,
