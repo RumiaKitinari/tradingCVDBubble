@@ -35,6 +35,3 @@ plotly
 ib_async
 # IANA timezone database for zoneinfo (macOS may lack it; needed for ET conversion)
 tzdata
-
-# Alpaca for testing
-alpaca-py

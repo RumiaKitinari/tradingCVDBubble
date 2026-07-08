@@ -7,15 +7,15 @@ Source-aware pipeline:
   source='ibkr_tick'   — IBKR real-time tick data; buying_volume/selling_volume/delta
                          pre-computed by tick_collector.py (quote-based aggressor).
                          Wick decomposition is SKIPPED.
-  source='alpaca_tick' — Alpaca real-time/historical tick data; buying_volume/selling_volume/delta
-                         pre-computed by alpaca_collector.py / alpaca_backfill.py.
+  source='ibkr_tick' — IBKR real-time/historical tick data; buying_volume/selling_volume/delta
+                         pre-computed by tick_collector.py / backfill.py.
                          Wick decomposition is SKIPPED.
   source='ibkr_hist'   — 1-sec bars from reqHistoricalData (no tick-level quotes).
                          Wick decomposition applied (same as FinViz).
   source='finviz_wick' — FinViz Elite 1-min bars.  Wick decomposition applied.
 
 add_cvd_columns() detects which rows have pre-computed values and branches
-accordingly, so mixed DataFrames (ibkr_tick + alpaca_tick + finviz_wick) work
+accordingly, so mixed DataFrames (ibkr_tick + finviz_wick) work
 transparently.
 """
 
@@ -127,8 +127,7 @@ def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float =
          16:01 onward (genuine after-hours) and the pre-close ramp (15:55-15:58,
          genuine continuous trading) untouched. See Personal Study Log §8.
 
-    Note: feeds that don't carry the official closing cross (e.g. Alpaca's
-    IEX-only feed — the cross prints on the listing exchange) simply won't
+    Note: feeds that don't carry the official closing cross simply won't
     have an anchor exceeding `mult`x the median, so nothing gets flagged.
     """
     minute = df.index.hour * 60 + df.index.minute
@@ -231,9 +230,9 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     if has_precomputed and has_source:
         # Rows that need wick decomposition: any source that isn't a real-tick source,
         # or rows where buying_volume is missing despite being tagged as tick data.
-        # Real-tick sources (ibkr_tick, alpaca_tick) have pre-computed buy/sell/delta.
+        # Real-tick sources (ibkr_tick) have pre-computed buy/sell/delta.
         needs_wick = (
-            ~df["source"].isin(["ibkr_tick", "alpaca_tick"])
+            ~df["source"].isin(["ibkr_tick"])
         ) | df["buying_volume"].isna()
 
         if needs_wick.any():
@@ -267,7 +266,7 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Do not neutralize real tick sources. Their high volume at 16:00 represents genuine 
     # directional aggressive trades with real Bid/Ask matching, not a single MOC print.
     if "source" in df.columns:
-        real_ticks = df["source"].isin(["alpaca_tick", "ibkr_tick"])
+        real_ticks = df["source"].isin(["ibkr_tick"])
         df.loc[real_ticks, "is_auction"] = False
 
     df["delta_raw"]      = df["delta"]                       # before neutralization
