@@ -212,8 +212,10 @@ app.layout = html.Div([
         # Dummy div for clientside callback to prevent invalid ID errors
         html.Div(id='clientside-dummy', style={'display': 'none'}),
         
-        # State tracking store to prevent unnecessary renders
-        dcc.Store(id='last-data-state', data="")
+        # State tracking stores
+        dcc.Store(id='last-data-state', data='{}'),
+        dcc.Store(id='days-to-load', data=3)
+        
         
     ], fluid=True, style={"padding": "0 2% 50px 2%"})
 ], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
@@ -243,27 +245,27 @@ def update_timeframes(base_tf, current_value):
 # Global state to prevent spamming FinViz fetches
 import time
 last_finviz_fetch = {}
-
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
      Output('loading-dummy', 'children'),
-     Output('last-data-state', 'data'),
-     Output('source-radio', 'value')],
+     Output('last-data-state', 'data')],
     [Input('ticker-input', 'value'),
      Input('source-radio', 'value'),
      Input('timeframe-dropdown', 'value'),
      Input('interval-component', 'n_intervals'),
-     Input('refresh-btn', 'n_clicks')],
+     Input('refresh-btn', 'n_clicks'),
+     Input('days-to-load', 'data')],
     [State('last-data-state', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, last_state_json):
     trigger = ctx.triggered_id
+    
     if not ticker:
         raise PreventUpdate
     
     ticker = str(ticker).strip().upper()
-    logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf}")
+    logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf} Days: {days_to_load}")
     
     try:
         # Periodic FinViz fetch (every 60 seconds) or forced by Manual Refresh
@@ -285,22 +287,20 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
             except Exception as e:
                 logging.error(f"Auto-fetch failed: {e}")
                 
-        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf)
+        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=days_to_load)
         
         # Fallback Logic: If user requested raw_tick or 1sec, but DB has no data,
-        # fallback to FinViz (i1) automatically.
+        # fallback to FinViz (i1) gracefully without changing the radio button to avoid circular dependency.
         fallback_msg = ""
-        new_base_tf = base_tf
         
         if df_base.empty and base_tf != 'i1':
-            logging.info(f"No data for {ticker} in {base_tf}. Falling back to FinViz i1...")
+            logging.info(f"No data for {ticker} in {base_tf}. Rendering FinViz i1 chart instead...")
             try:
                 from finviz.new_finviz import fetch_and_save
                 fetch_and_save(ticker, timeframe="i1")
                 last_finviz_fetch[ticker] = now
-                new_base_tf = 'i1'
-                df_base, frames = run_pipeline(ticker, base_timeframe='i1')
-                fallback_msg = f" (Fell back to FinViz 1-Min for {ticker})"
+                df_base, frames = run_pipeline(ticker, base_timeframe='i1', days=days_to_load)
+                fallback_msg = f" (Warning: No {base_tf} tick data found. Displaying FinViz 1-Min instead)"
             except Exception as e:
                 logging.error(f"Fallback fetch failed: {e}")
         
@@ -314,11 +314,23 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", "", "", base_tf
+            return empty_fig, "No Data", "", "{}"
             
+        import json
+        
         # Optimization: Only re-render if data has actually grown/changed
-        current_state = f"{ticker}_{new_base_tf}_{active_tf}_{len(df_base)}_{df_base.index[-1] if not df_base.empty else 'empty'}"
-        if current_state == last_state and trigger == 'interval-component':
+        current_state = {
+            "ticker": ticker,
+            "base_tf": base_tf,
+            "active_tf": active_tf,
+            "len": len(df_base),
+            "oldest_date": str(df_base.index[0]),
+            "newest_date": str(df_base.index[-1]),
+            "days_loaded": days_to_load
+        }
+        current_state_json = json.dumps(current_state)
+        
+        if current_state_json == last_state_json and trigger == 'interval-component':
             raise PreventUpdate
             
         fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf)
@@ -333,8 +345,8 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
         
-        # Return fig, text, empty string for loading, new state, and base_tf (for radio button)
-        return fig, msg, "", current_state, new_base_tf
+        # Return fig, text, empty string for loading, and new state
+        return fig, msg, "", current_state_json
         
     except PreventUpdate:
         raise
@@ -342,8 +354,9 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, last_state):
         logging.error(f"Error building chart: {e}")
         import traceback
         traceback.print_exc()
-        raise PreventUpdate
-
+        empty_fig = go.Figure()
+        empty_fig.update_layout(template="plotly_dark", title=dict(text=f"Error: {e}", font=dict(color="red")))
+        return empty_fig, f"Error: {e}", "", last_state_json
 
 app.clientside_callback(
     dash.ClientsideFunction(
@@ -354,6 +367,52 @@ app.clientside_callback(
     [Input('main-chart', 'relayoutData'),
      Input('main-chart', 'figure')]
 )
+
+
+# Infinite Scrolling Callback
+@app.callback(
+    Output('days-to-load', 'data'),
+    Input('main-chart', 'relayoutData'),
+    [State('days-to-load', 'data'),
+     State('last-data-state', 'data')]
+)
+def handle_panning(relayout_data, current_days, last_state_json):
+    if not relayout_data or 'xaxis.range[0]' not in relayout_data:
+        raise PreventUpdate
+        
+    if not last_state_json or last_state_json == "{}":
+        raise PreventUpdate
+        
+    try:
+        import json
+        import pandas as pd
+        state = json.loads(last_state_json)
+        oldest_date_str = state.get('oldest_date')
+        
+        if not oldest_date_str:
+            raise PreventUpdate
+            
+        oldest_date = pd.to_datetime(oldest_date_str)
+        view_start = pd.to_datetime(relayout_data['xaxis.range[0]'])
+        
+        if view_start.tzinfo is None:
+            view_start = view_start.tz_localize('UTC')
+        if oldest_date.tzinfo is None:
+            oldest_date = oldest_date.tz_localize('UTC')
+            
+        # If panning approaches the oldest date loaded (within 12 hours)
+        if view_start <= oldest_date + pd.Timedelta(hours=12):
+            new_days = min(current_days * 2 + 1, 180) # Cap at 180 days
+            if new_days > current_days:
+                logging.info(f"Panning detected. Increasing loaded days: {current_days} -> {new_days}")
+                return new_days
+                
+        raise PreventUpdate
+    except PreventUpdate:
+        raise
+    except Exception as e:
+        logging.error(f"Error in handle_panning: {e}")
+        raise PreventUpdate
 
 
 if __name__ == '__main__':
