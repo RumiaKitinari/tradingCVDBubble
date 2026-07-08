@@ -151,9 +151,9 @@ app.layout = html.Div([
                 dcc.RadioItems(
                     id='source-radio',
                     options=[
-                        {'label': ' Raw Ticks', 'value': 'raw_tick'},
-                        {'label': ' 1-Sec Agg', 'value': '1sec'},
-                        {'label': ' FinViz 1-Min', 'value': 'i1'}
+                        {'label': ' Raw Ticks (IBKR)', 'value': 'raw_tick'},
+                        {'label': ' 1-Sec Base (IBKR)', 'value': '1sec'},
+                        {'label': ' 1-Min Base (FinViz)', 'value': 'i1'}
                     ],
                     value='raw_tick',
                     inline=True,
@@ -239,14 +239,16 @@ app.layout = html.Div([
 )
 def update_timeframes(base_tf, current_value):
     if base_tf == 'raw_tick':
-        tfs = ["raw_tick"] + list(TIMEFRAME_RULE_IBKR.keys())
-    elif base_tf == '1sec':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
+        new_value = "1min"  # Default to 1min to prevent UI lag from 1hr aggregation
+    elif base_tf == '1sec':
+        tfs = [t for t in TIMEFRAME_RULE_IBKR.keys() if t != 'raw_tick']
+        new_value = current_value if current_value in tfs else "1hr"
     else: 
         tfs = list(TIMEFRAME_RULE.keys())
+        new_value = current_value if current_value in tfs else "1hr"
         
     options = [{'label': t, 'value': t} for t in tfs]
-    new_value = current_value if current_value in tfs else ("1hr" if "1hr" in tfs else tfs[-1])
     return options, new_value
 
 
