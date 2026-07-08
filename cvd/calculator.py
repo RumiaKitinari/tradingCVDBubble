@@ -424,7 +424,11 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
         query = {"ticker": ticker, "timeframe": timeframe}
         if days is not None:
             now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
-            query["date"] = {"$gte": now_et - timedelta(days=days)}
+            cutoff = now_et - timedelta(days=days)
+            if timeframe == "i1":
+                query["date"] = {"$gte": cutoff.strftime("%Y-%m-%d %H:%M:%S")}
+            else:
+                query["date"] = {"$gte": cutoff}
         
         docs = list(collection.find(
             query,
