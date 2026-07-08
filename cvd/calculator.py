@@ -491,7 +491,8 @@ def run_pipeline(
     frames = {}
     for tf, rule in tf_map.items():
         if tf == "raw_tick":
-            continue # Don't aggregate raw ticks
+            frames["raw_tick"] = df_base.copy() # Pass the raw ticks directly without aggregating
+            continue
         frames[tf] = aggregate_pressure(df_base, tf)
 
     sources = df_base["source"].value_counts().to_dict() if "source" in df_base.columns else {}
