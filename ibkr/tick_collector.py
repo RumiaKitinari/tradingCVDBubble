@@ -74,6 +74,9 @@ class TickCollector:
 
         self.bid: float | None = None
         self.ask: float | None = None
+        # Timestamp (ET naive) of the most recent bid/ask update. Used to measure
+        # quote-lag: how stale the NBBO was when a trade tick was classified.
+        self.quote_time: datetime | None = None
         self.prev_trade_price: float | None = None
         self.prev_tick_dir: float = 0.0
 
@@ -94,17 +97,34 @@ class TickCollector:
 
     # ── Event handlers ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _to_et(ts) -> datetime:
+        """Normalize an IBKR tick time to an ET-naive datetime (microsecond precision)."""
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(ET).replace(tzinfo=None)
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(ET).replace(tzinfo=None)
+
+    def _classify_method(self, price: float) -> str:
+        """Which rule classify_aggressor() used, for quote-lag diagnostics.
+
+        'quote'    — decided by NBBO (price at/through bid or ask)
+        'tick'     — quote unusable/inside spread; decided by up/down tick rule
+        'zerotick' — price unchanged; inherited previous tick direction
+        'none'     — nothing applied (no quote, no prior trade) -> delta 0
+        """
+        if self.bid is not None and self.ask is not None and self.bid < self.ask:
+            if price >= self.ask or price <= self.bid:
+                return "quote"
+        if self.prev_trade_price is not None and price != self.prev_trade_price:
+            return "tick"
+        return "zerotick" if self.prev_tick_dir else "none"
+
     def _on_trade_tick(self, ticker_obj):
         """Called by ib_async when new AllLast (trade) ticks arrive."""
         for tick in ticker_obj.tickByTicks:
-            ts = tick.time
-            # Normalize to an ET naive datetime (second precision)
-            if isinstance(ts, datetime):
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                ts = ts.astimezone(ET).replace(tzinfo=None)
-            else:
-                ts = datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(ET).replace(tzinfo=None)
+            ts = self._to_et(tick.time)
             sec = ts.replace(microsecond=0)
 
             # Boundary: flush completed second, start new bucket
@@ -116,6 +136,13 @@ class TickCollector:
 
             price = float(tick.price)
             size = float(tick.size)
+            # Snapshot the classification path + NBBO staleness BEFORE mutating
+            # prev-tick state, so we can audit quote-lag offline.
+            method = self._classify_method(price)
+            quote_age_ms = (
+                (ts - self.quote_time).total_seconds() * 1000.0
+                if self.quote_time is not None else None
+            )
             delta = classify_aggressor(
                 price, size, self.bid, self.ask,
                 self.prev_trade_price, self.prev_tick_dir,
@@ -123,15 +150,21 @@ class TickCollector:
             self.prev_tick_dir = next_tick_dir(price, self.prev_trade_price, self.prev_tick_dir)
             self.prev_trade_price = price
             self.tick_buffer.append((price, size, delta))
-            
-            # Save raw tick
+
+            # Save raw tick (+ quote-lag diagnostics: NBBO seen at classify time,
+            # how stale it was, and which rule fired). These let us measure
+            # whether the mid-size sell skew is quote-lag misclassification.
             self.raw_buffer.append({
                 "ticker": self.ticker,
                 "date": ts, # Exact datetime with microsecond precision
                 "price": price,
                 "size": size,
                 "delta": delta,
-                "source": "ibkr_tick"
+                "source": "ibkr_tick",
+                "bid": self.bid,
+                "ask": self.ask,
+                "quote_age_ms": quote_age_ms,
+                "cls": method,
             })
 
     def _on_bidask_tick(self, ticker_obj):
@@ -139,10 +172,18 @@ class TickCollector:
         for tick in ticker_obj.tickByTicks:
             bid = getattr(tick, "bidPrice", None)
             ask = getattr(tick, "askPrice", None)
+            updated = False
             if bid and float(bid) > 0:
                 self.bid = float(bid)
+                updated = True
             if ask and float(ask) > 0:
                 self.ask = float(ask)
+                updated = True
+            # Record when the NBBO last changed so _on_trade_tick can measure how
+            # stale the quote was at classification time (quote-lag diagnostics).
+            if updated:
+                t = getattr(tick, "time", None)
+                self.quote_time = self._to_et(t) if t is not None else self.quote_time
 
     # ── Bar flush ────────────────────────────────────────────────────────────
 

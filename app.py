@@ -5,6 +5,8 @@ from cvd.calculator import run_pipeline, TIMEFRAME_RULE_IBKR, TIMEFRAME_RULE
 from cvd.visualizer import build_chart
 import plotly.graph_objects as go
 import logging
+import json
+import time
 from dash.exceptions import PreventUpdate
 
 logging.basicConfig(level=logging.INFO)
@@ -152,7 +154,6 @@ app.layout = html.Div([
                     id='source-radio',
                     options=[
                         {'label': ' Raw Ticks (IBKR)', 'value': 'raw_tick'},
-                        {'label': ' 1-Sec Base (IBKR)', 'value': '1sec'},
                         {'label': ' 1-Min Base (FinViz)', 'value': 'i1'}
                     ],
                     value='raw_tick',
@@ -192,8 +193,40 @@ app.layout = html.Div([
                     )
                 ], className="mt-3")
             ], width=1)
-            
-        ], className="mb-3 align-items-center"),
+        ], className="mb-2 align-items-center"),
+        
+        dbc.Row([
+            dbc.Col([
+                html.Label("Auto Refresh:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='refresh-interval-dropdown',
+                    options=[
+                        {'label': 'Off', 'value': 0},
+                        {'label': '5 sec', 'value': 5000},
+                        {'label': '10 sec', 'value': 10000},
+                        {'label': '30 sec', 'value': 30000},
+                        {'label': '60 sec', 'value': 60000}
+                    ],
+                    value=10000,
+                    clearable=False,
+                    style={"color": "#000", "width": "120px", "display": "inline-block", "marginRight": "20px"}
+                ),
+                html.Label("Fixed Pie Charts (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='pie-chart-dropdown',
+                    options=[
+                        {'label': 'Off', 'value': 0},
+                        {'label': '25 Pies', 'value': 25},
+                        {'label': '50 Pies', 'value': 50},
+                        {'label': '100 Pies', 'value': 100},
+                        {'label': '150 Pies', 'value': 150}
+                    ],
+                    value=25,  # Default to 25 to show it off
+                    clearable=False,
+                    style={"color": "#000", "width": "150px", "display": "inline-block"}
+                )
+            ], width=12, className="d-flex align-items-center justify-content-end")
+        ], className="mb-3"),
         
         # Main Chart Area
         html.Div([
@@ -222,7 +255,8 @@ app.layout = html.Div([
         
         # State tracking stores
         dcc.Store(id='last-data-state', data='{}'),
-        dcc.Store(id='days-to-load', data=3)
+        dcc.Store(id='days-to-load', data=3),
+        dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
         
         
     ], fluid=True, style={"padding": "0 2% 50px 2%"})
@@ -241,9 +275,6 @@ def update_timeframes(base_tf, current_value):
     if base_tf == 'raw_tick':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
         new_value = "raw_tick"  # Default to raw_tick as user requested
-    elif base_tf == '1sec':
-        tfs = [t for t in TIMEFRAME_RULE_IBKR.keys() if t != 'raw_tick']
-        new_value = current_value if current_value in tfs else "1hr"
     else: 
         tfs = list(TIMEFRAME_RULE.keys())
         new_value = current_value if current_value in tfs else "1hr"
@@ -255,20 +286,35 @@ def update_timeframes(base_tf, current_value):
 # Global state to prevent spamming FinViz fetches
 import time
 last_finviz_fetch = {}
+DATA_CACHE = {} # Cache for fast pie chart HUD updates
+
+@app.callback(
+    [Output('interval-component', 'interval'),
+     Output('interval-component', 'disabled')],
+    [Input('refresh-interval-dropdown', 'value')]
+)
+def update_refresh_interval(val):
+    if val == 0:
+        return 10000, True
+    return val, False
+
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
      Output('loading-dummy', 'children'),
-     Output('last-data-state', 'data')],
+     Output('last-data-state', 'data'),
+     Output('pan-state', 'data')],
     [Input('ticker-input', 'value'),
      Input('source-radio', 'value'),
      Input('timeframe-dropdown', 'value'),
      Input('interval-component', 'n_intervals'),
      Input('refresh-btn', 'n_clicks'),
-     Input('days-to-load', 'data')],
-    [State('last-data-state', 'data')]
+     Input('days-to-load', 'data'),
+     Input('pie-chart-dropdown', 'value')],
+    [State('last-data-state', 'data'),
+     State('pan-state', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, last_state_json):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, last_state_json, pan_state_json):
     trigger = ctx.triggered_id
     
     if not ticker:
@@ -326,7 +372,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", "", "{}"
+            return empty_fig, "No Data", "", "{}", pan_state_json
             
         import json
         
@@ -338,15 +384,52 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             "len": len(df_base),
             "oldest_date": str(df_base.index[0]),
             "newest_date": str(df_base.index[-1]),
-            "days_loaded": days_to_load
+            "days_loaded": days_to_load,
+            "pie_chart_count": pie_chart_count
         }
         current_state_json = json.dumps(current_state)
         
         if current_state_json == last_state_json and trigger == 'interval-component':
             raise PreventUpdate
             
-        fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf)
+        global DATA_CACHE
+        df_active = frames[active_tf] if active_tf and active_tf in frames else frames[list(frames.keys())[0]]
         
+        # Ensure x_idx is present for caching so pie chart callback doesn't crash
+        df_cache = df_active.copy()
+        if "x_idx" not in df_cache.columns:
+            import numpy as np
+            df_cache["x_idx"] = np.arange(len(df_cache))
+            
+        DATA_CACHE['df'] = df_cache
+        DATA_CACHE['pie_chart_count'] = pie_chart_count
+        
+        try:
+            pan_state = json.loads(pan_state_json) if pan_state_json else {}
+        except:
+            pan_state = {}
+            
+        panned = pan_state.get('panned', False)
+        pan_time = pan_state.get('time', 0)
+        
+        # Check if 60s idle
+        if panned and (time.time() - pan_time > 60):
+            panned = False
+            pan_state['panned'] = False
+            
+        x_range = None
+        if panned and 'x0' in pan_state and 'x1' in pan_state:
+            x_range = (pan_state['x0'], pan_state['x1'])
+            
+        fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf, pie_chart_count=pie_chart_count, x_range=x_range)
+        
+        # Smart Panning: if not panned, auto-tail to newest
+        if not panned:
+            N_total = len(df_active)
+            x0 = max(0, N_total - 100)
+            x1 = N_total
+            fig.update_layout(xaxis=dict(range=[x0, x1]))
+            
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
@@ -357,8 +440,8 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
         
-        # Return fig, text, empty string for loading, and new state
-        return fig, msg, "", current_state_json
+        # Return fig, text, empty string for loading, new state, pan state
+        return fig, msg, "", current_state_json, json.dumps(pan_state)
         
     except PreventUpdate:
         raise
@@ -368,7 +451,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         traceback.print_exc()
         empty_fig = go.Figure()
         empty_fig.update_layout(template="plotly_dark", title=dict(text=f"Error: {e}", font=dict(color="red")))
-        return empty_fig, f"Error: {e}", "", last_state_json
+        return empty_fig, f"Error: {e}", "", last_state_json, pan_state_json
 
 app.clientside_callback(
     dash.ClientsideFunction(
@@ -424,6 +507,110 @@ def handle_panning(relayout_data, current_days, last_state_json):
         raise
     except Exception as e:
         logging.error(f"Error in handle_panning: {e}")
+        raise PreventUpdate
+
+@app.callback(
+    [Output('main-chart', 'figure', allow_duplicate=True),
+     Output('pan-state', 'data', allow_duplicate=True)],
+    Input('main-chart', 'relayoutData'),
+    State('main-chart', 'figure'),
+    prevent_initial_call=True
+)
+def update_pie_charts_on_pan(relayout_data, current_fig):
+    try:
+        if not relayout_data:
+            raise PreventUpdate
+            
+        # Sometimes relayoutData has 'xaxis.range' as a list instead of 'xaxis.range[0]'
+        x0 = None
+        x1 = None
+        if 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
+            x0 = float(relayout_data['xaxis.range[0]'])
+            x1 = float(relayout_data['xaxis.range[1]'])
+        elif 'xaxis.range' in relayout_data:
+            x0 = float(relayout_data['xaxis.range'][0])
+            x1 = float(relayout_data['xaxis.range'][1])
+            
+        if x0 is None or x1 is None:
+            # User might have clicked autorange (reset), we return the pan_state but we can't update pies
+            if 'xaxis.autorange' in relayout_data:
+                return dash.no_update, json.dumps({"panned": False, "time": 0})
+            raise PreventUpdate
+            
+        # We record any panning action
+        new_pan_state = json.dumps({"panned": True, "time": time.time(), "x0": x0, "x1": x1})
+            
+        df = DATA_CACHE.get('df')
+        pie_chart_count = DATA_CACHE.get('pie_chart_count', 0)
+        
+        if df is None or pie_chart_count == 0 or current_fig is None:
+            raise PreventUpdate
+            
+        # Filter to visible range
+        df_vis = df[(df['x_idx'] >= x0) & (df['x_idx'] <= x1)]
+        n_pies = int(pie_chart_count)
+        
+        chunk_size = (x1 - x0) / n_pies if n_pies > 0 else 1
+            
+        patched_fig = dash.Patch()
+        
+        # Find pie traces by type
+        pie_indices = [i for i, trace in enumerate(current_fig['data']) if trace.get('type') == 'pie']
+        if len(pie_indices) != n_pies:
+            raise PreventUpdate
+            
+        chunks = []
+        vols = []
+        for k in range(n_pies):
+            c_start = x0 + k * chunk_size
+            c_end = x0 + (k + 1) * chunk_size
+            chunk = df_vis[(df_vis['x_idx'] >= c_start) & (df_vis['x_idx'] < c_end)]
+            chunks.append(chunk)
+            if len(chunk) > 0:
+                vols.append(float(chunk["buy_pressure"].sum() + chunk["sell_pressure"].sum()))
+            else:
+                vols.append(0.0)
+                
+        max_vol = max(vols) if vols and max(vols) > 0 else 1.0
+        overall_width = 0.94
+        width = overall_width / n_pies
+            
+        for k, idx in enumerate(pie_indices):
+            chunk = chunks[k]
+            buy = float(chunk["buy_pressure"].sum()) if len(chunk) > 0 else 0.0
+            sell = float(chunk["sell_pressure"].sum()) if len(chunk) > 0 else 0.0
+            
+            x_center = k * width + (width / 2.0)
+            
+            if (buy + sell) > 0:
+                factor = ((buy + sell) / max_vol) ** 0.5
+                factor = max(0.15, factor)
+                d_x = [x_center - width * 0.45 * factor, x_center + width * 0.45 * factor]
+                d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor]
+                
+                patched_fig['data'][idx]['values'] = [buy, sell]
+                patched_fig['data'][idx]['marker'] = {'colors': ["rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)"]}
+                patched_fig['data'][idx]['hoverinfo'] = "text"
+                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+            else:
+                d_x = [x_center - width * 0.45 * 0.15, x_center + width * 0.45 * 0.15]
+                d_y = [0.52 - 0.04 * 0.15, 0.52 + 0.04 * 0.15]
+                
+                patched_fig['data'][idx]['values'] = [1.0, 1.0] # dummy to prevent Plotly JS scale crash
+                patched_fig['data'][idx]['marker'] = {'colors': ["rgba(0,0,0,0)", "rgba(0,0,0,0)"]}
+                patched_fig['data'][idx]['hoverinfo'] = "none"
+                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+                
+        logging.info(f"Patch successful for {len(pie_indices)} pies.")
+        return patched_fig, new_pan_state
+        
+    except PreventUpdate:
+        raise
+    except Exception as e:
+        import traceback
+        with open('pie_err.log', 'w') as f:
+            f.write(traceback.format_exc())
+            f.write('\nRelayout Data: ' + str(relayout_data))
         raise PreventUpdate
 
 

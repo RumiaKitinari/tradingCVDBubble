@@ -2,7 +2,7 @@ import dash
 from dash import dcc, html, Input, Output, State, ctx
 import dash_bootstrap_components as dbc
 from cvd.calculator import run_pipeline, TIMEFRAME_RULE_IBKR, TIMEFRAME_RULE
-from cvd.visualizer import build_chart
+from level2_webapp.visualizer import build_chart
 import plotly.graph_objects as go
 import logging
 from dash.exceptions import PreventUpdate
@@ -16,7 +16,7 @@ app.index_string = '''
 <html>
     <head>
         {%metas%}
-        <title>{%title%}</title>
+        <title>Level 2 + CVD Web App</title>
         {%favicon%}
         {%css%}
     </head>
@@ -29,8 +29,6 @@ app.index_string = '''
                 window.dash_clientside = window.dash_clientside || {};
                 window.dash_clientside.clientside = window.dash_clientside.clientside || {};
                 window.dash_clientside.clientside.refit_y = function(relayoutData, figureData) {
-                    // Triggered by EITHER user pan (relayoutData) OR data refresh (figureData)
-                    
                     var trigger = dash_clientside.callback_context.triggered;
                     var isFigUpdate = trigger && trigger.length > 0 && trigger[0].prop_id === 'main-chart.figure';
                     
@@ -41,9 +39,15 @@ app.index_string = '''
                         if (!hasX) return window.dash_clientside.no_update;
                     }
 
-                    if (window.__is_refitting) return window.dash_clientside.no_update;
+                    if (window.__refit_timer) {
+                        clearTimeout(window.__refit_timer);
+                    }
 
-                    setTimeout(function() {
+                    window.__refit_timer = setTimeout(function() {
+                        if (window.__is_refitting) {
+                            return; 
+                        }
+
                         var wrapper = document.getElementById('main-chart');
                         if (!wrapper) return;
                         var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
@@ -61,6 +65,15 @@ app.index_string = '''
                             gd._fullData.forEach(function(f) {
                                 if (f.visible === false || f.visible === 'legendonly') return;
                                 if ((f.yaxis || 'y') !== yref) return;
+                                
+                                // For the main price axis (Row 1), ONLY use Candlestick or Raw Ticks to determine bounds.
+                                // This prevents Heatmap, CoG, or sparse OBI markers from hijacking the scale.
+                                if (yref === 'yaxis') {
+                                    if (!f.name || (f.name.indexOf('Candle') === -1 && f.name.indexOf('Raw Ticks') === -1)) {
+                                        return;
+                                    }
+                                }
+                                
                                 var xs = f.x; if (!xs || !xs.length) return;
                                 
                                 var offset = xs[0];
@@ -100,7 +113,9 @@ app.index_string = '''
                         if (Object.keys(upd).length > 0) {
                             window.__is_refitting = true;
                             Plotly.relayout(gd, upd).then(function() {
-                                setTimeout(function() { window.__is_refitting = false; }, 200);
+                                window.__is_refitting = false;
+                            }).catch(function() {
+                                window.__is_refitting = false;
                             });
                         }
                     }, 150);
@@ -116,7 +131,7 @@ app.index_string = '''
 
 app.layout = html.Div([
     dbc.NavbarSimple(
-        brand="Trading CVD Bubble Dashboard",
+        brand="Level 2 + CVD Trading Dashboard",
         brand_href="#",
         color="dark",
         dark=True,
@@ -143,9 +158,9 @@ app.layout = html.Div([
                 dcc.RadioItems(
                     id='source-radio',
                     options=[
-                        {'label': ' Raw Ticks', 'value': 'raw_tick'},
-                        {'label': ' 1-Sec Agg', 'value': '1sec'},
-                        {'label': ' FinViz 1-Min', 'value': 'i1'}
+                        {'label': ' Raw Ticks (IBKR)', 'value': 'raw_tick'},
+                        {'label': ' 1-Sec Base (IBKR)', 'value': '1sec'},
+                        {'label': ' 1-Min Base (FinViz)', 'value': 'i1'}
                     ],
                     value='raw_tick',
                     inline=True,
@@ -158,8 +173,8 @@ app.layout = html.Div([
                 html.Label("Active Timeframe:", style={"fontWeight": "bold", "color": "#eee"}),
                 dcc.Dropdown(
                     id='timeframe-dropdown',
-                    options=[], # Populated by callback
-                    value='1hr',
+                    options=[],
+                    value='1min',
                     clearable=False,
                     style={"color": "#000"} 
                 )
@@ -173,7 +188,6 @@ app.layout = html.Div([
                 html.Div(id='last-updated-text', className="mt-4 text-muted text-end", style={"fontSize": "14px", "marginRight": "10px"})
             ], width=3),
             
-            # Isolated Loading Spinner (does not wrap the main chart)
             dbc.Col([
                 html.Div([
                     dcc.Loading(
@@ -187,7 +201,6 @@ app.layout = html.Div([
             
         ], className="mb-3 align-items-center"),
         
-        # Main Chart Area
         html.Div([
             dcc.Graph(
                 id='main-chart',
@@ -209,19 +222,13 @@ app.layout = html.Div([
             n_intervals=0
         ),
         
-        # Dummy div for clientside callback to prevent invalid ID errors
         html.Div(id='clientside-dummy', style={'display': 'none'}),
-        
-        # State tracking stores
         dcc.Store(id='last-data-state', data='{}'),
         dcc.Store(id='days-to-load', data=3)
-        
         
     ], fluid=True, style={"padding": "0 2% 50px 2%"})
 ], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
 
-
-# ── Callbacks ──
 
 @app.callback(
     [Output('timeframe-dropdown', 'options'),
@@ -231,18 +238,19 @@ app.layout = html.Div([
 )
 def update_timeframes(base_tf, current_value):
     if base_tf == 'raw_tick':
-        tfs = ["raw_tick"] + list(TIMEFRAME_RULE_IBKR.keys())
-    elif base_tf == '1sec':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
+        new_value = "1min"
+    elif base_tf == '1sec':
+        tfs = [t for t in TIMEFRAME_RULE_IBKR.keys() if t != 'raw_tick']
+        new_value = current_value if current_value in tfs else "1min"
     else: 
         tfs = list(TIMEFRAME_RULE.keys())
+        new_value = current_value if current_value in tfs else "1min"
         
     options = [{'label': t, 'value': t} for t in tfs]
-    new_value = current_value if current_value in tfs else ("1hr" if "1hr" in tfs else tfs[-1])
     return options, new_value
 
 
-# Global state to prevent spamming FinViz fetches
 import time
 last_finviz_fetch = {}
 @app.callback(
@@ -268,7 +276,6 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
     logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf} Days: {days_to_load}")
     
     try:
-        # Periodic FinViz fetch (every 60 seconds) or forced by Manual Refresh
         now = time.time()
         should_fetch_finviz = False
         
@@ -287,10 +294,9 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             except Exception as e:
                 logging.error(f"Auto-fetch failed: {e}")
                 
-        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=days_to_load)
+        actual_days = (20.0 / 1440.0) if base_tf == 'raw_tick' else days_to_load
+        df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=actual_days)
         
-        # Fallback Logic: If user requested raw_tick or 1sec, but DB has no data,
-        # fallback to FinViz (i1) gracefully without changing the radio button to avoid circular dependency.
         fallback_msg = ""
         
         if df_base.empty and base_tf != 'i1':
@@ -317,8 +323,6 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             return empty_fig, "No Data", "", "{}"
             
         import json
-        
-        # Optimization: Only re-render if data has actually grown/changed
         current_state = {
             "ticker": ticker,
             "base_tf": base_tf,
@@ -333,6 +337,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         if current_state_json == last_state_json and trigger == 'interval-component':
             raise PreventUpdate
             
+        # Call the level2_webapp visualizer!
         fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf)
         
         fig.update_layout(
@@ -345,7 +350,6 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
         
-        # Return fig, text, empty string for loading, and new state
         return fig, msg, "", current_state_json
         
     except PreventUpdate:
@@ -369,7 +373,6 @@ app.clientside_callback(
 )
 
 
-# Infinite Scrolling Callback
 @app.callback(
     Output('days-to-load', 'data'),
     Input('main-chart', 'relayoutData'),
@@ -400,9 +403,8 @@ def handle_panning(relayout_data, current_days, last_state_json):
         if oldest_date.tzinfo is None:
             oldest_date = oldest_date.tz_localize('UTC')
             
-        # If panning approaches the oldest date loaded (within 12 hours)
         if view_start <= oldest_date + pd.Timedelta(hours=12):
-            new_days = min(current_days * 2 + 1, 180) # Cap at 180 days
+            new_days = min(current_days * 2 + 1, 180)
             if new_days > current_days:
                 logging.info(f"Panning detected. Increasing loaded days: {current_days} -> {new_days}")
                 return new_days
@@ -416,4 +418,4 @@ def handle_panning(relayout_data, current_days, last_state_json):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8050)
+    app.run(debug=True, port=8051)

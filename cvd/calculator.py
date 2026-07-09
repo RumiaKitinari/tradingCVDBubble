@@ -144,19 +144,16 @@ def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float =
     for d, g in candidates.groupby(lambda ix: ix.date()):
         if g.empty:
             continue
-        med = reg_med.get(d, float("nan"))
+            
+        # Industry Standard: The closing cross (MOC) is guaranteed to be the single largest
+        # print in the immediate 15:59-16:01 window (or 12:59-13:01 for half days).
+        # We unconditionally neutralize the highest volume bar in this window without 
+        # relying on arbitrary volume multiplier heuristics.
         anchor = g["volume"].idxmax()
-        if not (pd.isna(med) or g.loc[anchor, "volume"] > mult * med):
-            continue
         flag.loc[anchor] = True
         
-        # Spill logic must iterate over the full day's index, not just the candidates
-        day_idx = df[df.index.date == d].index
-        for k in range(day_idx.get_loc(anchor) + 1, len(day_idx)):   # forward spill
-            if df.loc[day_idx[k], "volume"] > spill_mult * med:
-                flag.loc[day_idx[k]] = True
-            else:
-                break
+        # We don't spill forward anymore because the MOC is a single print/bar.
+        # Spilling forward was a hack for volume heuristics.
     return flag
 
 
@@ -263,11 +260,8 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # auction)" line stays available for comparison. See Personal Study Log §8.
     df["is_auction"]     = _flag_auction(df)
     
-    # Do not neutralize real tick sources. Their high volume at 16:00 represents genuine 
-    # directional aggressive trades with real Bid/Ask matching, not a single MOC print.
-    if "source" in df.columns:
-        real_ticks = df["source"].isin(["ibkr_tick"])
-        df.loc[real_ticks, "is_auction"] = False
+    # We apply neutralization for all sources, including ibkr_tick, because the 
+    # 16:00 closing cross (MOC) prints as a huge block volume, not an aggressive hit.
 
     df["delta_raw"]      = df["delta"]                       # before neutralization
     auc = df["is_auction"]

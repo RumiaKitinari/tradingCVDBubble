@@ -334,6 +334,24 @@ def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
         visible=vis("Buy Ratio"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
     ), row=row, col=1, secondary_y=True)
+    
+    # ── Delta Ratio Strip (Stacked Bar on Secondary Y) ──
+    tot_vol = df["buy_pressure"] + df["sell_pressure"]
+    tot_vol = np.where(tot_vol == 0, 1, tot_vol)
+    buy_pct = (df["buy_pressure"] / tot_vol)
+    sell_pct = (df["sell_pressure"] / tot_vol)
+    
+    fig.add_trace(go.Bar(
+        x=df['x_idx'], y=buy_pct, name="Buy % (Strip)",
+        marker_color="rgba(38,166,154,0.6)", visible=vis("Buy % (Strip)"), showlegend=on,
+        legend=legend_id, hoverinfo="y", offsetgroup=f"strip_{row}"
+    ), row=row, col=1, secondary_y=True)
+
+    fig.add_trace(go.Bar(
+        x=df['x_idx'], y=sell_pct, base=buy_pct, name="Sell % (Strip)",
+        marker_color="rgba(239,83,80,0.6)", visible=vis("Sell % (Strip)"), showlegend=on,
+        legend=legend_id, hoverinfo="y", offsetgroup=f"strip_{row}"
+    ), row=row, col=1, secondary_y=True)
 
 
 def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
@@ -411,7 +429,7 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
 
 
 
-def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None) -> go.Figure:
+def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: str = "1sec", pie_chart_count: int = 0, x_range: tuple = None) -> go.Figure:
 
     fig = make_subplots(
         rows=3, cols=1,
@@ -419,12 +437,12 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
         row_heights=[0.50, 0.25, 0.25],
         vertical_spacing=0.06,
         specs=[[{}], [{"secondary_y": True}], [{"secondary_y": True}]],
-        subplot_titles=(
-            f"{ticker} — Candlestick",
-            "Indicator Panel A — Buy/Sell Volume (toggle in upper legend)",
-            "Indicator Panel B — CVD (toggle in lower legend)",
-        )
+        subplot_titles=(f"{ticker} — Candlestick", "", "")
     )
+    
+    # ── Add zero lines for Indicator Panels (Must be done before Pie traces to avoid Plotly bugs) ──
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
 
     timeframes = list(frames.keys())
     if active_timeframe and active_timeframe in timeframes:
@@ -493,52 +511,87 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
                 hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
             ), row=1, col=1, secondary_y=False)
 
-        # ── Phase 3: Bullseye Bubble Chart Overlay ──
-        # Determine dominant direction
-        actual_buy_vol = df["buy_pressure"].fillna(0)
-        actual_sell_vol = df["sell_pressure"].fillna(0)
-        is_buy_dom = actual_buy_vol >= actual_sell_vol
-        
-        outer_color = np.where(is_buy_dom, "rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)")
-        inner_color = np.where(is_buy_dom, "rgba(239,83,80,0.9)", "rgba(38,166,154,0.9)")
-        
-        actual_min_vol = np.minimum(actual_buy_vol, actual_sell_vol)
-        actual_tot_vol = df["volume"].fillna(0)
-        
-        # Option 1: Compress the overall bubble size using square root (power=0.5) 
-        # so huge spikes don't crush the typical candles into tiny dots.
-        # Plotly's sizemode='area' means the 'size' array maps linearly to visual area.
-        power = 0.5
-        tot_vol = actual_tot_vol ** power
-        
-        # To strictly preserve the visual ratio, the inner bubble's area MUST be 
-        # the outer area multiplied by the actual volume ratio.
-        ratio = np.where(actual_tot_vol > 0, actual_min_vol / actual_tot_vol, 0)
-        min_vol = tot_vol * ratio
-        
-        # We calculate the y-position of the bubble as the typical price (H+L+C)/3, or simply close.
-        # But to place it on the candle body, VWAP or (Open+Close)/2 is nice.
-        bubble_y = (df["open"] + df["close"]) / 2
+        # ── Fixed Domain Pie Charts ──
+        if pie_chart_count > 0 and len(timeframes) == 1:
+            N_total = len(df)
+            if x_range is not None:
+                x0_init = x_range[0]
+                x1_init = x_range[1]
+            else:
+                x0_init = max(0, N_total - 100)
+                x1_init = N_total
+                
+            df_vis = df[(df['x_idx'] >= x0_init) & (df['x_idx'] <= x1_init)]
+            
+            n_pies = int(pie_chart_count)
+            overall_width = 0.94 # Matches secondary y-axis domain in Plotly
+            width = overall_width / n_pies
+            pad = width * 0.05
+            
+            chunk_size = (x1_init - x0_init) / n_pies if n_pies > 0 else 1
+            
+            # Pre-compute max volume for sqrt scaling
+            chunks = []
+            vols = []
+            for k in range(n_pies):
+                c_start = x0_init + k * chunk_size
+                c_end = x0_init + (k + 1) * chunk_size
+                chunk = df_vis[(df_vis['x_idx'] >= c_start) & (df_vis['x_idx'] < c_end)]
+                chunks.append(chunk)
+                if len(chunk) > 0:
+                    vols.append(float(chunk["buy_pressure"].sum() + chunk["sell_pressure"].sum()))
+                else:
+                    vols.append(0.0)
+            max_vol = max(vols) if vols and max(vols) > 0 else 1.0
+            
+            for k in range(n_pies):
+                chunk = chunks[k]
+                if len(chunk) > 0:
+                    buy = float(chunk["buy_pressure"].sum())
+                    sell = float(chunk["sell_pressure"].sum())
+                else:
+                    buy, sell = 0, 0
+                
+                if (buy + sell) > 0:
+                    factor = ((buy + sell) / max_vol) ** 0.5
+                    factor = max(0.15, factor) # min size
+                    
+                    x_center = k * width + (width / 2.0)
+                    d_x = [x_center - width * 0.45 * factor, x_center + width * 0.45 * factor]
+                    d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor] # Slightly higher than bottom
+                    
+                    fig.add_trace(go.Pie(
+                        values=[buy, sell],
+                        labels=["Buy", "Sell"],
+                        marker=dict(colors=["rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)"]),
+                        textinfo="none",
+                        hoverinfo="text",
+                        hovertext=f"Buy: {buy:,.0f}<br>Sell: {sell:,.0f}",
+                        hole=0.0,
+                        domain=dict(x=d_x, y=d_y),
+                        sort=False,
+                        direction="clockwise",
+                        showlegend=False
+                    ))
+                else:
+                    # Invisible placeholder
+                    x_center = k * width + (width / 2.0)
+                    d_x = [x_center - width * 0.45 * 0.15, x_center + width * 0.45 * 0.15]
+                    d_y = [0.52 - 0.04 * 0.15, 0.52 + 0.04 * 0.15]
+                    
+                    fig.add_trace(go.Pie(
+                        values=[1.0, 1.0],
+                        labels=["Buy", "Sell"],
+                        marker=dict(colors=["rgba(0,0,0,0)", "rgba(0,0,0,0)"]),
+                        textinfo="none",
+                        hoverinfo="none",
+                        hole=0.0,
+                        domain=dict(x=d_x, y=d_y),
+                        sort=False,
+                        direction="clockwise",
+                        showlegend=False
+                    ))
 
-        # Sizing ref: scale the average compressed volume to a nice 24px radius
-        # (This makes the absolute size much larger, about 4x the area of 12px radius)
-        ref_vol = tot_vol.mean() if not tot_vol.empty else 1
-        ref_vol = max(ref_vol, 1)
-        sizeref = 2.0 * ref_vol / (24 ** 2)
-
-        fig.add_trace(go.Scattergl(
-            x=df['x_idx'], y=bubble_y,
-            mode='markers', name=f"Bubble Outer ({tf})",
-            marker=dict(size=tot_vol, sizemode='area', sizeref=sizeref, sizemin=1, color=outer_color, line=dict(width=0)),
-            visible=False, showlegend=False, hoverinfo="skip"
-        ), row=1, col=1, secondary_y=False)
-
-        fig.add_trace(go.Scattergl(
-            x=df['x_idx'], y=bubble_y,
-            mode='markers', name=f"Bubble Inner ({tf})",
-            marker=dict(size=min_vol, sizemode='area', sizeref=sizeref, sizemin=0, color=inner_color, line=dict(width=0)),
-            visible=False, showlegend=False, hoverinfo="skip"
-        ), row=1, col=1, secondary_y=False)
 
 
         # Screen 2: defaults to Buy/Sell volume; Screen 3: defaults to CVD (session)
@@ -553,22 +606,26 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
         df = frames[tf]
         offset = tf_offsets[tf]
         
-        # panel order: buy, sell, CVD all, CVD raw, cum total, cum buy, cum sell, ratio
+        # panel order: buy, sell, CVD all, CVD raw, cum total, cum buy, cum sell, ratio, buy%, sell%
         LO = "legendonly"
-        panelA = [True, True, LO, LO, LO, LO, LO, LO]
-        panelB = [LO, LO, True, LO, LO, LO, LO, LO]
+        panelA = [True, True, LO, LO, LO, LO, LO, LO, LO, LO]
+        panelB = [LO, LO, True, LO, LO, LO, LO, LO, LO, LO]
         visibility = []
+        
+        # In static HTML mode, we skip dynamic traces (pie/strip) for updatemenus
+        # because their trace count is variable. This loop is only used if not active_timeframe.
+        N_TRACES = 21 # 1 Candle + 20 indicators (10 per panel)
         for j in range(len(timeframes)):
             if j == i:
-                # Candle, Bubble Outer, Bubble Inner
-                visibility += [True, False, False] + panelA + panelB
+                # Candle + panels
+                visibility += [True] + panelA + panelB
             else:
                 visibility += [False] * N_TRACES
 
         showlegend = []
         for j in range(len(timeframes)):
             if j == i:
-                showlegend += [False, False, False] + [True] * 16
+                showlegend += [False] + [True] * 20
             else:
                 showlegend += [False] * N_TRACES
 
@@ -620,7 +677,7 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
                     bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
         legend2=dict(orientation="h", yanchor="top", y=-0.02, xanchor="left", x=0,
                      bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
-        margin=dict(l=60, r=60, t=120, b=60),
+        margin=dict(l=60, r=60, t=120, b=150 if pie_chart_count > 0 else 60),
         uirevision="constant",  # Prevents Plotly from resetting UI state on relayout
     )
     if not active_timeframe:
@@ -641,9 +698,9 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
     fig.update_xaxes(title_text="Time", row=3, col=1)
 
     # ── Current Value Labels ──
-    if not df_1min.empty:
-        last_close = df_1min["close"].iloc[-1]
-        last_cvd = df_1min["cvd_all_end"].iloc[-1] if "cvd_all_end" in df_1min.columns else df_1min["cvd_all"].iloc[-1]
+    if not df.empty:
+        last_close = df["close"].iloc[-1]
+        last_cvd = df["cvd_all_end"].iloc[-1] if "cvd_all_end" in df.columns else df["cvd_all"].iloc[-1]
         
         fig.add_annotation(
             xref="paper", yref="y",
@@ -651,7 +708,7 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
             text=f"{last_close:.2f}",
             showarrow=False,
             xanchor="left",
-            bgcolor="rgba(38,166,154,0.9)" if df_1min["close"].iloc[-1] >= df_1min["open"].iloc[-1] else "rgba(239,83,80,0.9)",
+            bgcolor="rgba(38,166,154,0.9)" if df["close"].iloc[-1] >= df["open"].iloc[-1] else "rgba(239,83,80,0.9)",
             font=dict(color="white", size=11),
             borderpad=3
         )
@@ -665,9 +722,6 @@ def build_chart(df_1min, frames: dict, ticker: str, active_timeframe: str = None
             font=dict(color="white", size=11),
             borderpad=3
         )
-
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
 
     fig.update_xaxes(range=[x0, x1])
     if y1_0:

@@ -110,7 +110,17 @@ def fetch_and_save(ticker: str, timeframe: str = 'i1') -> list[dict]:
     Fetch OHLCV from FinViz and save to MongoDB in one step.
     Returns the fetched candles.
     """
-    candles = get_candle_data(ticker, timeframe)
+    try:
+        candles = get_candle_data(ticker, timeframe)
+    except FinvizTokenError:
+        print("[FinViz] Token expired. Attempting auto-renewal via finviz_curl...")
+        from finviz import finviz_curl
+        session = finviz_curl.login()
+        new_token = finviz_curl.get_token(session)
+        finviz_curl.update_api_keys(new_token)
+        print("[FinViz] Token successfully auto-renewed. Retrying fetch...")
+        candles = get_candle_data(ticker, timeframe)
+        
     save_candles_to_mongo(ticker, timeframe, candles)
     return candles
 
