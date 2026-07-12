@@ -19,6 +19,7 @@ accordingly, so mixed DataFrames (ibkr_tick + finviz_wick) work
 transparently.
 """
 
+import numpy as np
 import pandas as pd
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -173,6 +174,31 @@ def _apply_wick_decomp(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _winsorize_delta(delta: pd.Series, q: float = 0.995) -> pd.Series:
+    """Cap each bar's |delta| at the per-session q-quantile, preserving sign.
+
+    A single block/cross print (e.g. the ~1M-share cross NVDA printed at 15:53)
+    lands entirely on one side and would otherwise dominate the CVD curve — the
+    largest single trade accounts for ~35% of a 1-sec bar's gross flow and flips
+    ~40% of 1-sec bars' direction. These mega-prints are crosses/dark-pool/combo
+    legs, NOT aggressive lit flow, so capping their weight is a noise reduction,
+    not a fit to price. Quantile is computed per trading day so a quiet day and a
+    news day get their own scale.
+
+    Requires a DatetimeIndex. Returns a Series aligned to `delta`. Operates
+    positionally so it is safe on a raw-tick index with duplicate timestamps.
+    """
+    vals = delta.to_numpy(dtype=float).copy()
+    days = np.asarray(delta.index.date)
+    for day in np.unique(days):
+        mask = days == day
+        a = np.abs(vals[mask])
+        cap = np.quantile(a, q)
+        if cap > 0:
+            vals[mask] = np.sign(vals[mask]) * np.minimum(a, cap)
+    return pd.Series(vals, index=delta.index)
+
+
 def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Return df with CVD-related columns added.
@@ -274,6 +300,28 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["cvd_all"]     = df["delta"].cumsum()
     df["cvd_all_raw"] = df["delta_raw"].cumsum()
 
+    # ── Noise-reduced CVD variants (ADDITIVE — cvd_all above is unchanged) ─────
+    # Infrastructure for the tick-CVD upgrade. Two independent noise reductions:
+    #   delta_wins       — per-session winsorized delta (block/cross prints capped)
+    #   cvd_session      — cumulative delta reset each trading day (drops prior-day
+    #                      drift that the all-time cumsum drags forward; better for
+    #                      intraday price tracking)
+    #   cvd_wins         — all-time cumsum of the winsorized delta
+    #   cvd_session_wins — session-anchored + winsorized (both fixes together)
+    # NOTE: these improve the bar-level buy/sell signal and remove outlier
+    # domination, but they do NOT by themselves fix the cumulative-LEVEL vs price
+    # divergence — that is driven by systematic aggressor misclassification and
+    # requires the quote-lag fix (see ibkr/tick_collector.py instrumentation and
+    # scripts/analyze_quote_lag.py). Kept additive so nothing downstream breaks.
+    df["delta_wins"]       = _winsorize_delta(df["delta"])
+    # Session-anchored cumsums computed positionally (duplicate-timestamp safe on
+    # a raw-tick index). groupby(...).cumsum() preserves row order, so .values
+    # assignment aligns correctly even when the index has duplicate labels.
+    _day = df.index.date
+    df["cvd_session"]      = df.groupby(_day)["delta"].cumsum().values
+    df["cvd_wins"]         = df["delta_wins"].cumsum().values
+    df["cvd_session_wins"] = df.groupby(_day)["delta_wins"].cumsum().values
+
     return df
 
 
@@ -334,6 +382,16 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         cvd_all_raw_end=("cvd_all_raw", "last"),# CVD all-time (includes auction)
         auction_vol=("auction_volume", "sum"),  # auction volume falling in this bar
     )
+    # Noise-reduced CVD variants (carried through only when add_cvd_columns
+    # produced them, so older callers / bare frames still resample cleanly).
+    for src, dst, how in [
+        ("delta_wins",       "delta_wins_sum",       "sum"),
+        ("cvd_session",      "cvd_session_end",      "last"),
+        ("cvd_wins",         "cvd_wins_end",         "last"),
+        ("cvd_session_wins", "cvd_session_wins_end", "last"),
+    ]:
+        if src in df_1min.columns:
+            agg_spec[dst] = (src, how)
     if "source" in df_1min.columns:
         # Carry the (dominant) data source so the visualizer can shade
         # wick-estimated regions on every timeframe, not just the base one.
@@ -374,11 +432,42 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
     return df_agg
 
 
+def _reclassify_raw_docs(docs: list[dict], max_age_ms: float) -> list[dict]:
+    """Overwrite each raw-tick doc's `delta` using stale-quote demotion.
+
+    Ticks must be re-sorted by time (the tick rule is sequential). Docs missing
+    bid/ask/quote_age_ms (pre-instrumentation ticks) keep their stored delta.
+    """
+    from cvd.aggressor import classify_demote_stale
+
+    docs = sorted(docs, key=lambda d: d["date"])
+    have = [("bid" in d and "ask" in d and "quote_age_ms" in d) for d in docs]
+    if not any(have):
+        return docs  # nothing instrumented; leave stored delta untouched
+
+    price = np.array([d["price"] for d in docs], dtype=float)
+    size  = np.array([d["size"]  for d in docs], dtype=float)
+    bid   = np.array([d.get("bid", np.nan) for d in docs], dtype=float)
+    ask   = np.array([d.get("ask", np.nan) for d in docs], dtype=float)
+    age   = np.array([d.get("quote_age_ms", np.nan) for d in docs], dtype=float)
+
+    new_delta = classify_demote_stale(price, size, bid, ask, age, max_age_ms=max_age_ms)
+    for d, nd, ok in zip(docs, new_delta, have):
+        if ok:                       # only override instrumented ticks
+            d["delta"] = float(nd)
+    return docs
+
+
 # ─────────────────────────────────────────
 # 4. Load data from MongoDB
 # ─────────────────────────────────────────
 
-def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None) -> pd.DataFrame:
+def load_from_mongo(
+    ticker: str,
+    timeframe: str = "i1",
+    days: int | None = None,
+    reclassify_stale_ms: float | None = None,
+) -> pd.DataFrame:
     """
     Load a given ticker/timeframe from MongoDB finviz_db.candles.
 
@@ -391,6 +480,12 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
           for tick-based timeframes whose `date` field is a real datetime
           (FinViz 'i1' docs store dates as strings, which a datetime range
           query would silently exclude).
+
+    reclassify_stale_ms: (raw_tick only) if set, re-derive each tick's buy/sell
+          delta with quotes older than this many ms demoted to the tick rule
+          (quote-lag fix). Requires instrumented ticks carrying bid/ask/
+          quote_age_ms; ticks without them keep their stored delta. None (default)
+          uses the delta as computed live by tick_collector.
     """
     client = MongoClient("mongodb://localhost:27017/")
     if timeframe == "raw_tick":
@@ -399,10 +494,14 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
         if days is not None:
             now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
             query["date"] = {"$gte": now_et - timedelta(days=days)}
-        docs = list(collection.find(
-            query,
-            {"_id": 0, "date": 1, "price": 1, "size": 1, "delta": 1, "source": 1}
-        ))
+        proj = {"_id": 0, "date": 1, "price": 1, "size": 1, "delta": 1, "source": 1}
+        if reclassify_stale_ms is not None:
+            proj.update({"bid": 1, "ask": 1, "quote_age_ms": 1})
+        docs = list(collection.find(query, proj))
+
+        if reclassify_stale_ms is not None and docs:
+            docs = _reclassify_raw_docs(docs, reclassify_stale_ms)
+
         # Convert raw ticks to OHLCV format so the rest of the pipeline works seamlessly
         for doc in docs:
             p = doc.pop("price")

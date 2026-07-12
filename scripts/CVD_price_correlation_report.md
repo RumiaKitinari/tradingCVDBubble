@@ -1,27 +1,29 @@
-# IBKR 틱 CVD ↔ 주가 상관관계 조사 리포트
+# IBKR Tick CVD ↔ Price Correlation Study
 
-**대상:** NVDA · **데이터:** MongoDB `finviz_db.raw_ticks` / `candles(1sec, source=ibkr_tick)`
-**구간:** 2026-07-08 15:11 ET ~ 2026-07-09 15:51 ET (약 1.3 세션, 틱 978,555개 / 1초봉 16,827개)
-**작성일:** 2026-07-09
-
----
-
-## 0. 한 줄 결론
-
-> **직감이 맞습니다. 지금 CVD는 가격을 거의 안 따라갑니다.** 누적 CVD 레벨과 가격 레벨의
-> 상관계수는 **모든 타임프레임에서 0 근처(대부분 음수, -0.04 ~ -0.2)** 입니다.
-> 다만 원인은 "CVD 로직이 근본적으로 틀렸다"기보다 **① 데이터가 아직 1.3 세션뿐이라 추정이
-> 불안정**하고, **② 거래 크기 가중(size-weighted) 방식이 소수의 대형 프린트와 중간 크기
-> 체결의 매도 분류 편향에 지배**되기 때문입니다. **1분·3분봉으로 올려도 "누적 레벨" 괴리는
-> 안 고쳐집니다** (합산은 집계에 보존됨). 다만 바 단위 변화 신호는 조금 좋아집니다.
+**Symbol:** NVDA · **Data:** MongoDB `finviz_db.raw_ticks` / `candles(1sec, source=ibkr_tick)`
+**Window:** 2026-07-08 15:11 ET ~ 2026-07-09 15:51 ET (~1.3 sessions, 978,555 ticks / 16,827 1-sec bars)
+**Date:** 2026-07-09
 
 ---
 
-## 1. 측정 결과
+## 0. One-line conclusion
 
-### A) 레벨 상관 — `corr(가격, CVD)` (정규장 09:30–16:00, 세션별)
+> **Your intuition is right. Right now CVD barely tracks price.** The correlation between
+> cumulative CVD level and price level is **near zero across every timeframe (mostly negative,
+> −0.04 ~ −0.2)**. But the cause is not "the CVD logic is fundamentally wrong" — rather it is
+> **① we only have 1.3 sessions of data so the estimate is unstable**, and **② the size-weighted
+> approach is dominated by a handful of large prints plus a sell-classification bias on
+> mid-sized fills**. **Moving up to 1-min / 3-min bars does not fix the "cumulative level"
+> divergence** (the sum is preserved under aggregation). It does slightly improve the per-bar
+> change signal, though.
 
-| TF | 07-08 | 07-09 | 세션평균 | 전체pooled |
+---
+
+## 1. Measurements
+
+### A) Level correlation — `corr(price, CVD)` (regular hours 09:30–16:00, per session)
+
+| TF | 07-08 | 07-09 | Session avg | Pooled |
 |----|------:|------:|-------:|--------:|
 | 1sec | +0.061 | −0.133 | −0.036 | −0.063 |
 | 5sec | +0.057 | −0.153 | −0.048 | −0.111 |
@@ -30,9 +32,10 @@
 | 5min | −0.047 | +0.038 | −0.005 | −0.186 |
 | 15min| −0.092 | +0.250 | +0.079 | −0.205 |
 
-→ 사실상 **무상관, 오히려 약한 음의 상관**. 세션마다 부호가 뒤집힘(추정 불안정).
+→ Effectively **no correlation, if anything a weak negative one**. The sign flips between
+sessions (unstable estimate).
 
-### B) 변화량 상관 — `corr(ΔPrice, 바별 delta)` (정규장, pooled)
+### B) Change correlation — `corr(ΔPrice, per-bar delta)` (regular hours, pooled)
 
 | TF | n | corr |
 |----|--:|----:|
@@ -43,117 +46,186 @@
 | 5min | 71 | +0.040 |
 | 15min| 26 | +0.172 |
 
-→ 바 단위로는 **약한 양의 상관**. 1분 부근이 가장 나음. 하지만 여전히 매우 약함.
+→ At the bar level there is a **weak positive correlation**. The 1-min region is the best,
+but it is still very weak.
 
-### C) 리드/래그 (ΔPrice vs Δdelta, 1분봉)
+### C) Lead/lag (ΔPrice vs Δdelta, 1-min bars)
 
 ```
-lag −1 : +0.070    lag 0 : +0.172 (동일봉 최대)    lag +1 : +0.018
+lag −1 : +0.070    lag 0 : +0.172 (max at same bar)    lag +1 : +0.018
 ```
-→ CVD가 가격을 **선행하지 않음**. 동일 봉에서만 약하게 일치.
+→ CVD does **not lead** price. It only agrees weakly within the same bar.
 
-### D) 방향 일치율 — `sign(delta) == sign(ΔPrice)`
+### D) Directional hit rate — `sign(delta) == sign(ΔPrice)`
 
-| TF | 일치율 |
+| TF | Hit rate |
 |----|-----:|
 | 1sec | 59.9% |
 | 1min | 58.1% |
 | 3min | 56.6% |
 | 5min | 53.5% |
 
-→ 동전 던지기(50%)보다 아주 조금 나은 수준. 상위 TF로 갈수록 오히려 하락.
+→ Only slightly better than a coin flip (50%). It actually declines toward higher timeframes.
 
 ---
 
-## 2. 왜 안 따라가나 — 원인 진단
+## 2. Why it doesn't track — root-cause diagnosis
 
-### 원인 ①: 거래 크기 비대칭 (핵심)
-| | 매수(BUY) | 매도(SELL) |
+### Cause ①: Trade-size asymmetry (the key one)
+| | BUY | SELL |
 |--|--------:|---------:|
-| 틱 개수 비중 | **57%** | 43% |
-| 거래량 비중 | 49.4% | **50.6%** |
-| 평균 체결 크기(정규장) | **24.6** | **36.6** |
-| 중앙값 크기 | 1주 | 3주 |
+| Share of tick count | **57%** | 43% |
+| Share of volume | 49.4% | **50.6%** |
+| Avg fill size (regular hours) | **24.6** | **36.6** |
+| Median size | 1 share | 3 shares |
 
-→ **매수는 잔건(1주 오더 등)이 많고, 매도는 덩치가 큼.** 틱 수로는 매수 우위인데
-size-weighted 합산에서는 매도가 이겨서 CVD가 가격과 반대로 흘러내림.
+→ **Buys are dominated by odd lots (1-share orders etc.), while sells are chunkier.** By tick
+count buys lead, but in the size-weighted sum sells win, so CVD drifts down against price.
 
-### 원인 ②: 중간 크기 체결의 매도 분류 편향
-| 크기 구간 | net delta | 매수% |
+### Cause ②: Sell-classification bias on mid-sized fills
+| Size bucket | net delta | buy% |
 |--------|--------:|----:|
-| 100주(정확) | −294,900 | 42.6% |
+| 100 shares (exact) | −294,900 | 42.6% |
 | 101–500 | −278,939 | 43.9% |
 | 500–1000 | −146,145 | 40.4% |
 
-→ 100~1000주 라운드랏 체결이 **일관되게 ~42%만 매수로 분류** → CVD 하향 드리프트의 주범.
-전형적인 **quote-lag(호가 지연) 오분류** 냄새. AllLast(체결)와 BidAsk(호가)가 별도 스트림이라
-호가가 체결 대비 늦게 갱신되면 중간 크기 체결이 매도로 잘못 찍힘.
+→ Round-lot fills of 100–1000 shares are **consistently classified as only ~42% buys** → the
+main driver of the CVD downward drift. This smells like classic **quote-lag misclassification**.
+Because AllLast (trades) and BidAsk (quotes) are separate streams, if the quote updates late
+relative to the trade, mid-sized fills get stamped as sells by mistake.
 
-### 원인 ③: 초대형 아웃라이어 프린트
-`>=100k주` 프린트 4건 (그중 **1,000,000주 단일 매수 프린트** @15:53) = 전체 gross flow의
-**4.1%**를 단 4틱이 차지. 차트에서 CVD가 수직으로 튀는 지점이 이것.
-→ p99로 winsorize 시 레벨 상관 −0.158 → −0.047로 **드리프트 완화**되나, 양(+)으로 돌지는 않음.
+### Cause ③: Extreme outlier prints
+4 prints of `>=100k shares` (including a **single 1,000,000-share buy print** @15:53) account for
+**4.1%** of total gross flow in just 4 ticks. This is what makes CVD spike vertically on the chart.
+→ Winsorizing at p99 moves the level correlation from −0.158 → −0.047, so it **eases the drift**
+but does not flip it positive.
 
-### 시각 확인
-`scripts/cvd_price_overlay.png` 참조. 특히 **7/9 오후**: 가격이 204.2→203.0으로 급락하는데
-CVD는 오히려 높게 유지/상승 — 교과서적인 다이버전스(가격≠오더플로우).
-
----
-
-## 3. 사용자 질문에 대한 직접 답변
-
-**Q. CVD 로직을 고쳐야 하나?**
-→ 부분적으로 예. 근본 수식이 틀린 건 아니지만, 현재 **size-weighted 누적 방식이 아웃라이어와
-분류 편향에 취약**합니다. 아래 3-a~d 개선을 A/B로 테스트할 가치가 있습니다.
-
-**Q. 데이터가 쌓이고 1분·3분봉으로 가면 정확도가 오를까?**
-→ **레벨 괴리는 타임프레임으론 안 고쳐집니다.** 집계는 delta 합을 보존하므로 1초봉에서 생긴
-드리프트가 1분·3분봉에 그대로 누적됩니다. **바 단위 변화 신호(B)** 는 1분 부근에서 소폭 개선됩니다.
-데이터 양은 **결정적으로 부족**합니다 — 두 세션의 상관 부호가 서로 뒤집힐 만큼 추정이 불안정해서,
-지금 숫자로 "로직이 맞다/틀리다"를 단정할 수 없습니다.
+### Visual check
+See `scripts/cvd_price_overlay.png`. Note especially the **afternoon of 7/9**: price plunges from
+204.2 → 203.0, yet CVD stays high / rises — a textbook divergence (price ≠ order flow).
 
 ---
 
-## 4. 권장 조치 (우선순위 순)
+## 3. Direct answers to your questions
 
-1. **데이터부터 더 쌓기 (필수).** 최소 10–20 정규장 세션. 지금 1.3세션 상관치는 통계적으로 의미 없음.
-2. **quote-lag 검증.** `tick_collector`에서 분류 시점의 bid/ask 신선도(체결 대비 호가 타임스탬프 지연)를
-   로깅해 중간 크기 체결의 매도 편향이 오분류인지 실제 흐름인지 확인. 오분류면 Lee-Ready 호가 정렬/지연 보정.
-3. **크기 처리 개선 A/B:** (a) p99 winsorize, (b) 오드랏/1주 프린트 필터, (c) 대형 블록 별도 처리.
-   → 위 실험에서 winsorize가 드리프트를 절반으로 줄였음.
-4. **세션 앵커 CVD 도입 검토.** all-time cumsum 대신 세션 시작 리셋 CVD가 인트라데이 가격 추종엔 더 적합.
-5. **관점 정리:** CVD는 원래 가격과 1:1 상관이 목적이 아니라 **다이버전스 탐지용**. 낮은 상관 자체가
-   "고장"은 아님. 단 현재는 방향 일치율 <55%(상위 TF)라 아직 신뢰할 신호로 보긴 이름.
+**Q. Do I need to fix the CVD logic?**
+→ Partly yes. The underlying formula isn't wrong, but the current **size-weighted cumulative
+approach is vulnerable to outliers and classification bias**. The improvements 3-a~d below are
+worth A/B testing.
+
+**Q. As data accumulates and I move to 1-min / 3-min bars, will accuracy improve?**
+→ **The level divergence is not fixed by timeframe.** Aggregation preserves the delta sum, so
+drift created at the 1-sec bar carries straight into the 1-min / 3-min bars. The **per-bar change
+signal (B)** improves slightly around 1-min. The amount of data is **decisively insufficient** —
+the correlation sign flips between the two sessions, so the estimate is too unstable to declare
+the logic "right or wrong" from the current numbers.
+
+---
+
+## 4. Recommended actions (in priority order)
+
+1. **Accumulate more data first (mandatory).** At least 10–20 regular sessions. The current
+   1.3-session correlations are statistically meaningless.
+2. **Verify quote-lag.** Log the bid/ask freshness at classification time (quote timestamp lag
+   vs the trade) in `tick_collector` to check whether the mid-size sell bias is misclassification
+   or real flow. If it's misclassification, apply Lee-Ready quote alignment / lag correction.
+3. **Improve size handling, A/B:** (a) p99 winsorize, (b) filter odd-lot / 1-share prints,
+   (c) handle large blocks separately. → In the experiment above, winsorizing halved the drift.
+4. **Consider a session-anchored CVD.** Instead of an all-time cumsum, a CVD that resets at
+   session start is better suited to intraday price tracking.
+5. **Reframe the goal:** CVD was never meant to be 1:1 correlated with price — it's for
+   **divergence detection**. Low correlation by itself is not "broken." That said, with a
+   directional hit rate <55% (higher TFs), it is still too early to treat it as a trustworthy signal.
 
 ---
 
 ---
 
-## 5. 후속 (2026-07-09 오후)
+## 5. Follow-up (2026-07-09 afternoon)
 
-### 5.1 "5초/1초 candle decomposition이 더 정확한가?" — 테스트 결과 & 함정
-동일 IBKR 1초봉에 wick decomposition을 적용해 tick-aggressor와 비교:
+### 5.1 "Is 5-sec / 1-sec candle decomposition more accurate?" — test results & the trap
+Applying wick decomposition to the same IBKR 1-sec bars and comparing to tick-aggressor:
 
-| | LEVEL corr (tick / wick) | 방향일치 (tick / wick) |
+| | LEVEL corr (tick / wick) | Directional (tick / wick) |
 |--|--|--|
 | 1sec | 0.15·−0.28 / **0.89·0.23** | 59.5% / **90.7%** |
 | 5sec | 0.15·−0.27 / **0.95·0.73** | 57.7% / **96.0%** |
 | 1min | 0.11·−0.28 / **0.99·0.92** | 58.2% / **98.7%** |
 
-→ wick-decomp는 가격을 훨씬 잘 따라가 **보이지만, 이건 순환논리(circular)**. wick 방식은
-캔들의 open→close 방향에서 매수/매도를 *역산*하므로 "가격↑ = 매수세"를 되풀이할 뿐, **가격과
-독립적인 오더플로우 정보가 아님**. 방향일치 99%는 delta를 ΔP로부터 만들었으니 당연한 결과.
-→ IBKR 틱으로 전환한 이유(교수님 지시: 정확한 tick-level CVD) 자체가 wick 추정을 버리기 위함.
-   되돌아가면 예쁘지만 의미 없는 선이 됨. **결론: candle-decomp로 회귀 X. tick 분류를 고쳐야 함.**
-→ 단, tick-CVD의 변화상관이 0 근처/음수라는 건 "다이버전스"로만 보기엔 너무 낮음 → 분류 노이즈 존재.
+→ Wick-decomp *appears* to track price far better, **but this is circular reasoning**. The wick
+method *back-solves* buy/sell from the candle's open→close direction, so it merely restates
+"price↑ = buying pressure" — it is **not order-flow information independent of price**. A 99%
+directional hit rate is inevitable when delta is built from ΔP itself.
+→ The whole reason for switching to IBKR ticks (the professor's directive: accurate tick-level
+CVD) was to abandon wick estimation. Going back gives a pretty but meaningless line.
+**Conclusion: do NOT revert to candle-decomp. Fix the tick classification instead.**
+→ That said, tick-CVD's change correlation being near-zero / negative is too low to be dismissed
+as mere "divergence" → there is classification noise present.
 
-### 5.2 quote-lag 계측 구현 (완료)
-`ibkr/tick_collector.py`에 진단 필드 추가: 각 raw tick에 분류 시점의 `bid`, `ask`,
-`quote_age_ms`(NBBO 신선도), `cls`(quote/tick/zerotick/none 분류 경로) 저장.
-→ 다음 수집 세션부터 `scripts/analyze_quote_lag.py NVDA` 실행 시 중간 크기 매도 편향이
-   stale-quote 오분류인지(신선 호가만 쓰면 buy%가 50 근처로 회복) 실제 흐름인지 판정 가능.
+### 5.2 quote-lag instrumentation implemented (done)
+Added diagnostic fields to `ibkr/tick_collector.py`: for each raw tick, store the classification-time
+`bid`, `ask`, `quote_age_ms` (NBBO freshness), and `cls` (classification path: quote/tick/zerotick/none).
+→ From the next collection session onward, running `scripts/analyze_quote_lag.py NVDA` will tell
+whether the mid-size sell bias is stale-quote misclassification (buy% recovers to ~50 when only
+fresh quotes are used) or real flow.
 
-## 부록: 재현 방법
-- `scratchpad/cvd_corr.py` — A~D 상관 측정
-- `scratchpad/cvd_diag.py`, `cvd_diag2.py` — 분류 편향·크기 진단·대안 CVD 정의 비교
-- `scratchpad/cvd_final.py` — 아웃라이어 분석 + 오버레이 차트 생성
+## 6. Building noise-removal infrastructure (2026-07-09)
+
+**Key finding (pre-implementation validation):** offline noise removal alone — winsorize,
+session-anchor — **does not fix the level tracking of cumulative CVD.** In fact, the 7/8 regular
+session got *worse* under winsorize, with level correlation going +0.15 → −0.90 — that +0.15 was a
+*fake* correlation created by a single 1M-share buy print, and once it was stripped out the real
+sell drift surfaced. In other words, the culprit wrecking the level is not the outlier but the
+**systematic sell-misclassification drift**, and that cannot be fixed without the quote-lag
+classification fix (which needs instrumented data). Winsorize does, however, **consistently
+improve the per-bar change signal** (7/8 regular session chg +0.03 → +0.15).
+
+**Implementation (additive, existing `cvd_all` unchanged):** added to `cvd/calculator.py` —
+- `delta_wins` — per-bar delta winsorized at session p99.5 (caps block / cross prints)
+- `cvd_session` — session-anchored cumulative CVD that resets daily
+- `cvd_wins` / `cvd_session_wins` — combinations of the above. `aggregate_pressure` carries them
+  across all timeframes.
+- Validation: the 1M-print bar was capped 999,933 → 13,379. Session resets confirmed.
+  app/visualizer import OK.
+
+→ **Next step (real level fix):** restart the instrumented collector → accumulate 1–2 weeks →
+diagnose with `analyze_quote_lag.py` → fix the classification logic. Then layer these columns on
+top to finish. Recommend switching the visualizer display only after the classification fix
+(switching now makes some days' levels look worse).
+
+## 7. quote-lag diagnosis + reclassification fix implemented (2026-07-10)
+
+**Diagnosis (instrumented data 09:30–09:59, 30,295 ticks):** quote-lag confirmed real — 28.9% are
+stale by 100ms+. Mid-size (100–1000 share) buy% drops from 53.7% on fresh quotes → 48.3% on stale
+quotes, and net delta flips from + to −. **This confirms the hypothesis that stale quotes create
+the sell misclassification.** (This session was only 29% stale, so the bias isn't as severe as
+yesterday's. The collector died at 09:59, so only the first 29 minutes of regular hours were captured.)
+
+**Validation (reclassifying with stored bid/ask):** demoting stale quotes (trust only fresh quotes,
+tick-rule for the rest) improves things:
+| reclassify | LEVEL(30s) | direction(30s) |
+|--|--:|--:|
+| none | 0.834 | 49.1% |
+| >100ms | 0.899 | 61.4% |
+| >50ms | 0.903 | 59.6% |
+| >20ms | 0.932 | 57.9% |
+
+**Implementation:**
+- `cvd/aggressor.py::classify_demote_stale()` — stale-quote demotion reclassification (reuses
+  classify_vectorized)
+- `cvd/calculator.py::load_from_mongo(..., reclassify_stale_ms=50)` — reclassify on raw_tick load
+  (validated, usable immediately)
+- `ibkr/tick_collector.py` — store the NBBO stream into `raw_quotes` (for the proper merge_asof fix)
+- `ibkr/reclassify.py` — time-aligned reclassification via merge_asof (the proper approach;
+  verifiable once one session of raw_quotes is collected). Currently only 48 raw_quotes (1.5 min)
+  exist → a <50% coverage warning fires → needs the next collection session.
+
+**To do next session:** restart the (updated) collector → collect one regular session of raw_quotes →
+run `python -m ibkr.reclassify --ticker NVDA` to validate the proper fix → if good, apply with
+`--write` + switch the visualizer to `cvd_session_wins` / reclassified delta.
+
+## Appendix: how to reproduce
+- `scratchpad/cvd_corr.py` — A~D correlation measurements
+- `scratchpad/cvd_diag.py`, `cvd_diag2.py` — classification bias / size diagnosis / alternative CVD
+  definition comparison
+- `scratchpad/cvd_final.py` — outlier analysis + overlay chart generation

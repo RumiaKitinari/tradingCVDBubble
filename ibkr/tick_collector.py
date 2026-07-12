@@ -50,6 +50,13 @@ ET = ZoneInfo("America/New_York")
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "finviz_db"
 
+# Flush the NBBO buffer once it reaches this many quotes even if no trade has
+# rolled the 1-sec bar over. Quotes update far more often than trades, so during
+# quote-only periods (halts, thin symbols, pre-market) the bar flush may not fire
+# for a long time — without this cap the buffer would grow unbounded in memory
+# and none of those quotes would be persisted to raw_quotes.
+QUOTE_FLUSH_LIMIT = 2000
+
 
 # ─────────────────────────────────────────
 # TickCollector class
@@ -83,10 +90,18 @@ class TickCollector:
         self.current_second: datetime | None = None
         self.tick_buffer: list[tuple[float, float, float]] = []
         self.raw_buffer = []
+        self.quote_buffer = []
 
         mongo = MongoClient(MONGO_URI)
         self.col = mongo[DB_NAME]["candles"]
         self.raw_col = mongo[DB_NAME]["raw_ticks"]
+        # Full NBBO stream, persisted so trades can be re-classified OFFLINE by
+        # time-aligning each trade to the quote prevailing at its timestamp
+        # (merge_asof, the industry-standard Lee-Ready fix for quote-lag). The
+        # real-time per-trade bid/ask snapshot in raw_ticks can be stale; this
+        # stream lets us recover the correct prevailing quote after the fact.
+        self.quote_col = mongo[DB_NAME]["raw_quotes"]
+        self.quote_col.create_index([("ticker", 1), ("date", 1)], background=True)
         self.raw_col.create_index([("ticker", 1), ("date", 1)], background=True)
         self.col.create_index(
             [("ticker", 1), ("timeframe", 1), ("date", 1)],
@@ -180,18 +195,51 @@ class TickCollector:
                 self.ask = float(ask)
                 updated = True
             # Record when the NBBO last changed so _on_trade_tick can measure how
-            # stale the quote was at classification time (quote-lag diagnostics).
+            # stale the quote was at classification time (quote-lag diagnostics),
+            # and persist the quote to the raw_quotes stream for offline
+            # time-aligned re-classification (merge_asof).
             if updated:
                 t = getattr(tick, "time", None)
-                self.quote_time = self._to_et(t) if t is not None else self.quote_time
+                qt = self._to_et(t) if t is not None else self.quote_time
+                self.quote_time = qt
+                if qt is not None and self.bid is not None and self.ask is not None:
+                    self.quote_buffer.append({
+                        "ticker": self.ticker,
+                        "date": qt,
+                        "bid": self.bid,
+                        "ask": self.ask,
+                    })
+                    # Bound the buffer during quote-only periods (no trade to
+                    # trigger the bar flush); persist and clear when it fills up.
+                    if len(self.quote_buffer) >= QUOTE_FLUSH_LIMIT:
+                        self._flush_quotes()
 
     # ── Bar flush ────────────────────────────────────────────────────────────
 
+    def _flush_quotes(self):
+        """Persist and clear the buffered NBBO stream (raw_quotes).
+
+        Kept separate from _flush's bar logic so it runs independently of
+        tick_buffer: a second that carried quotes but no trades must still
+        persist its quotes, and the buffer must never grow without bound.
+        """
+        if not self.quote_buffer:
+            return
+        try:
+            self.quote_col.insert_many(self.quote_buffer)
+        except Exception as e:
+            logging.error(f"MongoDB raw quote insert error: {e}")
+        self.quote_buffer = []
+
     def _flush(self, second: datetime):
         """Aggregate tick_buffer into a 1-sec OHLCV bar and upsert to MongoDB."""
+        # Flush the NBBO stream first — unconditionally, before the tick_buffer
+        # early-return below, so quote-only seconds still persist their quotes.
+        self._flush_quotes()
+
         if not self.tick_buffer:
             return
-            
+
         # Bulk insert raw ticks
         if self.raw_buffer:
             try:

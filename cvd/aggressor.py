@@ -106,3 +106,44 @@ def classify_vectorized(
     delta[needs_tick] = tick_dir[needs_tick] * size[needs_tick]
 
     return delta, float(price[-1]), float(tick_dir[-1])
+
+
+def classify_demote_stale(
+    price: np.ndarray,
+    size: np.ndarray,
+    bid: np.ndarray,
+    ask: np.ndarray,
+    quote_age_ms: np.ndarray,
+    max_age_ms: float = 50.0,
+    prev_price: float | None = None,
+    prev_dir: float = 0.0,
+) -> np.ndarray:
+    """Re-classify trades, DEMOTING stale quotes to the tick rule.
+
+    A quote-based aggressor label is only trustworthy if the NBBO used was
+    actually current when the trade printed. IBKR delivers trades (AllLast) and
+    quotes (BidAsk) as two independent streams, so the quote snapshot held at
+    classification time can lag the trade by hundreds of ms; empirically stale
+    quotes bias the label toward SELL. Industry practice (Lee-Ready with proper
+    quote alignment) is to only quote-classify when the quote is time-aligned;
+    here we approximate that by NaN-ing the bid/ask for any trade whose quote was
+    older than `max_age_ms`, which forces classify_vectorized to fall back to the
+    tick rule for those trades.
+
+    The superior fix is merge_asof against the full NBBO stream (raw_quotes); use
+    ibkr/reclassify.py once that stream has been collected. This function works on
+    the per-trade bid/ask already stored in raw_ticks, so it needs no extra data.
+
+    Inputs must be time-sorted. Returns the signed per-trade delta array.
+    """
+    bid = np.asarray(bid, dtype=float).copy()
+    ask = np.asarray(ask, dtype=float).copy()
+    age = np.asarray(quote_age_ms, dtype=float)
+    stale = np.isnan(age) | (age > max_age_ms)
+    bid[stale] = np.nan
+    ask[stale] = np.nan
+    delta, _, _ = classify_vectorized(
+        np.asarray(price, dtype=float), np.asarray(size, dtype=float),
+        bid, ask, prev_price, prev_dir,
+    )
+    return delta

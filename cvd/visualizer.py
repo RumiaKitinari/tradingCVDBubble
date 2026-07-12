@@ -555,6 +555,8 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
                 if (buy + sell) > 0:
                     factor = ((buy + sell) / max_vol) ** 0.5
                     factor = max(0.15, factor) # min size
+                    if n_pies >= 50:
+                        factor *= 1.5
                     
                     x_center = k * width + (width / 2.0)
                     d_x = [x_center - width * 0.45 * factor, x_center + width * 0.45 * factor]

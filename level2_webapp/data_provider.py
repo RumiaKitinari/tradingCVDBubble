@@ -130,14 +130,14 @@ def fetch_and_aggregate_l2_data(ticker, df_candles, max_candles=300):
         bid_cog_list.append(calculate_center_of_gravity(bids))
         ask_cog_list.append(calculate_center_of_gravity(asks))
         
-    df_subset['obi'] = obi_list
-    df_subset['bid_weighted_liq'] = bid_wl_list
-    df_subset['ask_weighted_liq'] = ask_wl_list
-    df_subset['bid_cog'] = bid_cog_list
-    df_subset['ask_cog'] = ask_cog_list
-    
-    # Update the original df_candles with the subset metrics
-    df_candles.update(df_subset)
+    # Use iloc for assignment to avoid "cannot reindex from a duplicate axis" errors
+    # which happen when df_candles has duplicate timestamps (e.g. in Raw Ticks data).
+    N = len(obi_list)
+    df_candles.iloc[-N:, df_candles.columns.get_loc('obi')] = obi_list
+    df_candles.iloc[-N:, df_candles.columns.get_loc('bid_weighted_liq')] = bid_wl_list
+    df_candles.iloc[-N:, df_candles.columns.get_loc('ask_weighted_liq')] = ask_wl_list
+    df_candles.iloc[-N:, df_candles.columns.get_loc('bid_cog')] = bid_cog_list
+    df_candles.iloc[-N:, df_candles.columns.get_loc('ask_cog')] = ask_cog_list
     
     # Build Heatmap Z-Matrix
     all_prices = set()

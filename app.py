@@ -286,6 +286,12 @@ def update_timeframes(base_tf, current_value):
 # Global state to prevent spamming FinViz fetches
 import time
 last_finviz_fetch = {}
+# Per-ticker cooldown on the background IBKR backfill spawn. update_graph fires
+# on every polling interval, and each backfill process connects to IB Gateway on
+# the same clientId (=11) which Gateway REJECTS as a duplicate — so an unthrottled
+# spawn just piles up failing processes. A 1-day backfill runs ~65s (see DONE.md).
+last_backfill = {}
+BACKFILL_COOLDOWN_SEC = 120
 DATA_CACHE = {} # Cache for fast pie chart HUD updates
 
 @app.callback(
@@ -353,6 +359,21 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         
         if df_base.empty and base_tf != 'i1':
             logging.info(f"No data for {ticker} in {base_tf}. Rendering FinViz i1 chart instead...")
+
+            # Kick off a one-shot IBKR backfill in the background so tick data is
+            # ready on a later refresh. Throttled per-ticker (see BACKFILL_COOLDOWN_SEC)
+            # and isolated in its own try — a spawn failure must never suppress the
+            # FinViz fallback below. Stamp the cooldown before spawning so a raising
+            # Popen can't cause a retry-storm.
+            if now - last_backfill.get(ticker, 0) > BACKFILL_COOLDOWN_SEC:
+                last_backfill[ticker] = now
+                try:
+                    import subprocess, sys
+                    logging.info(f"Auto-backfilling 1 day of IBKR tick data for {ticker} in background...")
+                    subprocess.Popen([sys.executable, "-m", "ibkr.backfill", "--ticker", ticker, "--days", "1"])
+                except Exception as e:
+                    logging.error(f"Background backfill spawn failed: {e}")
+
             try:
                 from finviz.new_finviz import fetch_and_save
                 fetch_and_save(ticker, timeframe="i1")
@@ -585,6 +606,8 @@ def update_pie_charts_on_pan(relayout_data, current_fig):
             if (buy + sell) > 0:
                 factor = ((buy + sell) / max_vol) ** 0.5
                 factor = max(0.15, factor)
+                if n_pies >= 50:
+                    factor *= 1.5
                 d_x = [x_center - width * 0.45 * factor, x_center + width * 0.45 * factor]
                 d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor]
                 

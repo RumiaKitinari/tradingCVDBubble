@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from pymongo import MongoClient
 import traceback
 
 # Ensure we can import from the parent directory
@@ -11,62 +10,65 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from cvd.calculator import run_pipeline
 
 TIERS = {
-    "Large": ["NVDA", "AAPL", "TSLA", "MSFT", "JPM", "XOM", "UNH", "WMT", "CAT", "DIS"],
-    "Mid":   ["RBLX", "DKNG", "AFRM", "CVNA", "CROX", "SOFI", "CHWY", "RIVN", "PLTR", "U"],
-    "Small": ["GME", "AMC", "BYND", "UPST", "FUBO", "CLOV", "WKHS", "MULN", "SIRI", "RUM"]
+    "Mega": ["NVDA", "AAPL", "MSFT"],
+    "Micro": ["GME", "AMC", "PLTR"],
+    "Nano": ["PENN", "CHWY", "RUM"]
 }
 
+def analyze_session(df_session, window=390):
+    if len(df_session) < window:
+        return np.nan
+    rolling_corr = df_session["cvd_all"].rolling(window).corr(df_session["close"])
+    return rolling_corr.mean()
 
 def analyze_correlation(ticker: str):
     try:
-        # We use the existing pipeline to get perfectly calculated CVD
-        # We just need the base timeframe (1min)
         df, _ = run_pipeline(ticker)
         if df.empty:
             return None
             
         df = df.copy()
+        # Ensure index is datetime
+        df.index = pd.to_datetime(df.index)
         
-        # We need continuous data for rolling correlation, but market hours have gaps.
-        # However, for a simple rolling Pearson, we can just use rolling on the rows.
+        # Split into sessions
+        # Pre: 04:00 - 09:30
+        # Reg: 09:30 - 16:00
+        # Aft: 16:00 - 20:00
+        time = df.index.time
         
-        # 1. Rolling Pearson Correlation (Window = 390 rows, roughly 1 trading day of 1-min bars)
-        window = 390
-        rolling_corr = df["cvd_all"].rolling(window).corr(df["close"])
-        avg_rolling_corr = rolling_corr.mean()
+        from datetime import time as dtime
         
-        # 2. Lead-Lag Cross Correlation
-        # Does CVD lead price? We check the correlation of today's CVD with tomorrow's price (or +N minutes)
-        # Shift close BACKWARDS to see if current CVD correlates with FUTURE close.
-        # Positive lag means we are comparing CVD(t) with Close(t + lag).
-        # We'll use 5 min, 15 min, and 60 min lags.
-        lags = [1, 5, 15, 60]
-        lead_corrs = {}
+        pre_mask = (time >= dtime(4, 0)) & (time < dtime(9, 30))
+        reg_mask = (time >= dtime(9, 30)) & (time < dtime(16, 0))
+        aft_mask = (time >= dtime(16, 0)) & (time < dtime(20, 0))
         
-        # Since cumulative series have high autocorrelation, it's better to correlate changes (returns)
-        # However, the user asked for cvd_all vs close. We'll provide both.
+        df_pre = df[pre_mask]
+        df_reg = df[reg_mask]
+        df_aft = df[aft_mask]
         
-        # For cross-correlation, we'll use the difference (delta vs price change) to avoid spurious correlation
-        delta = df["delta"]
-        price_change = df["close"].diff()
+        # We use a smaller window for pre/after since they are shorter
+        # Pre is 5.5 hours = 330 mins -> window 60
+        # Reg is 6.5 hours = 390 mins -> window 120
+        # Aft is 4.0 hours = 240 mins -> window 60
         
-        for lag in lags:
-            shifted_price_change = price_change.shift(-lag)
-            corr = delta.corr(shifted_price_change)
-            lead_corrs[f"Lead {lag}m (Delta->Price)"] = corr
-            
+        corr_pre = analyze_session(df_pre, window=60)
+        corr_reg = analyze_session(df_reg, window=120)
+        corr_aft = analyze_session(df_aft, window=60)
+        
         return {
             "Ticker": ticker,
             "Total Bars": len(df),
-            "Avg 1-Day Rolling Corr (cvd_all vs close)": avg_rolling_corr,
-            **lead_corrs
+            "Pre-Market Corr": corr_pre,
+            "Regular Corr": corr_reg,
+            "After-Hours Corr": corr_aft
         }
     except Exception as e:
         print(f"Error analyzing {ticker}: {e}")
         return None
 
 def main():
-    print("Starting CVD-Price Correlation Backtest...\n")
+    print("Starting 3x3 CVD-Price Correlation Backtest...\n")
     
     results = []
     
@@ -85,38 +87,31 @@ def main():
         
     res_df = pd.DataFrame(results)
     
-    report = "# Price-CVD Correlation & Lead-Lag Backtest Report\n\n"
-    report += "This report analyzes the correlation between price and Cumulative Volume Delta (CVD) across different market cap tiers.\n\n"
+    report = "# 3x3 Matrix: Price-CVD Correlation Report\n\n"
+    report += "This report analyzes the rolling correlation between price and Tick CVD across 3 Market Caps and 3 Trading Sessions.\n\n"
     
-    report += "## Summary by Tier\n"
+    report += "## Summary by Tier and Session\n"
     summary = res_df.groupby("Tier").agg({
-        "Avg 1-Day Rolling Corr (cvd_all vs close)": "mean",
-        "Lead 1m (Delta->Price)": "mean",
-        "Lead 5m (Delta->Price)": "mean",
-        "Lead 15m (Delta->Price)": "mean",
+        "Pre-Market Corr": "mean",
+        "Regular Corr": "mean",
+        "After-Hours Corr": "mean"
     }).round(3).reset_index()
     
-    summary["Tier"] = pd.Categorical(summary["Tier"], ["Large", "Mid", "Small"])
+    summary["Tier"] = pd.Categorical(summary["Tier"], ["Mega", "Micro", "Nano"])
     summary = summary.sort_values("Tier")
     report += summary.to_markdown(index=False) + "\n\n"
     
     report += "## Detailed Results\n"
-    res_df["Tier"] = pd.Categorical(res_df["Tier"], ["Large", "Mid", "Small"])
-    res_df = res_df.sort_values(["Tier", "Avg 1-Day Rolling Corr (cvd_all vs close)"], ascending=[True, False])
+    res_df["Tier"] = pd.Categorical(res_df["Tier"], ["Mega", "Micro", "Nano"])
+    res_df = res_df.sort_values(["Tier", "Regular Corr"], ascending=[True, False])
     
-    # Format floats for readability
-    for col in res_df.columns:
-        if "Corr" in col or "Lead" in col:
-            res_df[col] = res_df[col].round(3)
+    # Format floats
+    for col in ["Pre-Market Corr", "Regular Corr", "After-Hours Corr"]:
+        res_df[col] = res_df[col].round(3)
             
     report += res_df.drop(columns=["Tier"]).to_markdown(index=False) + "\n\n"
     
-    report += "## Conclusion\n"
-    report += "1. **Rolling Correlation**: Shows whether the overall trend of CVD matches the price trend over a 1-day window.\n"
-    report += "2. **Lead-Lag Analysis**: Compares the 1-minute Net Delta to future price changes. Positive values indicate CVD changes precede Price changes in the same direction.\n"
-    report += "3. **Tier Comparison**: Lower liquidity stocks (Small caps) are expected to have lower correlation due to the inaccuracy of wick-based aggressive volume estimation.\n"
-    
-    report_path = os.path.join(os.path.dirname(__file__), "..", "Claude", "CVD_Correlation_Report.md")
+    report_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "CVD_3x3_Correlation_Report.md")
     with open(report_path, "w") as f:
         f.write(report)
         
