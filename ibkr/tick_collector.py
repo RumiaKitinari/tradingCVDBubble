@@ -16,10 +16,12 @@ the wick-decomposition step and use the real buy/sell values directly.
 Timestamps are converted from UTC to US/Eastern so the auction-detection
 logic in calculator.py (which checks for 15:59 / 16:00 ET) still works.
 
-IBC reconnection: ib_async automatically reconnects on dropped connections.
-If IB Gateway restarts (daily forced restart), ib_async will reconnect and
-re-subscribe. The weekly Sunday 1am ET forced logout requires IBC's
-weekly-reconnect feature (external setup, see DONE.md).
+Reconnection: run() detects a dropped API connection (isConnected() → False,
+e.g. the gateway's daily/weekly restart) and re-connects + re-subscribes both
+tick streams itself — ib_async does NOT auto-resubscribe, so without this the
+process would stay alive but silently collect nothing. The weekly Sunday 1am ET
+forced *logout* still requires IBC to re-authenticate the gateway (external
+setup, see DONE.md); this loop handles every drop where the gateway comes back.
 
 Usage:
     python -m ibkr.tick_collector --ticker NVDA
@@ -284,9 +286,10 @@ class TickCollector:
         except Exception as e:
             logging.error(f"MongoDB upsert error for {second}: {e}")
 
-    # ── Main async loop ──────────────────────────────────────────────────────
+    # ── Connect + subscribe (one session) ────────────────────────────────────
 
-    async def run(self):
+    async def _connect_and_subscribe(self):
+        """Connect to the gateway and (re)subscribe both tick streams."""
         logging.info(
             f"[{self.ticker}] Connecting to IB Gateway "
             f"(port={self.port}, clientId={self.client_id})..."
@@ -310,22 +313,52 @@ class TickCollector:
         )
         quote_ticker.updateEvent += self._on_bidask_tick
 
-        logging.info(
-            f"[{self.ticker}] Streaming tick data → MongoDB (1-sec bars). "
-            f"Press Ctrl+C to stop."
-        )
+        logging.info(f"[{self.ticker}] Streaming tick data → MongoDB (1-sec bars).")
+
+    # ── Main async loop ──────────────────────────────────────────────────────
+
+    async def run(self):
+        """Connect, stream, and RECONNECT on drops.
+
+        The gateway drops the API connection on its daily/weekly restart. ib_async
+        does NOT auto-resubscribe tick-by-tick streams, so we detect the drop
+        (isConnected() goes False) and rebuild the session ourselves. Without this
+        the process stays alive but silently collects nothing (a false heartbeat).
+        """
+        RECONNECT_DELAY = 30  # seconds between reconnect attempts
         try:
             while True:
-                await asyncio.sleep(60)
-                logging.info(f"[{self.ticker}] Heartbeat — still collecting...")
+                try:
+                    await self._connect_and_subscribe()
+                    # Hold the session open; break out the moment the socket drops.
+                    while self.ib.isConnected():
+                        await asyncio.sleep(15)
+                    logging.warning(
+                        f"[{self.ticker}] Connection LOST — flushing and reconnecting "
+                        f"in {RECONNECT_DELAY}s..."
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception as e:
+                    logging.error(f"[{self.ticker}] Session error: {e!r} — retrying "
+                                  f"in {RECONNECT_DELAY}s...")
+                finally:
+                    # Flush any partial second before the gap; disconnect cleanly so
+                    # the clientId is freed before we reconnect with the same id.
+                    if self.current_second is not None:
+                        self._flush(self.current_second)
+                        self.current_second = None
+                    if self.ib.isConnected():
+                        self.ib.disconnect()
+                await asyncio.sleep(RECONNECT_DELAY)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
-            # Flush any partial second still in the buffer
             if self.current_second is not None:
                 self._flush(self.current_second)
-            self.ib.disconnect()
-            logging.info(f"[{self.ticker}] Disconnected.")
+            if self.ib.isConnected():
+                self.ib.disconnect()
+            logging.info(f"[{self.ticker}] Stopped.")
 
 
 # ─────────────────────────────────────────

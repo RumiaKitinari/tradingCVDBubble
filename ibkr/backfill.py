@@ -1,30 +1,29 @@
 """
-ibkr/backfill.py — Step 4: Historical 1-second bar backfill.
+ibkr/backfill.py — historical bar backfill into the resolution-ladder tiers.
 
-Uses reqHistoricalData (barSizeSetting='1 secs', whatToShow='TRADES') to pull
-up to 6 months of 1-second bars from IBKR and insert them into MongoDB.
+Supports multiple bar sizes (see history/schema.py tiers):
+  --barsize 1sec   (default) 1-sec bars, 30-min chunks.  IBKR caps bars
+                   <= 30 sec at a 6-MONTH lookback.
+  --barsize 1min   1-min bars, 1-day chunks. No lookback cap (years OK).
+  --barsize 30min  30-min bars, 1-month chunks. Fills the 1hr/3hr charts.
+  --barsize 1day   daily bars, 1-year chunks. Cross-check for FinViz daily.
 
-Limitations vs. live tick data:
-  - No tick-level bid/ask available → aggressor classification is impossible.
-  - Bars are tagged source='ibkr_hist'; calculator.py will apply wick
-    decomposition (same as FinViz data) to get buy/sell volume estimates.
-  - IBKR maximum lookback: 6 months for 1-sec bars.
+All fetched bars are OHLCV only (no tick-level quotes), so the buy/sell
+split is estimated at write time with BVC (history/bvc.py) and stored with
+source='ibkr_hist', quality='bvc'. The quality guard in history.store
+guarantees these estimates can never overwrite live tick-classified bars.
 
-For data older than 6 months, FinViz data (source='finviz_wick') is used and
-remains in MongoDB alongside IBKR data; the chart labels them differently.
+Progress is recorded in backfill_meta per (ticker, timeframe); re-running the
+same command resumes past the already-covered range instead of re-fetching.
 
-Pacing rules (IBKR):
-  - Max 60 historical data requests per 10 minutes.
-  - We wait PACING_DELAY seconds between requests (default 11 s → ~54/10min).
-  - On pacing-violation error (code 162), we wait PACING_BACKOFF seconds.
-
-Each request retrieves CHUNK_SECONDS = 1800 s (30 minutes) of 1-sec bars.
+Pacing rules (IBKR): max 60 historical requests / 10 min, identical requests
+15 s apart. We wait PACING_DELAY between requests and back off on error 162.
 
 Usage:
-    python -m ibkr.backfill --ticker NVDA --days 1
-    python -m ibkr.backfill --ticker NVDA --days 5
+    python -m ibkr.backfill --ticker NVDA --days 1                    # 1-sec
+    python -m ibkr.backfill --ticker NVDA --barsize 30min --days 730
+    python -m ibkr.backfill --ticker NVDA --barsize 1min --days 180
     python -m ibkr.backfill --ticker NVDA --start 20260601 --end 20260628
-    python -m ibkr.backfill --ticker NVDA --port 7496   # live TWS
 """
 
 import asyncio
@@ -33,68 +32,100 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from pymongo import MongoClient, UpdateOne
+import pandas as pd
 from ib_async import IB, Stock
+
+from history.bvc import bvc_split
+from history.schema import mongo_client
+from history.store import get_backfill_coverage, set_backfill_coverage, upsert_bars
 
 ET = ZoneInfo("America/New_York")
 
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "finviz_db"
-
-CHUNK_SECONDS = 1800    # seconds per historical request (30 min = 1800 1-sec bars)
 PACING_DELAY = 11.0     # wait between requests: 11 s → ≈54 req/10 min (< 60 limit)
 PACING_BACKOFF = 60.0   # wait after a pacing-violation error
 
+# barsize key → IBKR barSizeSetting, chunk span per request, IBKR durationStr
+BAR_CONFIG = {
+    "1sec":  {"setting": "1 secs",  "chunk": timedelta(seconds=1800), "duration": None},   # "<sec> S"
+    "1min":  {"setting": "1 min",   "chunk": timedelta(days=1),       "duration": "1 D"},
+    "30min": {"setting": "30 mins", "chunk": timedelta(days=30),      "duration": "1 M"},
+    "1day":  {"setting": "1 day",   "chunk": timedelta(days=365),     "duration": "1 Y"},
+}
+
 
 def _parse_bar_time(raw_time) -> datetime:
-    """Convert IBKR bar time (datetime or 'YYYYMMDD  HH:MM:SS' string) to ET naive datetime."""
+    """Convert IBKR bar time (datetime, date, or 'YYYYMMDD  HH:MM:SS') to ET naive."""
     if isinstance(raw_time, datetime):
         if raw_time.tzinfo:
             return raw_time.astimezone(ET).replace(tzinfo=None)
         return raw_time
-    # String format from IBKR: "20260628  09:30:00"
-    return datetime.strptime(str(raw_time).strip(), "%Y%m%d  %H:%M:%S")
+    s = str(raw_time).strip()
+    if len(s) == 8 and s.isdigit():          # daily bars: 'YYYYMMDD'
+        return datetime.strptime(s, "%Y%m%d")
+    if "-" in s and ":" not in s:            # daily bars as date object str
+        return datetime.strptime(s, "%Y-%m-%d")
+    return datetime.strptime(s, "%Y%m%d  %H:%M:%S")
 
 
-def _bars_to_docs(ticker: str, bars) -> list[dict]:
-    """Convert a list of IB BarData objects to MongoDB documents."""
-    docs = []
+def _bars_to_docs(ticker: str, bars, tf: str) -> list[dict]:
+    """IB BarData list → tier docs with write-time BVC buy/sell estimation."""
+    rows = []
     for bar in bars:
         try:
-            ts = _parse_bar_time(bar.date)
-            docs.append({
-                "ticker":    ticker.upper(),
-                "timeframe": "1sec",
-                "date":      ts,
-                "open":      float(bar.open),
-                "high":      float(bar.high),
-                "low":       float(bar.low),
-                "close":     float(bar.close),
-                "volume":    float(bar.volume),
-                "source":    "ibkr_hist",
-                # buying_volume/selling_volume/delta are NOT set here;
-                # calculator.add_cvd_columns() will apply wick decomp for ibkr_hist rows.
+            rows.append({
+                "date": _parse_bar_time(bar.date),
+                "open": float(bar.open), "high": float(bar.high),
+                "low": float(bar.low), "close": float(bar.close),
+                "volume": float(bar.volume),
             })
         except Exception as e:
             logging.warning(f"Skipping malformed bar {bar}: {e}")
-    return docs
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows).sort_values("date").set_index("date")
+    df = df[~df.index.duplicated(keep="last")]
+    est = bvc_split(df["close"], df["volume"])
+
+    return [{
+        "ticker": ticker.upper(),
+        "timeframe": tf,
+        "date": ts.to_pydatetime(),
+        "open": float(r["open"]), "high": float(r["high"]),
+        "low": float(r["low"]), "close": float(r["close"]),
+        "volume": float(r["volume"]),
+        "buying_volume": float(est.loc[ts, "buying_volume"]),
+        "selling_volume": float(est.loc[ts, "selling_volume"]),
+        "delta": float(est.loc[ts, "delta"]),
+        "source": "ibkr_hist",
+        "quality": "bvc",
+    } for ts, r in df.iterrows()]
 
 
 async def backfill_ticker(
     ticker: str,
     start: datetime,
     end: datetime,
+    barsize: str = "1sec",
     port: int = 7497,
     client_id: int = 11,
+    resume: bool = True,
 ):
     """
-    Backfill 1-sec bars for `ticker` from `start` to `end` (ET naive datetimes).
-    Iterates backwards in CHUNK_SECONDS windows; pacing-aware.
+    Backfill `barsize` bars for `ticker` from `start` to `end` (ET naive).
+    Iterates backwards in chunks; pacing-aware; resumes past covered ranges.
     """
+    cfg = BAR_CONFIG[barsize]
     logging.info(
-        f"[Backfill] {ticker}: {start.strftime('%Y-%m-%d %H:%M')} → "
+        f"[Backfill] {ticker} ({barsize}): {start.strftime('%Y-%m-%d %H:%M')} → "
         f"{end.strftime('%Y-%m-%d %H:%M')} ET"
     )
+
+    mongo = mongo_client()
+    cov = get_backfill_coverage(ticker.upper(), barsize, client=mongo) if resume else None
+    if cov and cov["start"] <= start and cov["end"] >= end:
+        logging.info(f"[Backfill] Range already covered ({cov['start']} → {cov['end']}). Nothing to do.")
+        return
 
     ib = IB()
     try:
@@ -106,37 +137,40 @@ async def backfill_ticker(
     contract = Stock(ticker.upper(), "SMART", "USD")
     await ib.qualifyContractsAsync(contract)
 
-    mongo = MongoClient(MONGO_URI)
-    col = mongo[DB_NAME]["candles"]
-    col.create_index(
-        [("ticker", 1), ("timeframe", 1), ("date", 1)],
-        unique=True, name="ticker_tf_date", background=True,
-    )
-
     total_saved = 0
     current_end = end
     request_count = 0
 
     try:
         while current_end > start:
-            chunk_start = max(current_end - timedelta(seconds=CHUNK_SECONDS), start)
-            actual_secs = int((current_end - chunk_start).total_seconds())
-            if actual_secs <= 0:
-                break
+            # Skip through the already-covered range (resume support).
+            if cov and cov["start"] < current_end <= cov["end"]:
+                logging.info(f"  Skipping covered range down to {cov['start']}")
+                current_end = cov["start"]
+                continue
+
+            chunk_start = max(current_end - cfg["chunk"], start)
+            if cfg["duration"] is None:
+                actual_secs = int((current_end - chunk_start).total_seconds())
+                if actual_secs <= 0:
+                    break
+                duration = f"{actual_secs} S"
+            else:
+                duration = cfg["duration"]
 
             end_dt_aware = current_end.replace(tzinfo=ET)
             logging.info(
                 f"  Request {request_count+1}: "
-                f"{chunk_start.strftime('%H:%M:%S')} – {current_end.strftime('%H:%M:%S')} "
-                f"({actual_secs} s)..."
+                f"{chunk_start.strftime('%Y-%m-%d %H:%M')} – {current_end.strftime('%Y-%m-%d %H:%M')} "
+                f"({duration})..."
             )
 
             try:
                 bars = await ib.reqHistoricalDataAsync(
                     contract,
                     endDateTime=end_dt_aware,
-                    durationStr=f"{actual_secs} S",
-                    barSizeSetting="1 secs",
+                    durationStr=duration,
+                    barSizeSetting=cfg["setting"],
                     whatToShow="TRADES",
                     useRTH=False,
                     formatDate=1,
@@ -146,9 +180,7 @@ async def backfill_ticker(
             except Exception as e:
                 err = str(e)
                 if "162" in err or "pacing" in err.lower():
-                    logging.warning(
-                        f"  Pacing violation — waiting {PACING_BACKOFF}s..."
-                    )
+                    logging.warning(f"  Pacing violation — waiting {PACING_BACKOFF}s...")
                     await asyncio.sleep(PACING_BACKOFF)
                     continue
                 logging.error(f"  Request error: {e}")
@@ -156,23 +188,22 @@ async def backfill_ticker(
                 continue
 
             if bars:
-                docs = _bars_to_docs(ticker, bars)
+                docs = _bars_to_docs(ticker, bars, barsize)
                 if docs:
-                    ops = [
-                        UpdateOne(
-                            {"ticker": d["ticker"], "timeframe": d["timeframe"], "date": d["date"]},
-                            {"$set": d},
-                            upsert=True,
-                        )
-                        for d in docs
-                    ]
-                    result = col.bulk_write(ops)
-                    saved = result.upserted_count + result.modified_count
+                    saved = upsert_bars(docs, client=mongo)
                     total_saved += saved
                     logging.info(f"    Saved {saved} bars (fetched {len(docs)}). Total: {total_saved}")
             else:
                 logging.info("    No bars returned (outside market hours or no trades).")
 
+            # Record progress so an interrupted run resumes here. Only reload
+            # the coverage when resuming: with resume=False the whole point is
+            # to refetch the requested range, and the coverage union (which
+            # can't represent gaps) would otherwise "cover" it after the very
+            # first chunk and end the run.
+            set_backfill_coverage(ticker.upper(), barsize, chunk_start, current_end, client=mongo)
+            if resume:
+                cov = get_backfill_coverage(ticker.upper(), barsize, client=mongo)
             current_end = chunk_start
 
             if current_end > start:
@@ -180,7 +211,7 @@ async def backfill_ticker(
 
     finally:
         ib.disconnect()
-        logging.info(f"[Backfill] Done. Total saved: {total_saved} bars for {ticker}.")
+        logging.info(f"[Backfill] Done. Total saved: {total_saved} bars for {ticker} ({barsize}).")
 
 
 def main():
@@ -189,9 +220,13 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
     parser = argparse.ArgumentParser(
-        description="Backfill IBKR 1-sec historical bars → MongoDB (source='ibkr_hist')"
+        description="Backfill IBKR historical bars → candles tiers (source='ibkr_hist', BVC split)"
     )
-    parser.add_argument("--ticker", default="NVDA")
+    parser.add_argument("--ticker", nargs="+", default=["NVDA"])
+    parser.add_argument(
+        "--barsize", default="1sec", choices=list(BAR_CONFIG.keys()),
+        help="Bar size / destination tier (default: 1sec)",
+    )
     parser.add_argument(
         "--days", type=int, default=1,
         help="Number of calendar days to backfill ending now (default: 1)",
@@ -212,6 +247,10 @@ def main():
         "--client-id", type=int, default=11, dest="client_id",
         help="clientId for this connection (must differ from tick_collector's)",
     )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Ignore backfill_meta coverage and re-fetch everything",
+    )
     args = parser.parse_args()
 
     now = datetime.now(tz=ET).replace(tzinfo=None)
@@ -224,7 +263,11 @@ def main():
         if args.start else (now - timedelta(days=args.days))
     )
 
-    asyncio.run(backfill_ticker(args.ticker, start_dt, end_dt, args.port, args.client_id))
+    for t in args.ticker:
+        asyncio.run(backfill_ticker(
+            t, start_dt, end_dt, barsize=args.barsize,
+            port=args.port, client_id=args.client_id, resume=not args.no_resume,
+        ))
 
 
 if __name__ == "__main__":

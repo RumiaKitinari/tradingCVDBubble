@@ -18,26 +18,33 @@ TICKERS = [
     "PENN", "CHWY", "RUM"    # Nano (Using as micro/nano proxies)
 ]
 
-async def collect_all(days: int, backfill_only: bool = False):
+async def collect_all(tickers, days: int, backfill_only: bool = False):
     end = datetime.now(ZoneInfo("America/New_York"))
     start = end - timedelta(days=days)
-    
-    for ticker in TICKERS:
+
+    for ticker in tickers:
         logging.info(f"Starting backfill for {ticker}...")
         try:
             await backfill_ticker(ticker, start, end, port=7497, client_id=11)
             logging.info(f"✅ Finished backfill for {ticker}.")
         except Exception as e:
             logging.error(f"❌ Failed backfill for {ticker}: {e}")
-            
+
     if not backfill_only:
-        logging.info("🚀 Starting LIVE Tick Collectors for all 9 tickers...")
-        await run_pipeline_ibkr(TICKERS, 7497, 20, 0)
+        logging.info(f"🚀 Starting LIVE Tick Collectors for {len(tickers)} ticker(s): {tickers}")
+        await run_pipeline_ibkr(tickers, 7497, 20, 0)
             
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backfill-only", action="store_true", help="Only run backfill, do not start live collectors")
+    parser.add_argument("--days", type=int, default=5,
+                        help="How many days back to backfill 1-sec bars (default: 5)")
+    parser.add_argument("--tickers", nargs="+", default=TICKERS,
+                        help="Tickers to process (default: the 9-ticker universe). For LIVE "
+                             "collection pass 1 per tier to stay under tick-line limits, "
+                             "e.g. --tickers NVDA PLTR RUM")
+    parser.add_argument("--backfill-only", action="store_true",
+                        help="Only run backfill, do not start live collectors")
     args = parser.parse_args()
-    
-    asyncio.run(collect_all(args.days, args.backfill_only))
+
+    asyncio.run(collect_all(args.tickers, args.days, args.backfill_only))

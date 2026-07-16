@@ -1,23 +1,30 @@
-# 3x3 Matrix: Price-CVD Correlation Report
+# CVD ↔ Price Correlation (change-based, real tick CVD)
 
-This report analyzes the rolling correlation between price and Tick CVD across 3 Market Caps and 3 Trading Sessions.
+Bar timeframe: **1min**. Metric: within-session, within-day correlation of per-bar **delta** vs per-bar **price change** (stationary), plus directional hit-rate `sign(delta)==sign(ΔP)`. This replaces the earlier level-correlation of two cumulative series (spurious) and the wick-CVD data source (circular).
 
-## Summary by Tier and Session
-| Tier   |   Pre-Market Corr |   Regular Corr |   After-Hours Corr |
+## Summary by Tier (mean change-corr)
+| Tier   |   Pre-Market corr |   Regular corr |   After-Hours corr |
 |:-------|------------------:|---------------:|-------------------:|
-| Mega   |             0.587 |          0.826 |              0.527 |
-| Micro  |             0.355 |          0.687 |              0.245 |
-| Nano   |             0.477 |          0.651 |              0.461 |
+| Mega   |            -0.221 |          0.045 |              0.228 |
 
-## Detailed Results
-| Ticker   |   Total Bars |   Pre-Market Corr |   Regular Corr |   After-Hours Corr |
-|:---------|-------------:|------------------:|---------------:|-------------------:|
-| NVDA     |        30716 |             0.657 |          0.875 |              0.586 |
-| AAPL     |        21400 |             0.473 |          0.816 |              0.382 |
-| MSFT     |        10555 |             0.63  |          0.786 |              0.614 |
-| PLTR     |        10542 |             0.533 |          0.836 |              0.381 |
-| AMC      |         8833 |             0.406 |          0.648 |              0.236 |
-| GME      |         7622 |             0.125 |          0.577 |              0.118 |
-| RUM      |         6114 |             0.21  |          0.686 |              0.344 |
-| CHWY     |         5410 |             0.745 |          0.615 |              0.578 |
+## Detailed change-correlation
+| Ticker   |   Bars |   Pre-Market corr |   Regular corr |   After-Hours corr |
+|:---------|-------:|------------------:|---------------:|-------------------:|
+| NVDA     |   1122 |            -0.221 |          0.045 |              0.228 |
 
+## Directional hit-rate % (50% = coin flip)
+| Ticker   |   Pre-Market hit% |   Regular hit% |   After-Hours hit% |
+|:---------|------------------:|---------------:|-------------------:|
+| NVDA     |              64.1 |           52.1 |               68.3 |
+
+## Skipped (no real tick data)
+- **AAPL** (Mega): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **MSFT** (Mega): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **GME** (Micro): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **AMC** (Micro): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **PLTR** (Micro): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **PENN** (Nano): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **CHWY** (Nano): no raw_ticks (skipped — would otherwise use circular wick CVD)
+- **RUM** (Nano): no raw_ticks (skipped — would otherwise use circular wick CVD)
+
+> Only NVDA currently has `raw_ticks`. Collect a regular session with `python -m ibkr.tick_collector --ticker <SYM>` to add a ticker to the matrix.

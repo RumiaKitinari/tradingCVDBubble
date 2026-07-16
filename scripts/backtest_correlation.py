@@ -1,121 +1,67 @@
+"""
+scripts/backtest_correlation.py
+-------------------------------
+135-case CVD<->price tracking, using REAL tick-aggressor CVD.
+
+    9 tickers (Mega/Micro/Nano x3) x 3 sessions (Pre/Regular/After)
+    x 5 timeframes (1sec/5sec/1min/5min/1hr) = 135 cells.
+
+Data source is `raw_ticks` (from the real-time tick_collector), classified per
+trade by quote/tick rule — NOT wick decomposition. Tickers with no raw_ticks are
+SKIPPED (rather than silently falling back to wick, which is circular and would
+fake a high correlation). See scripts/backtest_correlation_wick.py for the
+matching wick-decomposed 1sec-backfill analysis to compare against.
+
+NOTE: real tick data can only be gathered LIVE (IBKR reqHistoricalTicks is capped
+at 1000 ticks/request → impractical for multi-day). Collect a session with
+`python -m ibkr.tick_collector --ticker <SYM>` to add a ticker to the grid.
+
+Metric per cell: within-session, within-day change-correlation of per-bar delta
+vs per-bar price change, + directional hit-rate + n. (This replaces the old
+report's spurious level-correlation of two cumulative series.)
+
+Usage:
+    python scripts/backtest_correlation.py
+"""
 import os
 import sys
-import pandas as pd
-import numpy as np
-import traceback
 
-# Ensure we can import from the parent directory
+from pymongo import MongoClient
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from cvd.calculator import run_pipeline
+from corr_common import TIERS, TFS, analyze_all, build_report
 
-TIERS = {
-    "Mega": ["NVDA", "AAPL", "MSFT"],
-    "Micro": ["GME", "AMC", "PLTR"],
-    "Nano": ["PENN", "CHWY", "RUM"]
-}
+MONGO_URI = "mongodb://localhost:27017/"
 
-def analyze_session(df_session, window=390):
-    if len(df_session) < window:
-        return np.nan
-    rolling_corr = df_session["cvd_all"].rolling(window).corr(df_session["close"])
-    return rolling_corr.mean()
 
-def analyze_correlation(ticker: str):
-    try:
-        df, _ = run_pipeline(ticker)
-        if df.empty:
-            return None
-            
-        df = df.copy()
-        # Ensure index is datetime
-        df.index = pd.to_datetime(df.index)
-        
-        # Split into sessions
-        # Pre: 04:00 - 09:30
-        # Reg: 09:30 - 16:00
-        # Aft: 16:00 - 20:00
-        time = df.index.time
-        
-        from datetime import time as dtime
-        
-        pre_mask = (time >= dtime(4, 0)) & (time < dtime(9, 30))
-        reg_mask = (time >= dtime(9, 30)) & (time < dtime(16, 0))
-        aft_mask = (time >= dtime(16, 0)) & (time < dtime(20, 0))
-        
-        df_pre = df[pre_mask]
-        df_reg = df[reg_mask]
-        df_aft = df[aft_mask]
-        
-        # We use a smaller window for pre/after since they are shorter
-        # Pre is 5.5 hours = 330 mins -> window 60
-        # Reg is 6.5 hours = 390 mins -> window 120
-        # Aft is 4.0 hours = 240 mins -> window 60
-        
-        corr_pre = analyze_session(df_pre, window=60)
-        corr_reg = analyze_session(df_reg, window=120)
-        corr_aft = analyze_session(df_aft, window=60)
-        
-        return {
-            "Ticker": ticker,
-            "Total Bars": len(df),
-            "Pre-Market Corr": corr_pre,
-            "Regular Corr": corr_reg,
-            "After-Hours Corr": corr_aft
-        }
-    except Exception as e:
-        print(f"Error analyzing {ticker}: {e}")
-        return None
+def frames_for(ticker):
+    """(frames, skip_reason) for the tick pipeline. frames maps tf -> aggregated df."""
+    c = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+    if c["finviz_db"]["raw_ticks"].count_documents({"ticker": ticker}, limit=1) == 0:
+        return None, "no raw_ticks (live-only; run: python -m ibkr.tick_collector --ticker %s)" % ticker
+    _, frames = run_pipeline(ticker, base_timeframe="raw_tick")
+    return {tf: frames.get(tf) for tf in TFS}, None
+
 
 def main():
-    print("Starting 3x3 CVD-Price Correlation Backtest...\n")
-    
-    results = []
-    
-    for tier, tickers in TIERS.items():
-        print(f"--- Analyzing {tier} Cap ---")
-        for ticker in tickers:
-            print(f"Analyzing {ticker}...")
-            stats = analyze_correlation(ticker)
-            if stats:
-                stats["Tier"] = tier
-                results.append(stats)
-                
-    if not results:
-        print("No results generated.")
-        return
-        
-    res_df = pd.DataFrame(results)
-    
-    report = "# 3x3 Matrix: Price-CVD Correlation Report\n\n"
-    report += "This report analyzes the rolling correlation between price and Tick CVD across 3 Market Caps and 3 Trading Sessions.\n\n"
-    
-    report += "## Summary by Tier and Session\n"
-    summary = res_df.groupby("Tier").agg({
-        "Pre-Market Corr": "mean",
-        "Regular Corr": "mean",
-        "After-Hours Corr": "mean"
-    }).round(3).reset_index()
-    
-    summary["Tier"] = pd.Categorical(summary["Tier"], ["Mega", "Micro", "Nano"])
-    summary = summary.sort_values("Tier")
-    report += summary.to_markdown(index=False) + "\n\n"
-    
-    report += "## Detailed Results\n"
-    res_df["Tier"] = pd.Categorical(res_df["Tier"], ["Mega", "Micro", "Nano"])
-    res_df = res_df.sort_values(["Tier", "Regular Corr"], ascending=[True, False])
-    
-    # Format floats
-    for col in ["Pre-Market Corr", "Regular Corr", "After-Hours Corr"]:
-        res_df[col] = res_df[col].round(3)
-            
-    report += res_df.drop(columns=["Tier"]).to_markdown(index=False) + "\n\n"
-    
-    report_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "CVD_3x3_Correlation_Report.md")
-    with open(report_path, "w") as f:
+    print("135-case TICK-CVD correlation grid (real aggressor, raw_ticks only)\n")
+    rows, skipped = analyze_all(TIERS, frames_for)
+
+    report = build_report(
+        rows, skipped,
+        title="135-Case CVD↔Price Tracking — TICK CVD (real aggressor)",
+        subtitle="Source: `raw_ticks` (live tick_collector), per-trade quote/tick classification. "
+                 "9 tickers × 3 sessions × 5 timeframes.",
+    )
+    out = os.path.join(os.path.dirname(__file__), "CVD_135_tick_report.md")
+    with open(out, "w") as f:
         f.write(report)
-        
-    print(f"\nReport generated at: {report_path}")
+    print("\n" + report)
+    print(f"\nReport written to: {out}")
+
 
 if __name__ == "__main__":
     main()

@@ -115,46 +115,61 @@ def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0)
 def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
     """Core closing-cross detection on minute-level (or coarser) volume bars.
 
-    The closing auction footprint spans two bars: the main cross on 15:59
-    (~2500x a normal after-hours minute) plus an overflow/official print on
-    16:00 (~167x), after which volume drops back to normal by 16:01. So:
-      1. anchor = the afternoon (>=12:00) bar with the largest volume, flagged
-         only if it dwarfs that day's regular-session median (> `mult`x). This
-         lands on 15:59 normally, or the early-close print (e.g. 12:59) on a
-         half-day — no clock time is hardcoded.
-      2. spill  = walk FORWARD from the anchor, also flagging each following bar
-         while it stays elevated (> `spill_mult`x the regular median), stopping
-         at the first normal bar. This catches the 16:00 overflow but leaves
-         16:01 onward (genuine after-hours) and the pre-close ramp (15:55-15:58,
-         genuine continuous trading) untouched. See Personal Study Log §8.
-
-    Note: feeds that don't carry the official closing cross simply won't
-    have an anchor exceeding `mult`x the median, so nothing gets flagged.
+    The closing auction footprint spans two bars: the main cross on the last
+    regular minute (~2500x a normal after-hours minute) plus an overflow/
+    official print on the following one (~167x), after which volume drops back
+    to normal. So:
+      1. Pick the day's closing window — 15:59-16:01 normally, or 12:59-13:01
+         when the day is a half-day. A half-day is decided by EVIDENCE, not by
+         where the data happens to end: a genuine early close leaves only thin
+         after-hours prints between 13:10 and 15:55 (well under the morning
+         median), while a normal day being watched live before ~15:00 simply
+         has no verdict yet — and gets NO early-close flag, so a 13:00 block
+         trade can't be mistaken for the closing cross mid-session.
+      2. anchor = the largest-volume bar inside the window, flagged only if it
+         dwarfs the day's 09:30-13:00 median (> `mult`x) — a quiet day whose
+         feed lacks the official cross has no anchor and nothing is flagged.
+      3. spill  = walk FORWARD from the anchor, also flagging each following bar
+         while it stays elevated (> `spill_mult`x the median), stopping at the
+         first normal bar. This catches the 16:00 overflow but leaves later
+         genuine after-hours and the pre-close ramp (15:55-15:58) untouched.
+         See Personal Study Log §8.
     """
-    minute = df.index.hour * 60 + df.index.minute
-    reg = (minute >= 570) & (minute < 960)                 # 09:30-16:00
-    reg_med = df.loc[reg].groupby(lambda ix: ix.date())["volume"].median()
-
     flag = pd.Series(False, index=df.index)
-    
-    # Restrict anchor search to typical closing cross windows: 12:59-13:01 (early close) and 15:59-16:01 (regular close).
-    # This prevents massive after-hours news spikes (e.g. 16:20) from being misidentified as the closing auction.
-    is_candidate = ((minute >= 779) & (minute <= 781)) | ((minute >= 959) & (minute <= 961))
-    candidates = df[is_candidate]
-    
-    for d, g in candidates.groupby(lambda ix: ix.date()):
+
+    for d, g in df.groupby(lambda ix: ix.date()):
         if g.empty:
             continue
-            
-        # Industry Standard: The closing cross (MOC) is guaranteed to be the single largest
-        # print in the immediate 15:59-16:01 window (or 12:59-13:01 for half days).
-        # We unconditionally neutralize the highest volume bar in this window without 
-        # relying on arbitrary volume multiplier heuristics.
-        anchor = g["volume"].idxmax()
+        minute = g.index.hour * 60 + g.index.minute
+
+        # Baseline: 09:30-13:00 volume, regular-session on both day types.
+        base = g.loc[(minute >= 570) & (minute < 780), "volume"]
+        base_med = base.median() if not base.empty else 0
+        if not base_med > 0:
+            continue
+
+        # Half-day evidence: enough post-13:00 bars, all thin.
+        aft = g.loc[(minute >= 790) & (minute <= 955), "volume"]
+        if len(aft) >= 5 and aft.median() < base_med * 0.1:
+            window_mask = (minute >= 779) & (minute <= 781)    # 12:59-13:01
+        else:
+            window_mask = (minute >= 959) & (minute <= 961)    # 15:59-16:01
+        window = g.loc[window_mask, "volume"]
+        if window.empty:
+            continue
+
+        anchor = window.idxmax()
+        if not window.loc[anchor] > base_med * mult:
+            continue
         flag.loc[anchor] = True
-        
-        # We don't spill forward anymore because the MOC is a single print/bar.
-        # Spilling forward was a hack for volume heuristics.
+
+        pos = g.index.get_loc(anchor)
+        for ts in g.index[pos + 1:]:
+            if g.loc[ts, "volume"] > base_med * spill_mult:
+                flag.loc[ts] = True
+            else:
+                break
+
     return flag
 
 
@@ -250,13 +265,19 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
         and "delta" in df.columns
     )
 
-    if has_precomputed and has_source:
-        # Rows that need wick decomposition: any source that isn't a real-tick source,
-        # or rows where buying_volume is missing despite being tagged as tick data.
-        # Real-tick sources (ibkr_tick) have pre-computed buy/sell/delta.
+    if has_precomputed:
+        # Rows with a stored buy/sell/delta keep it — that covers ibkr_tick
+        # (real aggressor) AND tier docs whose split was BVC-estimated at
+        # write time (history package). Only rows missing any of the three
+        # get the legacy wick decomposition.
         needs_wick = (
-            ~df["source"].isin(["ibkr_tick"])
-        ) | df["buying_volume"].isna()
+            df["buying_volume"].isna()
+            | df["selling_volume"].isna()
+            | df["delta"].isna()
+        )
+
+        if not has_source:
+            df["source"] = pd.NA
 
         if needs_wick.any():
             decomp = _apply_wick_decomp(df[needs_wick])
@@ -321,6 +342,17 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["cvd_session"]      = df.groupby(_day)["delta"].cumsum().values
     df["cvd_wins"]         = df["delta_wins"].cumsum().values
     df["cvd_session_wins"] = df.groupby(_day)["delta_wins"].cumsum().values
+
+    # ── Independent BVC-estimated CVD (ADDITIVE — wick/tick columns untouched) ─
+    # A parallel estimate of the same order flow using Bulk Volume Classification
+    # on close-to-close moves, regardless of what produced buying_volume above.
+    # Rendered as its own legend entry ("CVD (BVC est.)") so the tick/wick CVD
+    # and the BVC CVD can be compared side by side on any chart.
+    from history.bvc import bvc_split   # local import: keeps cvd↔history acyclic
+    _bvc = bvc_split(df["close"], df["volume"])
+    df["delta_bvc"] = _bvc["delta"].to_numpy()
+    df.loc[auc, "delta_bvc"] = 0.0      # same closing-auction neutralization
+    df["cvd_bvc"] = df["delta_bvc"].cumsum()
 
     return df
 
@@ -389,6 +421,8 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         ("cvd_session",      "cvd_session_end",      "last"),
         ("cvd_wins",         "cvd_wins_end",         "last"),
         ("cvd_session_wins", "cvd_session_wins_end", "last"),
+        ("delta_bvc",        "delta_bvc_sum",        "sum"),
+        ("cvd_bvc",          "cvd_bvc_end",          "last"),
     ]:
         if src in df_1min.columns:
             agg_spec[dst] = (src, how)
@@ -396,8 +430,22 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         # Carry the (dominant) data source so the visualizer can shade
         # wick-estimated regions on every timeframe, not just the base one.
         agg_spec["source"] = ("source", "first")
-
     df_agg = df_1min.resample(rule).agg(**agg_spec).dropna(subset=["open"])
+
+    if "quality" in df_1min.columns:
+        # Worst-of quality per bucket: a coarse bar mixing real tick flow and
+        # estimates must still read as estimated ('mixed') in the chart.
+        # Vectorized via rank min/max — a Python reducer per bucket cost ~1s
+        # on a 19k-row 1-min frame (one call per output bar).
+        _RANK = {"tick": 4, "mixed": 3, "bvc": 2, "wick": 1, "neutral": 0}
+        _FROM_RANK = {v: k for k, v in _RANK.items()}
+        rank = df_1min["quality"].map(_RANK)
+        rmin = rank.resample(rule).min()
+        rmax = rank.resample(rule).max()
+        q = rmin.map(_FROM_RANK)                      # single quality → itself
+        q[(rmin != rmax) & (rmax == _RANK["tick"])] = "mixed"  # tick + estimates
+        # other mixtures already read as their worst (lowest-rank) member
+        df_agg["quality"] = q.reindex(df_agg.index)
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]
 
@@ -526,6 +574,7 @@ def load_from_mongo(
                 "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
                 # Pre-computed by tick_collector (ibkr_tick) — absent for FinViz docs.
                 "buying_volume": 1, "selling_volume": 1, "delta": 1, "source": 1,
+                "quality": 1,
             }
         ))
 
@@ -546,6 +595,7 @@ def run_pipeline(
     ticker: str,
     base_timeframe: str = "i1",
     days: int | None = None,
+    only: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Load bars from MongoDB → compute CVD → aggregate into every timeframe.
@@ -557,6 +607,11 @@ def run_pipeline(
                          '1sec' → IBKR 1-second bars (tick_collector output)
         days           : only load the last N days (tick timeframes only;
                          see load_from_mongo). None = everything.
+        only           : restrict frames to these timeframe labels. The Dash
+                         app displays a single timeframe, so aggregating all
+                         12 on every callback is wasted work; None (default)
+                         keeps the build-everything behavior for the static
+                         HTML chart with timeframe buttons.
 
     Returns:
         df_base : base-granularity bars with buy/sell/delta/cvd columns
@@ -582,6 +637,8 @@ def run_pipeline(
         
     frames = {}
     for tf, rule in tf_map.items():
+        if only is not None and tf not in only:
+            continue
         if tf == "raw_tick":
             raw_df = df_base.copy()
             raw_df = raw_df.rename(columns={
@@ -589,6 +646,7 @@ def run_pipeline(
                 "selling_volume": "sell_pressure",
                 "cvd_all": "cvd_all_end",
                 "cvd_all_raw": "cvd_all_raw_end",
+                "cvd_bvc": "cvd_bvc_end",
                 "auction_volume": "auction_vol"
             })
             raw_df["net_pressure"] = raw_df["buy_pressure"] - raw_df["sell_pressure"]
