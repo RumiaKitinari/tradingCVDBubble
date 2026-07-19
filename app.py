@@ -5,7 +5,9 @@ from cvd.calculator import run_pipeline, TIMEFRAME_RULE_IBKR, TIMEFRAME_RULE
 from cvd.visualizer import build_chart, MAX_CANDLES
 from history.schema import SERVE_TIER, SERVE_WINDOW_DAYS
 from history.serve import run_pipeline_tiered, invalidate_cache
+from level2_webapp.data_provider import fetch_and_aggregate_l2_data, compute_support_resistance
 import plotly.graph_objects as go
+import numpy as np
 import pandas as pd
 import logging
 import json
@@ -34,10 +36,35 @@ app.index_string = '''
                 window.dash_clientside = window.dash_clientside || {};
                 window.dash_clientside.clientside = window.dash_clientside.clientside || {};
 
+                // Y Auto-Scale checkbox state (manual mode when unchecked).
+                window.__yAutoOn = function() {
+                    var el = document.querySelector('#yauto-check input[type="checkbox"]');
+                    return el ? el.checked : true;
+                };
+
+                // Manual mode: every user y movement sticks as-is — plot-area
+                // pan, price-axis drag/wheel, all of it. Persistence across
+                // rebuilds is handled by the manual-y Store (track_manual_y
+                // below). The only interception left is double-click, which
+                // Plotly would turn into a plain trace autorange: route it
+                // through __requestRefit so the one-shot fit uses our own
+                // logic (L2 band inclusion, visible-window scoping); the
+                // refit's relayout then lands in the Store like any other.
+                window.__guardManualY = function(gd, e) {
+                    if (window.__yAutoOn() || window.__is_refitting || !e) return;
+                    var keys = Object.keys(e);
+                    if (keys.some(function(k) { return k.indexOf('autorange') !== -1; })) {
+                        window.__requestRefit();
+                    }
+                };
+
                 // Debounced y-axis refit, shared by the Dash clientside callback
                 // (pan / data refresh) and the plotly_restyle hook below
                 // (legend toggles, which Dash does not expose as a prop).
-                window.__requestRefit = function() {
+                // onlyAxes (optional): array of layout axis names — restricts
+                // the fit to those panels (manual-mode legend toggles refit
+                // ONLY the panel whose trace changed).
+                window.__requestRefit = function(onlyAxes) {
                     if (window.__refit_timer) {
                         clearTimeout(window.__refit_timer);
                     }
@@ -60,10 +87,35 @@ app.index_string = '''
                         
                         var upd = {};
                         Object.keys(LEFT).forEach(function(yref) {
+                            if (onlyAxes && onlyAxes.indexOf(LEFT[yref]) === -1) return;
                             var lo = Infinity, hi = -Infinity;
                             gd._fullData.forEach(function(f) {
                                 if (f.visible === false || f.visible === 'legendonly') return;
                                 if ((f.yaxis || 'y') !== yref) return;
+                                if (f.type === 'pie') return;
+                                // L2 heatmap: y is a price-LEVEL axis, not a
+                                // per-bar series. Include only the levels that
+                                // hold meaningful liquidity (>=15% of the
+                                // trace zmax) in the visible x window, so the
+                                // bands stay on screen without a faint stray
+                                // level stretching the whole axis.
+                                if (f.type === 'heatmap') {
+                                    if (!f.x || !f.x.length || !f.z || !f.y) return;
+                                    var h0 = Math.max(0, Math.floor(xr[0] - f.x[0]));
+                                    var h1 = Math.min(f.x.length - 1, Math.ceil(xr[1] - f.x[0]));
+                                    var thr = 0.15 * (f.zmax || 0);
+                                    if (h0 > h1 || !(thr > 0)) return;
+                                    for (var r = 0; r < f.z.length; r++) {
+                                        var zrow = f.z[r], m = 0;
+                                        for (var c = h0; c <= h1; c++) if (zrow[c] > m) m = zrow[c];
+                                        if (m >= thr) {
+                                            var yv = f.y[r];
+                                            if (yv < lo) lo = yv;
+                                            if (yv > hi) hi = yv;
+                                        }
+                                    }
+                                    return;
+                                }
                                 // Traces may carry an explicit x array OR the
                                 // compact x0/dx form (dx is always 1 here).
                                 var xs = f.x, ys = f.y || f.close;
@@ -150,11 +202,46 @@ app.index_string = '''
                     return {'bars': next, 'tf': tf, 'x0': x0, 'x1': x1};
                 };
 
+                // Manual-mode y tracker → dcc.Store('manual-y'). The server
+                // re-applies these ranges on every rebuild (uirevision does
+                // NOT protect API/relayout edits, only true GUI drags), the
+                // same explicit-reapply pattern the x window already uses.
+                // EVERY event carrying y ranges counts — plot-area pans
+                // (x+y) included: with the checkbox off, wherever the user
+                // moves y is the new manual scale.
+                window.dash_clientside.clientside.track_manual_y = function(relayoutData, yautoValue, current) {
+                    var nu = window.dash_clientside.no_update;
+                    var trg = dash_clientside.callback_context.triggered;
+                    if (trg && trg.length && trg[0].prop_id === 'yauto-check.value') {
+                        return null;   // mode flip: stale manual ranges must not resurface
+                    }
+                    if (window.__yAutoOn() || !relayoutData) return nu;
+                    var out = (current && typeof current === 'object') ? Object.assign({}, current) : {};
+                    var touched = false;
+                    ['yaxis', 'yaxis2', 'yaxis4'].forEach(function(ax) {
+                        if (relayoutData[ax + '.range[0]'] !== undefined) {
+                            out[ax] = [+relayoutData[ax + '.range[0]'], +relayoutData[ax + '.range[1]']];
+                            touched = true;
+                        } else if (Array.isArray(relayoutData[ax + '.range'])) {
+                            out[ax] = relayoutData[ax + '.range'].slice();
+                            touched = true;
+                        }
+                    });
+                    return touched ? out : nu;
+                };
+
                 window.dash_clientside.clientside.refit_y = function(relayoutData, figureData) {
                     // Triggered by EITHER user pan (relayoutData) OR data refresh (figureData)
 
                     var trigger = dash_clientside.callback_context.triggered;
                     var isFigUpdate = trigger && trigger.length > 0 && trigger[0].prop_id === 'main-chart.figure';
+
+                    // Manual mode: no continuous refits — the server only
+                    // rewrites y on fresh views and otherwise re-applies the
+                    // manual-y Store, so there is nothing to do here.
+                    if (!window.__yAutoOn()) {
+                        return window.dash_clientside.no_update;
+                    }
 
                     if (!isFigUpdate) {
                         if (!relayoutData) return window.dash_clientside.no_update;
@@ -177,9 +264,28 @@ app.index_string = '''
                     var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
                     if (!gd || !gd.on || gd.__restyleBound) return;
                     gd.__restyleBound = true;
-                    gd.on('plotly_restyle', function() {
-                        if (!window.__is_refitting) window.__requestRefit();
+                    gd.on('plotly_restyle', function(ev) {
+                        if (window.__is_refitting) return;
+                        if (window.__yAutoOn()) { window.__requestRefit(); return; }
+                        // Manual mode: legend toggles refit ONLY the panel the
+                        // toggled trace lives on — candle/other panels keep
+                        // their manual scale.
+                        var axes = {};
+                        var idx = (ev && ev[1]) || [];
+                        idx.forEach(function(i) {
+                            var t = gd._fullData[i];
+                            if (!t) return;
+                            var ax = {'y': 'yaxis', 'y2': 'yaxis2', 'y4': 'yaxis4'}[t.yaxis || 'y'];
+                            if (ax) axes[ax] = true;
+                        });
+                        var list = Object.keys(axes);
+                        if (list.length) {
+                            window.__requestRefit(list);
+                        }
                     });
+                    // Manual-mode double-click: route autorange through the
+                    // one-shot custom refit (all other y moves stick as-is).
+                    gd.on('plotly_relayout', function(e) { window.__guardManualY(gd, e); });
                 }, 1000);
             </script>
             {%renderer%}
@@ -275,6 +381,13 @@ app.layout = html.Div([
                     clearable=False,
                     style={"color": "#000", "width": "120px", "display": "inline-block", "marginRight": "20px"}
                 ),
+                dcc.Checklist(
+                    id='yauto-check',
+                    options=[{'label': ' Y Auto-Scale', 'value': 'on'}],
+                    value=['on'],
+                    labelStyle={"color": "white", "fontWeight": "bold"},
+                    style={"display": "inline-block", "marginRight": "20px"}
+                ),
                 html.Label("Z-Score Bubbles:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
                 dcc.Dropdown(
                     id='bubbles-dropdown',
@@ -283,6 +396,17 @@ app.layout = html.Div([
                         {'label': 'Off', 'value': False}
                     ],
                     value=True,
+                    clearable=False,
+                    style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
+                ),
+                html.Label("L2 Depth:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='l2-dropdown',
+                    options=[
+                        {'label': 'On', 'value': True},
+                        {'label': 'Off', 'value': False}
+                    ],
+                    value=False,
                     clearable=False,
                     style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
                 ),
@@ -335,6 +459,7 @@ app.layout = html.Div([
         # visualizer default (1,000 — cheap re-renders); doubles when the user
         # pans to the left edge or zooms out, up to BARS_HARD_CAP.
         dcc.Store(id='bars-to-show', data=None),
+        dcc.Store(id='manual-y', data=None),
         dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
         
         
@@ -479,6 +604,8 @@ def update_refresh_interval(val):
      Input('days-to-load', 'data'),
      Input('pie-chart-dropdown', 'value'),
      Input('bubbles-dropdown', 'value'),
+     Input('l2-dropdown', 'value'),
+     Input('yauto-check', 'value'),
      Input('bars-to-show', 'data')],
     # NOTE: deliberately NO State('main-chart', 'figure') here — that would
     # upload the entire multi-MB figure JSON from the browser on every
@@ -487,9 +614,10 @@ def update_refresh_interval(val):
     # freshest user window without waiting for the pan-state Store round-trip.
     [State('last-data-state', 'data'),
      State('pan-state', 'data'),
-     State('main-chart', 'relayoutData')]
+     State('main-chart', 'relayoutData'),
+     State('manual-y', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, bars_to_show, last_state_json, pan_state_json, relayout_data):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, last_state_json, pan_state_json, relayout_data, manual_y_store):
     trigger = ctx.triggered_id
     
     if not ticker:
@@ -728,6 +856,8 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             "days_loaded": days_to_load,
             "pie_chart_count": pie_chart_count,
             "bubbles": show_bubbles,
+            "l2": show_l2,
+            "yauto": bool(yauto_value),
             "bars": bars_req
         }
         # Compare ignoring n_active (a post-build fact appended below); keep
@@ -806,7 +936,29 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             if _shift > 0:
                 x_range = (x_range[0] + _shift, x_range[1] + _shift)
 
-        fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf, pie_chart_count=pie_chart_count, show_bubbles=show_bubbles, x_range=x_range, max_candles=bars_req)
+        # ── Level-2 depth heatmap + support/resistance (mock or real —
+        # trading_cvd.level2_snapshots, filled by tests/mock_level2_stream.py
+        # today and ibkr/level2_collector.py once the depth subscription is
+        # live). Computed on the SAME truncated tail build_chart will render
+        # (iloc[-bars_req:]) so heatmap columns line up with x_idx 1:1.
+        l2_data = None
+        if show_l2:
+            try:
+                _l2_key = active_tf if active_tf in frames else list(frames.keys())[0]
+                _l2_tail = frames[_l2_key].iloc[-bars_req:]
+                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_tail, max_candles=300)
+                _closes = _l2_tail["close"].dropna() if len(_l2_tail) else _l2_tail
+                if _zm is not None and len(_closes):
+                    # last VALID close — session-grid empty candles carry NaN
+                    _mid = float(_closes.iloc[-1])
+                    l2_data = {"y_levels": _yl, "z": _zm,
+                               "sr": compute_support_resistance(_yl, _zm, _mid, z_bid=_zb)}
+                else:
+                    logging.info(f"L2: no depth snapshots for {ticker} in the visible window")
+            except Exception as e:
+                logging.error(f"L2 fetch failed (chart renders without it): {e}")
+
+        fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf, pie_chart_count=pie_chart_count, show_bubbles=show_bubbles, x_range=x_range, max_candles=bars_req, l2_data=l2_data)
 
         # build_chart mutates `frames`: the active frame is now truncated to
         # MAX_CANDLES with its FINAL x_idx/time_str — cache THAT frame so the
@@ -861,17 +1013,62 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 if k0 in relayout_data and k1 in relayout_data:
                     user_y[ax] = [float(relayout_data[k0]), float(relayout_data[k1])]
 
+        # Y Auto-Scale OFF → the server writes y ranges ONLY on fresh-view
+        # triggers (new coordinate space / toggle flips); on every other
+        # trigger the axes stay untouched and uirevision preserves whatever
+        # manual scale the user set on the price axis.
+        y_auto = bool(yauto_value)
+        fresh_view = trigger in ('ticker-input', 'source-radio',
+                                 'timeframe-dropdown', 'yauto-check')
+
         df_vis = df_active[(df_active['x_idx'] >= x0) & (df_active['x_idx'] <= x1)]
-        if not df_vis.empty:
+        if not df_vis.empty and (y_auto or fresh_view):
             y_price = _fit(df_vis['high'], df_vis['low']) if 'high' in df_vis.columns else _fit(df_vis['close'])
             y_pa = _fit(df_vis['buy_pressure'], -df_vis['sell_pressure'])
             y_pb = _fit(df_vis['cvd_all_end']) if 'cvd_all_end' in df_vis.columns else None
+            # L2 on: widen the price fit so liquidity bands worth seeing
+            # (>=15% of the strongest resting size in the visible window)
+            # aren't clipped — but ignore faint fringe levels so one deep
+            # stray wall can't squash the candles.
+            if l2_data is not None and l2_data.get("z") is not None and y_price:
+                _z = l2_data["z"]
+                _n_cols = _z.shape[1]
+                _col0 = max(0, int(x0) - (N_total - _n_cols))
+                _col1 = min(_n_cols - 1, int(x1) - (N_total - _n_cols))
+                if _col0 <= _col1 and _z.max() > 0:
+                    _win = _z[:, _col0:_col1 + 1]
+                    # Same liquidity reference as the heatmap colorscale and
+                    # the clientside refit: 98th percentile of positive sizes
+                    # (trace zmax), NOT the raw max an iceberg can own.
+                    _zref = float(np.percentile(_z[_z > 0], 98))
+                    _liquid = _win.max(axis=1) >= 0.15 * _zref
+                    if _liquid.any():
+                        _lv = [l2_data["y_levels"][i] for i in range(len(_liquid)) if _liquid[i]]
+                        _pad = max(0.02, 0.05 * (max(_lv) - min(_lv)))
+                        y_price = [min(y_price[0], min(_lv) - _pad),
+                                   max(y_price[1], max(_lv) + _pad)]
             y_price = user_y.get('yaxis', y_price)
             y_pa = user_y.get('yaxis2', y_pa)
             y_pb = user_y.get('yaxis4', y_pb)
             if y_price: fig.update_layout(yaxis=dict(range=y_price))
             if y_pa:    fig.update_layout(yaxis2=dict(range=y_pa))
             if y_pb:    fig.update_layout(yaxis4=dict(range=y_pb))
+        elif (not y_auto) and isinstance(manual_y_store, dict):
+            # Manual mode, non-fresh rebuild: bake the user's hand-set ranges
+            # into the served figure. uirevision alone cannot protect them —
+            # it only preserves true GUI drags, and build_chart writes its own
+            # tail-fit ranges that would win on every new candle otherwise.
+            for _ax in ('yaxis', 'yaxis2', 'yaxis4'):
+                _rng = manual_y_store.get(_ax)
+                if _rng and len(_rng) == 2:
+                    fig.update_layout({_ax: dict(range=[float(_rng[0]), float(_rng[1])])})
+
+        # Manual mode unlocks the y axes: price-axis drag/wheel AND the y
+        # component of plot-area pans both stick (tracked by the manual-y
+        # Store and re-applied above).
+        fig.update_layout(yaxis=dict(fixedrange=y_auto),
+                          yaxis2=dict(fixedrange=y_auto),
+                          yaxis4=dict(fixedrange=y_auto))
 
         # Axis uirevision: changes only when the x-coordinate space itself
         # changes (bars added/removed shift x_idx), so Plotly then accepts the
@@ -884,9 +1081,18 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # `matches`, and a matched axis whose uirevision did NOT change would
         # restore its old range and drag the primary axis back with it.
         axis_rev = f"{ticker}:{current_state['len']}:{current_state['oldest_date']}:{bars_req}"
+        # Manual y mode: the y axes get a DATA-INDEPENDENT revision, so the
+        # user's hand-set scale survives every refresh (len grows each bar —
+        # with the data-sensitive revision Plotly would drop the client's y
+        # state and adopt build_chart's baked tail fit on every new candle).
+        # Fresh-view triggers change ticker/tf (or the toggle itself), which
+        # changes this string too, letting the server's one-shot fit land.
+        y_rev = axis_rev if y_auto else f"{ticker}:{active_tf}:manual"
         for ax in list(fig.layout):
-            if ax.startswith('xaxis') or ax in ('yaxis', 'yaxis2', 'yaxis4'):
+            if ax.startswith('xaxis'):
                 fig.update_layout({ax: dict(uirevision=axis_rev)})
+            elif ax in ('yaxis', 'yaxis2', 'yaxis4'):
+                fig.update_layout({ax: dict(uirevision=y_rev)})
 
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
@@ -919,6 +1125,21 @@ app.clientside_callback(
     Output('clientside-dummy', 'children'),
     [Input('main-chart', 'relayoutData'),
      Input('main-chart', 'figure')]
+)
+
+# Manual-y tracker: records every user y movement (plot-area pan, price-axis
+# drag/wheel, double-click refit result) so the server can re-apply the ranges
+# on every rebuild while Y Auto-Scale is off.
+app.clientside_callback(
+    dash.ClientsideFunction(
+        namespace='clientside',
+        function_name='track_manual_y'
+    ),
+    Output('manual-y', 'data'),
+    [Input('main-chart', 'relayoutData'),
+     Input('yauto-check', 'value')],
+    State('manual-y', 'data'),
+    prevent_initial_call=True,
 )
 
 # Bars-to-show growth: clientside so it can never be aborted by a newer

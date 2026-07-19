@@ -476,6 +476,13 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
             "x": df["x_idx"].to_numpy(),
         })
         runs["rid"] = (runs["flag"] != runs["flag"].shift()).cumsum()
+        # Absorb short runs (< MIN_RUN_BARS) into the preceding run: a one-off
+        # estimated bar in a tick stretch (or vice versa) is noise, not a
+        # regime change — shading/lines only mark multi-bar transitions.
+        MIN_RUN_BARS = 3
+        run_sizes = runs.groupby("rid")["flag"].transform("size")
+        runs["flag"] = runs["flag"].mask(run_sizes < MIN_RUN_BARS).ffill().bfill()
+        runs["rid"] = (runs["flag"] != runs["flag"].shift()).cumsum()
         last_top_text_x = -9999
         for _, run in runs.groupby("rid"):
             style = styles.get(run["flag"].iloc[0])
@@ -520,16 +527,15 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
                 # the x1 + 0.5 boundary of the background rectangle.
                 x_split = curr_run["x"].iloc[-1] + 0.5
                 
-                # Always draw the vertical demarcation line
                 fig.add_shape(
                     type="line", x0=x_split, x1=x_split, y0=0, y1=1,
-                    yref="paper", xref="x", line=dict(color="rgba(255,255,255,0.25)", width=1.5, dash="dot"), layer="below",
+                    yref="paper", xref="x", line=dict(color="rgba(255,255,255,0.10)", width=1.0, dash="dot"), layer="below",
                 )
 
 
 
 
-def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: str = "1sec", pie_chart_count: int = 0, x_range: tuple = None, max_candles: int = None, show_bubbles: bool = True) -> go.Figure:
+def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: str = "1sec", pie_chart_count: int = 0, x_range: tuple = None, max_candles: int = None, show_bubbles: bool = True, l2_data: dict = None) -> go.Figure:
 
     fig = make_subplots(
         rows=3, cols=1,
@@ -619,6 +625,33 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
     for tf in timeframes:
         df = frames[tf]
         on = (tf == default_tf)
+
+        # ── Level-2 depth heatmap (single-frame mode only, like the pies —
+        # the timeframe-button path never receives l2_data). Added BEFORE the
+        # candle trace so price action paints on top of the liquidity bands.
+        # z columns were computed against the same truncated tail (app passes
+        # frames[tf].iloc[-max_candles:]), so they map onto the last n x_idx.
+        if l2_data is not None and len(timeframes) == 1 and l2_data.get("z") is not None:
+            _z = l2_data["z"]
+            _n = min(int(_z.shape[1]), len(df))
+            # Saturate the colorscale at the 98th percentile of resting size:
+            # one transient iceberg print would otherwise own the whole scale
+            # and wash the persistent walls (the interesting part) to near
+            # invisibility.
+            _pos = _z[_z > 0]
+            _zmax = float(np.percentile(_pos, 98)) if _pos.size else None
+            fig.add_trace(go.Heatmap(
+                x=df['x_idx'].iloc[-_n:].to_numpy(),
+                y=list(l2_data["y_levels"]),
+                z=_z[:, -_n:],
+                colorscale=[[0.0, "rgba(0,0,0,0)"],
+                            [0.10, "rgba(41,98,255,0.15)"],
+                            [0.45, "rgba(41,150,255,0.35)"],
+                            [1.0, "rgba(0,229,255,0.60)"]],
+                zmin=0.0, zmax=_zmax,
+                showscale=False, hoverinfo="skip",
+                name=f"L2 Depth ({tf})", visible=on, showlegend=False,
+            ), row=1, col=1, secondary_y=False)
 
         # Screen 1: candle or scatter (for raw ticks)
         if tf == "raw_tick":
@@ -950,6 +983,27 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
         fig.update_yaxes(range=y_pa_0, row=2, col=1, secondary_y=False)
     if y_pb_0:
         fig.update_yaxes(range=y_pb_0, row=3, col=1, secondary_y=False)
+
+    # ── Level-2 support/resistance lines (persistent resting liquidity,
+    # computed in level2_webapp.data_provider.compute_support_resistance) ──
+    if l2_data is not None and len(timeframes) == 1:
+        # Blue/amber on purpose: candle green/red must stay unmistakable, so
+        # the S&R lines use a different hue family and stay thin — only the
+        # right-edge label is fully opaque.
+        for lvl in l2_data.get("sr") or []:
+            _c = "#42a5f5" if lvl["side"] == "support" else "#ffa726"
+            fig.add_shape(
+                type="line", xref="x domain", x0=0, x1=1,
+                yref="y", y0=lvl["price"], y1=lvl["price"],
+                line=dict(color=_c, width=1.0 + 0.8 * lvl["score"], dash="dash"),
+                opacity=0.30 + 0.30 * lvl["score"], layer="above",
+            )
+            fig.add_annotation(
+                xref="x domain", x=0.999, xanchor="right",
+                yref="y", y=lvl["price"], yanchor="bottom",
+                text=f"{'S' if lvl['side'] == 'support' else 'R'} {lvl['price']:.2f}",
+                showarrow=False, font=dict(size=9, color=_c),
+            )
 
     # Step 3: Source-aware annotations — shade wick-estimated data regions.
     _add_source_annotations(fig, frames)
