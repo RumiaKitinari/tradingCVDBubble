@@ -18,6 +18,13 @@ import numpy as np
 
 from .calculator import run_pipeline, TIMEFRAME_RULE, DAILY_OR_ABOVE, WEEK_OR_ABOVE, TIMEFRAME_RULE_IBKR
 
+# Default cap on bars per frame. Plotly SVG renders EVERY bar, on-screen or
+# not, so this number IS the render cost. 1,000 keeps every refresh snappy;
+# scrollback beyond it is loaded PROGRESSIVELY — app.py doubles the cap (its
+# bars-to-show store, hard cap 12,000) whenever the user pans to the left
+# edge or zooms out, and passes it via build_chart(max_candles=...).
+MAX_CANDLES = 1000
+
 
 # Injected into the saved HTML (via write_html post_script).
 #
@@ -60,10 +67,12 @@ function refitY() {
         gd._fullData.forEach(function(f) {
             if (f.visible === false || f.visible === 'legendonly') return;
             if ((f.yaxis || 'y') !== yref) return;
-            var xs = f.x; if (!xs || !xs.length) return;
-            
-            var offset = xs[0];
-            var len = xs.length;
+            // Traces may carry an explicit x array OR the compact x0/dx form.
+            var xs = f.x, ys = f.y || f.close;
+            var offset, len;
+            if (xs && xs.length) { offset = xs[0]; len = xs.length; }
+            else if (ys && ys.length) { offset = (f.x0 != null ? f.x0 : 0); len = ys.length; }
+            else return;
             var i0 = Math.max(0, Math.floor(xr[0] - offset));
             var i1 = Math.min(len - 1, Math.ceil(xr[1] - offset));
             if (i0 > i1 || i0 >= len || i1 < 0) return; 
@@ -254,80 +263,133 @@ def _yrange(series, extra=PAD):
     return [lo - rng * extra, hi + rng * extra]
 
 
-# One indicator panel's worth of traces (6): buy bar, sell bar, CVD all,
-# CVD session, cumulative volume, buy ratio (last one on the right axis).
+# One indicator panel's worth of traces (11): buy bar, sell bar, CVD all,
+# CVD raw, CVD BVC, cum total/buy/sell, buy ratio, buy%/sell% strips.
 def _add_indicator_panel(fig, df, row, legend_id, on, default_on):
     """default_on: set of trace names shown by default in this panel."""
     ratio = df["buy_pressure"] / (df["buy_pressure"] + df["sell_pressure"])
 
+    # Determine if this panel contains estimated data
+    has_wick = "source" in df.columns and df["source"].astype(str).str.contains("wick").any()
+    buy_name = "Buy Volume (est.)" if has_wick else "Buy Volume"
+    sell_name = "Sell Volume (est.)" if has_wick else "Sell Volume"
+
     # Gray out bars whose volume is dominated by the closing auction (>50%):
     # their buy/sell split is neutralized (50/50) so the direction isn't real.
-    GRAY = "rgba(150,150,150,0.80)"
+    # A per-bar color list costs ~6,000 strings per trace in the figure JSON,
+    # so it is only built when an auction-dominated bar is actually in frame.
+    GRAY = "#969696"
     frac = df["auction_frac"] if "auction_frac" in df.columns else pd.Series(0.0, index=df.index)
-    buy_colors  = [GRAY if a > 0.5 else "rgba(38,166,154,0.85)" for a in frac]
-    sell_colors = [GRAY if a > 0.5 else "rgba(239,83,80,0.85)"  for a in frac]
+    if bool((frac > 0.5).any()):
+        buy_colors  = [GRAY if a > 0.5 else "#26a69a" for a in frac]
+        sell_colors = [GRAY if a > 0.5 else "#ef5350" for a in frac]
+    else:
+        buy_colors, sell_colors = "#26a69a", "#ef5350"
 
     def vis(name):
         if not on:
             return False
         return True if name in default_on else "legendonly"
-        
+
     sell_custom = np.stack((df['time_str'], df["sell_pressure"]), axis=-1)
 
+    # All panel traces sit on the same regular integer grid: ship x as x0/dx
+    # instead of repeating a 6,000-element array on every trace. The hover
+    # timestamp (customdata) is likewise carried only by the default-visible
+    # traces (buy/sell/CVD) — the unified tooltip needs it once per panel,
+    # not on all 11 traces.
+    x0 = float(df['x_idx'].iloc[0]) if len(df) else 0.0
+
     fig.add_trace(go.Bar(
-        x=df['x_idx'], y=df["buy_pressure"], name="Buy Volume",
-        marker_color=buy_colors, visible=vis("Buy Volume"), showlegend=on,
+        x0=x0, dx=1, y=df["buy_pressure"], name=buy_name,
+        width=0.8, offset=-0.4,
+        marker=dict(color=buy_colors, opacity=0.85),
+        visible=vis("Buy Volume"), showlegend=on,
         legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>Buy: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
     fig.add_trace(go.Bar(
-        x=df['x_idx'], y=-df["sell_pressure"], name="Sell Volume",
-        marker_color=sell_colors, visible=vis("Sell Volume"), showlegend=on,
+        x0=x0, dx=1, y=-df["sell_pressure"], name=sell_name,
+        width=0.8, offset=-0.4,
+        marker=dict(color=sell_colors, opacity=0.85),
+        visible=vis("Sell Volume"), showlegend=on,
         legend=legend_id, customdata=sell_custom,
         hovertemplate="<b>%{customdata[0]}</b><br>Sell: %{customdata[1]:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=df["cvd_all_end"], mode="lines", name="CVD (all-time)",
         line=dict(color="#ba68c8", width=2), connectgaps=True,
         visible=vis("CVD (all-time)"), showlegend=on, legend=legend_id, customdata=df['time_str'],
         hovertemplate="<b>%{customdata}</b><br>CVD all: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=df["cvd_all_raw_end"], mode="lines", name="CVD raw (incl. auction)",
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=df["cvd_all_raw_end"], mode="lines", name="CVD raw (incl. auction)",
         line=dict(color="#9575cd", width=1.4, dash="dot"), connectgaps=True,
-        visible=vis("CVD raw (incl. auction)"), showlegend=on, legend=legend_id, customdata=df['time_str'],
-        hovertemplate="<b>%{customdata}</b><br>CVD raw: %{y:,.0f}<extra></extra>",
+        visible=vis("CVD raw (incl. auction)"), showlegend=on, legend=legend_id,
+        hovertemplate="CVD raw: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=df["volume"].cumsum(), mode="lines", name="Cum Total",
+    # Independent BVC-estimated CVD (calculator.add_cvd_columns → cvd_bvc_end).
+    # Always added (NaN if the column is missing) so trace counts stay fixed
+    # for the static-HTML timeframe buttons.
+    y_bvc = df["cvd_bvc_end"] if "cvd_bvc_end" in df.columns \
+        else pd.Series(np.nan, index=df.index)
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=y_bvc, mode="lines", name="CVD (BVC est.)",
+        line=dict(color="#4dd0e1", width=1.6, dash="dash"), connectgaps=True,
+        visible=vis("CVD (BVC est.)"), showlegend=on, legend=legend_id,
+        hovertemplate="CVD BVC: %{y:,.0f}<extra></extra>",
+    ), row=row, col=1, secondary_y=False)
+
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=df["volume"].cumsum(), mode="lines", name="Cum Total",
         line=dict(color="#ffd54f", width=2), connectgaps=True,
-        visible=vis("Cum Total"), showlegend=on, legend=legend_id, customdata=df['time_str'],
-        hovertemplate="<b>%{customdata}</b><br>Cum Total: %{y:,.0f}<extra></extra>",
+        visible=vis("Cum Total"), showlegend=on, legend=legend_id,
+        hovertemplate="Cum Total: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=df["buy_pressure"].cumsum(), mode="lines", name="Cum Buy",
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=df["buy_pressure"].cumsum(), mode="lines", name="Cum Buy",
         line=dict(color="#66bb6a", width=1.6), connectgaps=True,
-        visible=vis("Cum Buy"), showlegend=on, legend=legend_id, customdata=df['time_str'],
-        hovertemplate="<b>%{customdata}</b><br>Cum Buy: %{y:,.0f}<extra></extra>",
+        visible=vis("Cum Buy"), showlegend=on, legend=legend_id,
+        hovertemplate="Cum Buy: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=df["sell_pressure"].cumsum(), mode="lines", name="Cum Sell",
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=df["sell_pressure"].cumsum(), mode="lines", name="Cum Sell",
         line=dict(color="#e57373", width=1.6), connectgaps=True,
-        visible=vis("Cum Sell"), showlegend=on, legend=legend_id, customdata=df['time_str'],
-        hovertemplate="<b>%{customdata}</b><br>Cum Sell: %{y:,.0f}<extra></extra>",
+        visible=vis("Cum Sell"), showlegend=on, legend=legend_id,
+        hovertemplate="Cum Sell: %{y:,.0f}<extra></extra>",
     ), row=row, col=1, secondary_y=False)
 
-    fig.add_trace(go.Scatter(
-        x=df['x_idx'], y=ratio, mode="lines", name="Buy Ratio",
+    fig.add_trace(go.Scattergl(
+        x0=x0, dx=1, y=ratio.round(4), mode="lines", name="Buy Ratio",
         line=dict(color="#ff9800", width=1.6, dash="dot"), connectgaps=True,
-        visible=vis("Buy Ratio"), showlegend=on, legend=legend_id, customdata=df['time_str'],
-        hovertemplate="<b>%{customdata}</b><br>Buy Ratio: %{y:.1%}<extra></extra>",
+        visible=vis("Buy Ratio"), showlegend=on, legend=legend_id,
+        hovertemplate="Buy Ratio: %{y:.1%}<extra></extra>",
+    ), row=row, col=1, secondary_y=True)
+
+    # ── Delta Ratio Strip (Stacked Bar on Secondary Y) ──
+    # barmode="relative" stacks same-sign bars sharing an offsetgroup, so the
+    # sell strip needs no explicit base array (saved ~0.24 MB of JSON).
+    tot_vol = df["buy_pressure"] + df["sell_pressure"]
+    tot_vol = np.where(tot_vol == 0, 1, tot_vol)
+    buy_pct = (df["buy_pressure"] / tot_vol).round(4)
+    sell_pct = (df["sell_pressure"] / tot_vol).round(4)
+
+    fig.add_trace(go.Bar(
+        x0=x0, dx=1, y=buy_pct, name="Buy % (Strip)",
+        marker_color="rgba(38,166,154,0.6)", visible=vis("Buy % (Strip)"), showlegend=on,
+        legend=legend_id, hoverinfo="y", offsetgroup=f"strip_{row}"
+    ), row=row, col=1, secondary_y=True)
+
+    fig.add_trace(go.Bar(
+        x0=x0, dx=1, y=sell_pct, name="Sell % (Strip)",
+        marker_color="rgba(239,83,80,0.6)", visible=vis("Sell % (Strip)"), showlegend=on,
+        legend=legend_id, hoverinfo="y", offsetgroup=f"strip_{row}"
     ), row=row, col=1, secondary_y=True)
 
 
@@ -368,19 +430,68 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
         ),
     }
 
+    # Tier-served frames (history package) carry a `quality` flag that is more
+    # precise than the source tag: shade every non-tick-quality run.
+    QUALITY_STYLES = {
+        "bvc": dict(
+            fillcolor="rgba(255,210,100,0.07)",
+            label="BVC (est.)",
+            font_color="rgba(220,180,80,0.75)",
+        ),
+        "wick": dict(
+            fillcolor="rgba(255,210,100,0.07)",
+            label="Wick (est.)",
+            font_color="rgba(220,180,80,0.75)",
+        ),
+        "mixed": dict(
+            fillcolor="rgba(100,160,255,0.05)",
+            label="Mixed (part est.)",
+            font_color="rgba(100,160,220,0.75)",
+        ),
+    }
+
     for df in frames.values():
-        if "source" not in df.columns or "x_idx" not in df.columns:
+        if "x_idx" not in df.columns:
             continue
-        src_col = df["source"]
-        # Contiguous runs of the same source value
-        run_id = (src_col != src_col.shift()).cumsum()
-        for _, run in df.groupby(run_id):
-            src = run["source"].iloc[0]
-            style = EST_SOURCES.get(src)
+        if "quality" in df.columns:
+            flag_name, styles = "quality", QUALITY_STYLES
+        elif "source" in df.columns:
+            flag_name, styles = "source", EST_SOURCES
+        else:
+            continue
+        # Empty session-grid slots carry NaN flags; let them inherit the
+        # surrounding run instead of fragmenting it into thousands of
+        # one-bar runs (each run costs an add_shape → massive figures).
+        # Positional frame → safe on raw-tick indexes with duplicate labels.
+        # Fill missing quality for raw ticks so they don't inherit 'bvc' via ffill
+        if "quality" in df.columns and "source" in df.columns:
+            df_flag = df["quality"].copy()
+            df_flag = df_flag.mask(df_flag.isna() & df["source"].str.contains("tick", na=False), "tick")
+            flag_array = df_flag.ffill().to_numpy()
+        else:
+            flag_array = df[flag_name].ffill().to_numpy()
+
+        runs = pd.DataFrame({
+            "flag": flag_array,
+            "x": df["x_idx"].to_numpy(),
+        })
+        runs["rid"] = (runs["flag"] != runs["flag"].shift()).cumsum()
+        # Absorb short runs (< MIN_RUN_BARS) into the preceding run: a one-off
+        # estimated bar in a tick stretch (or vice versa) is noise, not a
+        # regime change — shading/lines only mark multi-bar transitions.
+        MIN_RUN_BARS = 3
+        run_sizes = runs.groupby("rid")["flag"].transform("size")
+        runs["flag"] = runs["flag"].mask(run_sizes < MIN_RUN_BARS).ffill().bfill()
+        runs["rid"] = (runs["flag"] != runs["flag"].shift()).cumsum()
+        last_top_text_x = -9999
+        for _, run in runs.groupby("rid"):
+            style = styles.get(run["flag"].iloc[0])
             if style is None:
                 continue
-            x0 = run["x_idx"].iloc[0]
-            x1 = run["x_idx"].iloc[-1]
+            
+            # Use -0.5 and +0.5 to make the rectangle fully cover the candle width
+            x0 = run["x"].iloc[0] - 0.5
+            x1 = run["x"].iloc[-1] + 0.5
 
             fig.add_shape(
                 type="rect",
@@ -391,22 +502,40 @@ def _add_source_annotations(fig: go.Figure, frames: dict) -> None:
                 line_width=0,
                 layer="below",
             )
-            fig.add_annotation(
-                x=x0,
-                y=0.98,
-                yref="paper",
-                xref="x",
-                text=style["label"],
-                showarrow=False,
-                xanchor="left",
-                yanchor="top",
-                font=dict(size=8, color=style["font_color"]),
-            )
+            
+            # User prefers the colored top text. Add overlap protection.
+            if (x0 - last_top_text_x) > (df["x_idx"].max() * 0.05):
+                fig.add_annotation(
+                    x=x0, y=0.98, yref="paper", xref="x",
+                    text=style["label"], showarrow=False, xanchor="left", yanchor="top",
+                    font=dict(size=8, color=style["font_color"]),
+                )
+                last_top_text_x = x0
+
+        # Draw demarcation lines ONLY when transitioning from estimated to true tick
+        run_list = [r for _, r in runs.groupby("rid")]
+        
+        for i in range(len(run_list) - 1):
+            curr_run = run_list[i]
+            next_run = run_list[i+1]
+            
+            curr_is_est = styles.get(curr_run["flag"].iloc[0]) is not None
+            next_is_est = styles.get(next_run["flag"].iloc[0]) is not None
+            
+            if curr_is_est != next_is_est:
+                # Place the line exactly between the two candles, which also perfectly matches
+                # the x1 + 0.5 boundary of the background rectangle.
+                x_split = curr_run["x"].iloc[-1] + 0.5
+                
+                fig.add_shape(
+                    type="line", x0=x_split, x1=x_split, y0=0, y1=1,
+                    yref="paper", xref="x", line=dict(color="rgba(255,255,255,0.10)", width=1.0, dash="dot"), layer="below",
+                )
 
 
 
 
-def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
+def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: str = "1sec", pie_chart_count: int = 0, x_range: tuple = None, max_candles: int = None, show_bubbles: bool = True, l2_data: dict = None) -> go.Figure:
 
     fig = make_subplots(
         rows=3, cols=1,
@@ -414,28 +543,43 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         row_heights=[0.50, 0.25, 0.25],
         vertical_spacing=0.06,
         specs=[[{}], [{"secondary_y": True}], [{"secondary_y": True}]],
-        subplot_titles=(
-            f"{ticker} — Candlestick",
-            "Indicator Panel A — Buy/Sell Volume (toggle in upper legend)",
-            "Indicator Panel B — CVD (toggle in lower legend)",
-        )
+        subplot_titles=(f"{ticker} — Candlestick", "", "")
     )
+    
+    # ── Add zero lines for Indicator Panels (Must be done before Pie traces to avoid Plotly bugs) ──
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
 
     timeframes = list(frames.keys())
-    default_tf = "1hr" if "1hr" in timeframes else timeframes[-1]
-    default_idx = timeframes.index(default_tf)
+    if active_timeframe and active_timeframe in timeframes:
+        timeframes = [active_timeframe]
+        default_tf = active_timeframe
+        default_idx = 0
+    else:
+        default_tf = "1hr" if "1hr" in timeframes else timeframes[-1]
+        default_idx = timeframes.index(default_tf)
 
     tf_offsets = {}
     current_idx = 0
-    MAX_CANDLES = 6000
+    candle_cap = int(max_candles) if max_candles else MAX_CANDLES
     for i, tf in enumerate(timeframes):
+        # ── DOM Optimization: Limit short timeframes to the most recent bars
+        df = frames[tf]
+        if len(df) > candle_cap:
+            df = df.iloc[-candle_cap:]
         # Copy so x_idx/time_str additions never mutate the caller's frames
         # (and never trigger SettingWithCopyWarning on the truncated slice).
-        df = frames[tf].copy()
+        df = df.copy()
 
-        # ── DOM Optimization: Limit short timeframes to the most recent 6000 bars
-        if len(df) > MAX_CANDLES:
-            df = df.iloc[-MAX_CANDLES:]
+        # Trim float noise before serialization: BVC/wick splits carry 12+
+        # decimal digits per value, which balloons the figure JSON the
+        # browser has to download and parse on every refresh.
+        for c in ("buy_pressure", "sell_pressure", "volume", "delta_sum",
+                  "net_pressure", "cvd_all_end", "cvd_all_raw_end", "cvd_bvc_end",
+                  "auction_vol", "delta_wins_sum", "delta_bvc_sum",
+                  "cvd_session_end", "cvd_wins_end", "cvd_session_wins_end"):
+            if c in df.columns:
+                df[c] = df[c].round(1)
 
         frames[tf] = df
         df['x_idx'] = np.arange(len(df)) + current_idx
@@ -443,8 +587,38 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             df['time_str'] = df.index.strftime('%Y-%m-%d')
         else:
             df['time_str'] = df.index.strftime('%Y-%m-%d %H:%M')
+            
+        # --- Z-Score & Absorption Calculation ---
+        lookback = 60
+        delta = df["buy_pressure"].fillna(0) - df["sell_pressure"].fillna(0)
+        abs_delta = delta.abs()
+        mean_delta = abs_delta.rolling(window=lookback, min_periods=10).mean()
+        std_delta = abs_delta.rolling(window=lookback, min_periods=10).std()
+        df["z_score_delta"] = np.where(std_delta > 0, (abs_delta - mean_delta) / std_delta, 0.0)
+        
+        tot_vol = df["buy_pressure"].fillna(0) + df["sell_pressure"].fillna(0)
+        mean_vol = tot_vol.rolling(window=lookback, min_periods=10).mean()
+        std_vol = tot_vol.rolling(window=lookback, min_periods=10).std()
+        df["z_score_vol"] = np.where(std_vol > 0, (tot_vol - mean_vol) / std_vol, 0.0)
+        
+        candle_body = (df["close"] - df["open"]).abs()
+        avg_body = candle_body.rolling(window=lookback, min_periods=10).mean()
+        df["is_absorption"] = (df["z_score_delta"] >= 2.0) & (candle_body < (avg_body * 0.6))
+        # ----------------------------------------
+            
         tf_offsets[tf] = current_idx
         current_idx += len(df)
+        
+    # Source composition for the title. A bare mode() is misleading on mixed
+    # tiers (e.g. today's bars IBKR-derived, history FinViz — the mode said
+    # just "finviz"): show every source with its share instead.
+    df_active = frames[default_tf]
+    if not df_active.empty and "source" in df_active.columns:
+        shares = df_active["source"].value_counts(normalize=True)
+        parts = [f"{s} {frac:.0%}" for s, frac in shares.items() if frac >= 0.005]
+        src_str = " + ".join(parts[:3]) if parts else "unknown"
+    else:
+        src_str = "unknown"
 
     N_TRACES = 19
 
@@ -452,62 +626,218 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         df = frames[tf]
         on = (tf == default_tf)
 
-        # Screen 1: candle
-        fig.add_trace(go.Candlestick(
-            x=df['x_idx'], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-            name=f"Candle ({tf})",
-            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-            increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-            visible=on, showlegend=False, customdata=df['time_str'],
-            hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
-        ), row=1, col=1, secondary_y=False)
+        # ── Level-2 depth heatmap (single-frame mode only, like the pies —
+        # the timeframe-button path never receives l2_data). Added BEFORE the
+        # candle trace so price action paints on top of the liquidity bands.
+        # z columns were computed against the same truncated tail (app passes
+        # frames[tf].iloc[-max_candles:]), so they map onto the last n x_idx.
+        if l2_data is not None and len(timeframes) == 1 and l2_data.get("z") is not None:
+            _z = l2_data["z"]
+            _n = min(int(_z.shape[1]), len(df))
+            # Saturate the colorscale at the 98th percentile of resting size:
+            # one transient iceberg print would otherwise own the whole scale
+            # and wash the persistent walls (the interesting part) to near
+            # invisibility.
+            _pos = _z[_z > 0]
+            _zmax = float(np.percentile(_pos, 98)) if _pos.size else None
+            fig.add_trace(go.Heatmap(
+                x=df['x_idx'].iloc[-_n:].to_numpy(),
+                y=list(l2_data["y_levels"]),
+                z=_z[:, -_n:],
+                colorscale=[[0.0, "rgba(0,0,0,0)"],
+                            [0.10, "rgba(41,98,255,0.15)"],
+                            [0.45, "rgba(41,150,255,0.35)"],
+                            [1.0, "rgba(0,229,255,0.60)"]],
+                zmin=0.0, zmax=_zmax,
+                showscale=False, hoverinfo="skip",
+                name=f"L2 Depth ({tf})", visible=on, showlegend=False,
+            ), row=1, col=1, secondary_y=False)
 
-        # ── Phase 3: Bullseye Bubble Chart Overlay ──
-        # Determine dominant direction
-        actual_buy_vol = df["buy_pressure"].fillna(0)
-        actual_sell_vol = df["sell_pressure"].fillna(0)
-        is_buy_dom = actual_buy_vol >= actual_sell_vol
-        
-        outer_color = np.where(is_buy_dom, "rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)")
-        inner_color = np.where(is_buy_dom, "rgba(239,83,80,0.9)", "rgba(38,166,154,0.9)")
-        
-        actual_min_vol = np.minimum(actual_buy_vol, actual_sell_vol)
-        actual_tot_vol = df["volume"].fillna(0)
-        
-        # Option 1: Compress the overall bubble size using square root (power=0.5) 
-        # so huge spikes don't crush the typical candles into tiny dots.
-        # Plotly's sizemode='area' means the 'size' array maps linearly to visual area.
-        power = 0.5
-        tot_vol = actual_tot_vol ** power
-        
-        # To strictly preserve the visual ratio, the inner bubble's area MUST be 
-        # the outer area multiplied by the actual volume ratio.
-        ratio = np.where(actual_tot_vol > 0, actual_min_vol / actual_tot_vol, 0)
-        min_vol = tot_vol * ratio
-        
-        # We calculate the y-position of the bubble as the typical price (H+L+C)/3, or simply close.
-        # But to place it on the candle body, VWAP or (Open+Close)/2 is nice.
-        bubble_y = (df["open"] + df["close"]) / 2
+        # Screen 1: candle or scatter (for raw ticks)
+        if tf == "raw_tick":
+            # For raw ticks, OHLC are all the same, so we plot a simple line or scatter.
+            # Using markers allows seeing individual trades clearly.
+            fig.add_trace(go.Scattergl(
+                x0=float(df['x_idx'].iloc[0]) if len(df) else 0.0, dx=1,
+                y=df["close"],
+                mode="lines+markers",
+                name=f"Raw Ticks",
+                line=dict(color="#29b6f6", width=1),
+                marker=dict(size=3, color="#29b6f6"),
+                visible=on, showlegend=False, customdata=df['time_str'],
+                hovertemplate="<b>%{customdata}</b><br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1, secondary_y=False)
+        else:
+            fig.add_trace(go.Candlestick(
+                x=df['x_idx'], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                name=f"Candle ({tf})",
+                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+                visible=on, showlegend=False, customdata=df['time_str'],
+                hovertemplate="<b>%{customdata}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>",
+            ), row=1, col=1, secondary_y=False)
 
-        # Sizing ref: scale the average compressed volume to a nice 24px radius
-        # (This makes the absolute size much larger, about 4x the area of 12px radius)
-        ref_vol = tot_vol.mean() if not tot_vol.empty else 1
-        ref_vol = max(ref_vol, 1)
-        sizeref = 2.0 * ref_vol / (24 ** 2)
+        # --- Add Volume/Absorption Bubbles ---
+        if show_bubbles:
+            if "z_score_delta" in df.columns:
+                mask_bubble = (df["z_score_delta"] >= 2.0) | (df["z_score_vol"] >= 3.0)
+            else:
+                mask_bubble = pd.Series(False, index=df.index)
+            if mask_bubble.any():
+                df_b = df[mask_bubble].copy()
+                
+                colors = []
+                sizes = []
+                texts = []
+                for idx, row_data in df_b.iterrows():
+                    z_delta = row_data["z_score_delta"]
+                    z_vol = row_data["z_score_vol"]
+                    is_abs = row_data["is_absorption"]
+                    d_val = row_data["buy_pressure"] - row_data["sell_pressure"]
+                    tot_val = row_data["buy_pressure"] + row_data["sell_pressure"]
+                    
+                    if is_abs:
+                        c = "rgba(157, 0, 255, 0.9)"
+                        sz = z_delta
+                        raw_val = d_val
+                        prefix = "+" if d_val > 0 else ""
+                    elif z_delta >= 2.0:
+                        c = "rgba(0, 150, 100, 0.7)" if d_val > 0 else "rgba(182, 0, 61, 0.7)"
+                        sz = z_delta
+                        raw_val = d_val
+                        prefix = "+" if d_val > 0 else ""
+                    else:
+                        c = "rgba(255, 215, 0, 0.7)"
+                        sz = z_vol
+                        raw_val = tot_val
+                        prefix = ""
+                    
+                    if abs(raw_val) >= 1e6:
+                        txt = f"{prefix}{raw_val/1e6:.1f}M"
+                    elif abs(raw_val) >= 1e3:
+                        txt = f"{prefix}{raw_val/1e3:.1f}K"
+                    else:
+                        txt = f"{prefix}{raw_val:.0f}"
+                        
+                    colors.append(c)
+                    sizes.append(min(45, 12 + sz * 6))
+                    texts.append(txt)
+                    
+                y_coords = (df_b["open"] + df_b["high"] + df_b["low"] + df_b["close"]) / 4.0
+                
+                fig.add_trace(go.Scatter(
+                    x=df_b["x_idx"],
+                    y=y_coords,
+                    mode="markers+text",
+                    name=f"Volume Bubbles ({tf})",
+                    marker=dict(
+                        size=sizes,
+                        color=colors,
+                        line=dict(width=1, color="rgba(255,255,255,0.7)")
+                    ),
+                    text=texts,
+                    textposition="middle center",
+                    textfont=dict(size=10, color="white", family="Arial Black"),
+                    visible=on,
+                    showlegend=False,
+                    hoverinfo="skip"
+                ), row=1, col=1, secondary_y=False)
+            else:
+                # Empty placeholder: the timeframe-button visibility arrays
+                # below assume a fixed trace count per frame, so the bubble
+                # trace must exist even when no bar clears the threshold.
+                fig.add_trace(go.Scatter(
+                    x=[], y=[], mode="markers+text",
+                    name=f"Volume Bubbles ({tf})",
+                    visible=on, showlegend=False, hoverinfo="skip",
+                ), row=1, col=1, secondary_y=False)
+        # -------------------------------------
 
-        fig.add_trace(go.Scatter(
-            x=df['x_idx'], y=bubble_y,
-            mode='markers', name=f"Bubble Outer ({tf})",
-            marker=dict(size=tot_vol, sizemode='area', sizeref=sizeref, sizemin=1, color=outer_color, line=dict(width=0)),
-            visible=False, showlegend=False, hoverinfo="skip"
-        ), row=1, col=1, secondary_y=False)
+        # ── Fixed Domain Pie Charts ──
+        if pie_chart_count > 0 and len(timeframes) == 1:
+            N_total = len(df)
+            if x_range is not None:
+                x0_init = x_range[0]
+                x1_init = x_range[1]
+            else:
+                x0_init = max(0, N_total - 100)
+                x1_init = N_total
+                
+            df_vis = df[(df['x_idx'] >= x0_init) & (df['x_idx'] <= x1_init)]
+            
+            n_pies = int(pie_chart_count)
+            overall_width = 0.94 # Matches secondary y-axis domain in Plotly
+            width = overall_width / n_pies
+            pad = width * 0.05
+            
+            chunk_size = (x1_init - x0_init) / n_pies if n_pies > 0 else 1
+            
+            # Pre-compute max volume for sqrt scaling
+            chunks = []
+            vols = []
+            for k in range(n_pies):
+                c_start = x0_init + k * chunk_size
+                c_end = x0_init + (k + 1) * chunk_size
+                chunk = df_vis[(df_vis['x_idx'] >= c_start) & (df_vis['x_idx'] < c_end)]
+                chunks.append(chunk)
+                if len(chunk) > 0:
+                    vols.append(float(chunk["buy_pressure"].sum() + chunk["sell_pressure"].sum()))
+                else:
+                    vols.append(0.0)
+            max_vol = max(vols) if vols and max(vols) > 0 else 1.0
+            
+            for k in range(n_pies):
+                chunk = chunks[k]
+                if len(chunk) > 0:
+                    buy = float(chunk["buy_pressure"].sum())
+                    sell = float(chunk["sell_pressure"].sum())
+                else:
+                    buy, sell = 0, 0
+                
+                if (buy + sell) > 0:
+                    factor = ((buy + sell) / max_vol) ** 0.5
+                    factor = max(0.15, factor) # min size
+                    if n_pies >= 50:
+                        factor *= 1.5
+                    
+                    # Perfectly align with the center of the candles in this chunk
+                    c_center = chunk["x_idx"].mean()
+                    x_span = x1_init - x0_init
+                    if x_span > 0:
+                        x_center = (c_center - x0_init) / x_span * overall_width
+                    else:
+                        x_center = k * width + (width / 2.0)
+                        
+                    # Clamp x_center so the pie's radius doesn't push the domain below 0 or above 1
+                    radius = width * 0.45 * factor
+                    x_center = max(radius, min(overall_width - radius, x_center))
+                    
+                    d_x = [x_center - radius, x_center + radius]
+                    d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor] # Slightly higher than bottom
+                    
+                    fig.add_trace(go.Pie(
+                        values=[buy, sell],
+                        labels=["Buy", "Sell"],
+                        marker=dict(colors=["rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)"]),
+                        textinfo="none",
+                        hoverinfo="text",
+                        hovertext=f"Buy: {buy:,.0f}<br>Sell: {sell:,.0f}",
+                        hole=0.0,
+                        domain=dict(x=d_x, y=d_y),
+                        sort=False,
+                        direction="clockwise",
+                        showlegend=False
+                    ))
+                else:
+                    # Hide empty chunks completely by zeroing their domain
+                    d_x = [0, 0]
+                    d_y = [0, 0]
+                    fig.add_trace(go.Pie(
+                        values=[0, 0], marker=dict(colors=["rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)"]),
+                        domain=dict(x=d_x, y=d_y),
+                        hoverinfo='none', textinfo='none', hole=0.0
+                    ))
 
-        fig.add_trace(go.Scatter(
-            x=df['x_idx'], y=bubble_y,
-            mode='markers', name=f"Bubble Inner ({tf})",
-            marker=dict(size=min_vol, sizemode='area', sizeref=sizeref, sizemin=0, color=inner_color, line=dict(width=0)),
-            visible=False, showlegend=False, hoverinfo="skip"
-        ), row=1, col=1, secondary_y=False)
 
 
         # Screen 2: defaults to Buy/Sell volume; Screen 3: defaults to CVD (session)
@@ -522,22 +852,27 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         df = frames[tf]
         offset = tf_offsets[tf]
         
-        # panel order: buy, sell, CVD all, CVD raw, cum total, cum buy, cum sell, ratio
+        # panel order: buy, sell, CVD all, CVD raw, CVD BVC, cum total, cum buy, cum sell, ratio, buy%, sell%
         LO = "legendonly"
-        panelA = [True, True, LO, LO, LO, LO, LO, LO]
-        panelB = [LO, LO, True, LO, LO, LO, LO, LO]
+        panelA = [True, True, LO, LO, LO, LO, LO, LO, LO, LO, LO]
+        panelB = [LO, LO, True, LO, LO, LO, LO, LO, LO, LO, LO]
         visibility = []
+
+        # In static HTML mode, we skip dynamic traces (pie/strip) for updatemenus
+        # because their trace count is variable. This loop is only used if not active_timeframe.
+        head = 2 if show_bubbles else 1     # candle (+ bubble trace) per frame
+        N_TRACES = head + 22                # + 22 indicators (11 per panel)
         for j in range(len(timeframes)):
             if j == i:
-                # Candle, Bubble Outer, Bubble Inner
-                visibility += [True, False, False] + panelA + panelB
+                # Candle (+ bubbles) + panels
+                visibility += [True] * head + panelA + panelB
             else:
                 visibility += [False] * N_TRACES
 
         showlegend = []
         for j in range(len(timeframes)):
             if j == i:
-                showlegend += [False, False, False] + [True] * 16
+                showlegend += [False] * head + [True] * 22
             else:
                 showlegend += [False] * N_TRACES
 
@@ -574,28 +909,32 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     y_pa_0 = _yrange(pd.concat([in0["buy_pressure"], -in0["sell_pressure"]]))
     y_pb_0 = _yrange(in0["cvd_all_end"])
 
-    fig.update_layout(
-        title=dict(text=f"<b>{ticker}</b> — {default_tf}", font=dict(size=18)),
+    layout_kwargs = dict(
+        title=dict(text=f"<b>{ticker}</b> — {default_tf} <span style='font-size:12px;color:gray;'>(Source: {src_str})</span>", font=dict(size=18)),
         template="plotly_dark",
         height=1150,
-        barmode="overlay",
+        barmode="relative",
         bargap=0.1,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
+        hoverlabel=dict(bgcolor="rgba(25, 25, 25, 0.95)", font_size=12, font_color="white", bordercolor="#444"),
         dragmode="pan",  # Left-click drags to pan instead of selecting a zoom box
         # two independent legends, one per indicator panel
         legend=dict(orientation="h", yanchor="bottom", y=0.25, xanchor="left", x=0,
                     bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
         legend2=dict(orientation="h", yanchor="top", y=-0.02, xanchor="left", x=0,
                      bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
-        margin=dict(l=60, r=60, t=120, b=60),
+        margin=dict(l=60, r=60, t=120, b=150 if pie_chart_count > 0 else 60),
         uirevision="constant",  # Prevents Plotly from resetting UI state on relayout
-        updatemenus=[
+    )
+    if not active_timeframe:
+        layout_kwargs["updatemenus"] = [
             dict(type="buttons", direction="right", x=0.0, y=1.09, xanchor="left",
                  buttons=buttons, bgcolor="#2d2d2d", bordercolor="#888",
                  font=dict(color="#aaaaaa", size=12), active=default_idx),
-        ],
-    )
+        ]
+        
+    fig.update_layout(**layout_kwargs)
 
     fig.update_xaxes(type="linear", showticklabels=False, showspikes=True, spikemode="across", spikedash="solid", spikecolor="gray", spikethickness=1)
     fig.update_yaxes(title_text="Price (USD)", fixedrange=True, row=1, col=1, showspikes=True, spikemode="across", spikedash="solid", spikecolor="gray", spikethickness=1)
@@ -606,9 +945,15 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
     fig.update_xaxes(title_text="Time", row=3, col=1)
 
     # ── Current Value Labels ──
-    if not df_1min.empty:
-        last_close = df_1min["close"].iloc[-1]
-        last_cvd = df_1min["cvd_all_end"].iloc[-1] if "cvd_all_end" in df_1min.columns else df_1min["cvd_all"].iloc[-1]
+    # Use the last bar that actually traded: session-grid frames end with
+    # empty (NaN) slots whenever the final expected bin has no data yet.
+    if not df.empty and df["close"].notna().any():
+        valid = df.dropna(subset=["close"])
+        last_close = valid["close"].iloc[-1]
+        last_open = valid["open"].iloc[-1]
+        cvd_col = "cvd_all_end" if "cvd_all_end" in df.columns else "cvd_all"
+        _cvd_valid = df[cvd_col].dropna()
+        last_cvd = _cvd_valid.iloc[-1] if not _cvd_valid.empty else 0.0
         
         fig.add_annotation(
             xref="paper", yref="y",
@@ -616,7 +961,7 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             text=f"{last_close:.2f}",
             showarrow=False,
             xanchor="left",
-            bgcolor="rgba(38,166,154,0.9)" if df_1min["close"].iloc[-1] >= df_1min["open"].iloc[-1] else "rgba(239,83,80,0.9)",
+            bgcolor="rgba(38,166,154,0.9)" if last_close >= last_open else "rgba(239,83,80,0.9)",
             font=dict(color="white", size=11),
             borderpad=3
         )
@@ -631,9 +976,6 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
             borderpad=3
         )
 
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=2, col=1)
-    fig.add_hline(y=0, line=dict(color="gray", width=0.8, dash="dot"), row=3, col=1)
-
     fig.update_xaxes(range=[x0, x1])
     if y1_0:
         fig.update_yaxes(range=y1_0, row=1, col=1)
@@ -641,6 +983,27 @@ def build_chart(df_1min, frames: dict, ticker: str) -> go.Figure:
         fig.update_yaxes(range=y_pa_0, row=2, col=1, secondary_y=False)
     if y_pb_0:
         fig.update_yaxes(range=y_pb_0, row=3, col=1, secondary_y=False)
+
+    # ── Level-2 support/resistance lines (persistent resting liquidity,
+    # computed in level2_webapp.data_provider.compute_support_resistance) ──
+    if l2_data is not None and len(timeframes) == 1:
+        # Blue/amber on purpose: candle green/red must stay unmistakable, so
+        # the S&R lines use a different hue family and stay thin — only the
+        # right-edge label is fully opaque.
+        for lvl in l2_data.get("sr") or []:
+            _c = "#42a5f5" if lvl["side"] == "support" else "#ffa726"
+            fig.add_shape(
+                type="line", xref="x domain", x0=0, x1=1,
+                yref="y", y0=lvl["price"], y1=lvl["price"],
+                line=dict(color=_c, width=1.0 + 0.8 * lvl["score"], dash="dash"),
+                opacity=0.30 + 0.30 * lvl["score"], layer="above",
+            )
+            fig.add_annotation(
+                xref="x domain", x=0.999, xanchor="right",
+                yref="y", y=lvl["price"], yanchor="bottom",
+                text=f"{'S' if lvl['side'] == 'support' else 'R'} {lvl['price']:.2f}",
+                showarrow=False, font=dict(size=9, color=_c),
+            )
 
     # Step 3: Source-aware annotations — shade wick-estimated data regions.
     _add_source_annotations(fig, frames)

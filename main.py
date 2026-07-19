@@ -24,6 +24,7 @@ from finviz.finviz_curl import login, get_token, update_api_keys
 from finviz.new_finviz import fetch_and_save, FinvizTokenError
 from cvd.calculator import run_pipeline
 from cvd.visualizer import build_chart, write_chart_html
+import cvd.visualizer_level2 as visualizer_level2
 from TradingView.admin import DOWNLOAD_DIR
 
 
@@ -69,20 +70,26 @@ def fetch(ticker: str):
 # 3 + 4. Calculate + visualize
 # ─────────────────────────────────────────
 
-def calculate_and_show(ticker: str, save_html: bool = True, open_browser: bool = False):
-    print(f"
-[Pipeline] Running CVD pipeline for {ticker}...")
+def calculate_and_show(ticker: str, save_html: bool = True, open_browser: bool = False, use_level2: bool = False):
+    print(f"\n[Pipeline] Running CVD pipeline for {ticker} (Level 2: {use_level2})...")
     df_1min, frames = run_pipeline(ticker)
 
     if df_1min.empty or not frames:
         print("[Pipeline] ❌ No data to visualize.")
         return
 
-    fig = build_chart(df_1min, frames, ticker)
-    path = "chart.html"
+    if use_level2:
+        fig = visualizer_level2.build_chart(df_1min, frames, ticker)
+        path = "chart_level2.html"
+    else:
+        fig = build_chart(df_1min, frames, ticker)
+        path = "chart.html"
 
     if save_html:
-        write_chart_html(fig, path)
+        if use_level2:
+            visualizer_level2.write_chart_html(fig, path)
+        else:
+            write_chart_html(fig, path)
         print(f"[Visualizer] Saved → {path}")
 
     if open_browser:
@@ -95,9 +102,9 @@ def calculate_and_show(ticker: str, save_html: bool = True, open_browser: bool =
 # 5. Main loop
 # ─────────────────────────────────────────
 
-def run(ticker: str, loop: bool = True, interval: int = 60):
+def run(ticker: str, loop: bool = True, interval: int = 60, use_level2: bool = False):
     print(f"\n{'='*55}")
-    print(f"  CVD Pipeline  |  ticker={ticker}  |  loop={loop}")
+    print(f"  CVD Pipeline  |  ticker={ticker}  |  loop={loop} | level2={use_level2}")
     print(f"{'='*55}")
 
     # Token regeneration once at startup
@@ -125,7 +132,7 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
 
         try:
             fetch(ticker)
-            calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1))
+            calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1), use_level2=use_level2)
         except FinvizTokenError as e:
             # Wrong/expired token → regenerate and retry this iteration once.
             print(f"[Loop] ⚠️  Token error: {e}")
@@ -133,7 +140,7 @@ def run(ticker: str, loop: bool = True, interval: int = 60):
             refresh_token()
             try:
                 fetch(ticker)
-                calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1))
+                calculate_and_show(ticker, save_html=True, open_browser=(iteration == 1), use_level2=use_level2)
             except Exception:
                 print("[Loop] ❌ Retry after token refresh still failed:")
                 traceback.print_exc()
@@ -159,10 +166,12 @@ if __name__ == "__main__":
     parser.add_argument("--ticker",   type=str, default="NVDA", help="Stock ticker (default: NVDA)")
     parser.add_argument("--no-loop",  action="store_true",       help="Run once and exit")
     parser.add_argument("--interval", type=int, default=60,      help="Fetch interval in seconds (default: 60)")
+    parser.add_argument("--level2",   action="store_true",       help="Use the new Level 2 visualization")
     args = parser.parse_args()
 
     run(
         ticker   = args.ticker,
         loop     = not args.no_loop,
-        interval = args.interval
+        interval = args.interval,
+        use_level2 = args.level2
     )

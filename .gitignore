@@ -14,5 +14,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Generated chart outputs
+# macOS Finder metadata
+.DS_Store
+
+# Generated chart outputs (10-20MB each — keep out of git)
 *_cvd_chart.html
+*_alpaca_chart.html
+*_ibkr_chart.html
+chart.html
+
+# Claude
+.claudeignore
+CLAUDE.md
+.claude/
+claude/

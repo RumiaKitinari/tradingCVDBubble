@@ -1,0 +1,1344 @@
+import dash
+from dash import dcc, html, Input, Output, State, ctx
+import dash_bootstrap_components as dbc
+from cvd.calculator import run_pipeline, TIMEFRAME_RULE_IBKR, TIMEFRAME_RULE
+from cvd.visualizer import build_chart, MAX_CANDLES
+from history.schema import SERVE_TIER, SERVE_WINDOW_DAYS
+from history.serve import run_pipeline_tiered, invalidate_cache
+from level2_webapp.data_provider import fetch_and_aggregate_l2_data, compute_support_resistance
+import plotly.graph_objects as go
+import numpy as np
+import pandas as pd
+import logging
+import json
+import time
+from dash.exceptions import PreventUpdate
+
+logging.basicConfig(level=logging.INFO)
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
+
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            <script>
+                window.dash_clientside = window.dash_clientside || {};
+                window.dash_clientside.clientside = window.dash_clientside.clientside || {};
+
+                // Y Auto-Scale checkbox state (manual mode when unchecked).
+                window.__yAutoOn = function() {
+                    var el = document.querySelector('#yauto-check input[type="checkbox"]');
+                    return el ? el.checked : true;
+                };
+
+                // Manual mode: every user y movement sticks as-is — plot-area
+                // pan, price-axis drag/wheel, all of it. Persistence across
+                // rebuilds is handled by the manual-y Store (track_manual_y
+                // below). The only interception left is double-click, which
+                // Plotly would turn into a plain trace autorange: route it
+                // through __requestRefit so the one-shot fit uses our own
+                // logic (L2 band inclusion, visible-window scoping); the
+                // refit's relayout then lands in the Store like any other.
+                window.__guardManualY = function(gd, e) {
+                    if (window.__yAutoOn() || window.__is_refitting || !e) return;
+                    var keys = Object.keys(e);
+                    if (keys.some(function(k) { return k.indexOf('autorange') !== -1; })) {
+                        window.__requestRefit();
+                    }
+                };
+
+                // Debounced y-axis refit, shared by the Dash clientside callback
+                // (pan / data refresh) and the plotly_restyle hook below
+                // (legend toggles, which Dash does not expose as a prop).
+                // onlyAxes (optional): array of layout axis names — restricts
+                // the fit to those panels (manual-mode legend toggles refit
+                // ONLY the panel whose trace changed).
+                window.__requestRefit = function(onlyAxes) {
+                    if (window.__refit_timer) {
+                        clearTimeout(window.__refit_timer);
+                    }
+
+                    window.__refit_timer = setTimeout(function() {
+                        if (window.__is_refitting) {
+                            return; // Wait until current refit is done
+                        }
+
+                        var wrapper = document.getElementById('main-chart');
+                        if (!wrapper) return;
+                        var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
+                        if (!gd || !gd._fullLayout) return;
+                        
+                        var YPAD = 0.10;
+                        var LEFT = {'y':'yaxis', 'y2':'yaxis2', 'y4':'yaxis4'};
+                        var ax = gd._fullLayout.xaxis;
+                        if (!ax || !ax.range) return;
+                        var xr = [ax.range[0], ax.range[1]];
+                        
+                        var upd = {};
+                        Object.keys(LEFT).forEach(function(yref) {
+                            if (onlyAxes && onlyAxes.indexOf(LEFT[yref]) === -1) return;
+                            var lo = Infinity, hi = -Infinity;
+                            gd._fullData.forEach(function(f) {
+                                if (f.visible === false || f.visible === 'legendonly') return;
+                                if ((f.yaxis || 'y') !== yref) return;
+                                if (f.type === 'pie') return;
+                                // L2 heatmap: y is a price-LEVEL axis, not a
+                                // per-bar series. Include only the levels that
+                                // hold meaningful liquidity (>=15% of the
+                                // trace zmax) in the visible x window, so the
+                                // bands stay on screen without a faint stray
+                                // level stretching the whole axis.
+                                if (f.type === 'heatmap') {
+                                    if (!f.x || !f.x.length || !f.z || !f.y) return;
+                                    var h0 = Math.max(0, Math.floor(xr[0] - f.x[0]));
+                                    var h1 = Math.min(f.x.length - 1, Math.ceil(xr[1] - f.x[0]));
+                                    var thr = 0.15 * (f.zmax || 0);
+                                    if (h0 > h1 || !(thr > 0)) return;
+                                    for (var r = 0; r < f.z.length; r++) {
+                                        var zrow = f.z[r], m = 0;
+                                        for (var c = h0; c <= h1; c++) if (zrow[c] > m) m = zrow[c];
+                                        if (m >= thr) {
+                                            var yv = f.y[r];
+                                            if (yv < lo) lo = yv;
+                                            if (yv > hi) hi = yv;
+                                        }
+                                    }
+                                    return;
+                                }
+                                // Traces may carry an explicit x array OR the
+                                // compact x0/dx form (dx is always 1 here).
+                                var xs = f.x, ys = f.y || f.close;
+                                var offset, len;
+                                if (xs && xs.length) { offset = xs[0]; len = xs.length; }
+                                else if (ys && ys.length) { offset = (f.x0 != null ? f.x0 : 0); len = ys.length; }
+                                else return;
+                                var i0 = Math.max(0, Math.floor(xr[0] - offset));
+                                var i1 = Math.min(len - 1, Math.ceil(xr[1] - offset));
+                                if (i0 > i1 || i0 >= len || i1 < 0) return; 
+                                
+                                if (f.low && f.high) {
+                                    var lows = f.low, highs = f.high;
+                                    for (var i = i0; i <= i1; i++) {
+                                        if (lows[i]  < lo) lo = lows[i];
+                                        if (highs[i] > hi) hi = highs[i];
+                                    }
+                                } else if (f.y) {
+                                    var ys = f.y;
+                                    for (var i = i0; i <= i1; i++) {
+                                        var v = ys[i];
+                                        if (v == null || isNaN(v)) continue;
+                                        if (v < lo) lo = v;
+                                        if (v > hi) hi = v;
+                                    }
+                                }
+                            });
+                            if (lo < hi && lo !== Infinity) {
+                                var pad = (hi - lo) * YPAD;
+                                var new_lo = lo - pad;
+                                var new_hi = hi + pad;
+
+                                // Relative threshold: the old absolute 0.05 test always
+                                // failed for CVD values in the millions, forcing a full
+                                // re-render (Plotly.relayout) after every data refresh.
+                                var span = new_hi - new_lo;
+                                var old_range = gd._fullLayout[LEFT[yref]] ? gd._fullLayout[LEFT[yref]].range : null;
+                                if (!old_range || Math.abs(old_range[0] - new_lo) > span * 0.02 || Math.abs(old_range[1] - new_hi) > span * 0.02) {
+                                    upd[LEFT[yref] + '.range'] = [new_lo, new_hi];
+                                }
+                            }
+                        });
+                        
+                        if (Object.keys(upd).length > 0) {
+                            window.__is_refitting = true;
+                            Plotly.relayout(gd, upd).then(function() {
+                                window.__is_refitting = false;
+                            }).catch(function() {
+                                window.__is_refitting = false;
+                            });
+                        }
+                    }, 60);
+                };
+
+                // Progressive scrollback growth (bars-to-show doubling) runs
+                // CLIENTSIDE: a server callback on relayoutData gets aborted
+                // whenever the y-refit fires a newer relayout event, silently
+                // eating the growth. Constants mirror app.py DEFAULT_BARS /
+                // BARS_HARD_CAP — keep them in sync.
+                window.dash_clientside.clientside.grow_scrollback = function(relayoutData, currentBars, lastStateJson) {
+                    var nu = window.dash_clientside.no_update;
+                    if (!relayoutData) return nu;
+                    var x0 = null, x1 = null;
+                    if (relayoutData['xaxis.range[0]'] !== undefined && relayoutData['xaxis.range[1]'] !== undefined) {
+                        x0 = +relayoutData['xaxis.range[0]']; x1 = +relayoutData['xaxis.range[1]'];
+                    } else if (Array.isArray(relayoutData['xaxis.range'])) {
+                        x0 = +relayoutData['xaxis.range'][0]; x1 = +relayoutData['xaxis.range'][1];
+                    } else return nu;
+                    var st = {};
+                    try { st = JSON.parse(lastStateJson || '{}'); } catch(e) { return nu; }
+                    var n = st.n_active, tf = st.active_tf;
+                    if (!n || !tf) return nu;
+                    var atLeft = x0 <= 10;
+                    var zoomedOut = (x1 - x0) >= 0.95 * n;
+                    if (!atLeft && !zoomedOut) return nu;
+                    var DEFAULT_BARS = 1000, HARD_CAP = 12000;
+                    var cur = DEFAULT_BARS;
+                    if (currentBars && typeof currentBars === 'object') {
+                        cur = (currentBars.tf === tf) ? (currentBars.bars || DEFAULT_BARS) : DEFAULT_BARS;
+                    } else if (currentBars) { cur = +currentBars; }
+                    if (n < cur) return nu;   // data-limited: the server grows days-to-load instead
+                    var next = Math.min(cur * 2, HARD_CAP);
+                    if (next <= cur) return nu;
+                    return {'bars': next, 'tf': tf, 'x0': x0, 'x1': x1};
+                };
+
+                // Manual-mode y tracker → dcc.Store('manual-y'). The server
+                // re-applies these ranges on every rebuild (uirevision does
+                // NOT protect API/relayout edits, only true GUI drags), the
+                // same explicit-reapply pattern the x window already uses.
+                // EVERY event carrying y ranges counts — plot-area pans
+                // (x+y) included: with the checkbox off, wherever the user
+                // moves y is the new manual scale.
+                window.dash_clientside.clientside.track_manual_y = function(relayoutData, yautoValue, current) {
+                    var nu = window.dash_clientside.no_update;
+                    var trg = dash_clientside.callback_context.triggered;
+                    if (trg && trg.length && trg[0].prop_id === 'yauto-check.value') {
+                        return null;   // mode flip: stale manual ranges must not resurface
+                    }
+                    if (window.__yAutoOn() || !relayoutData) return nu;
+                    var out = (current && typeof current === 'object') ? Object.assign({}, current) : {};
+                    var touched = false;
+                    ['yaxis', 'yaxis2', 'yaxis4'].forEach(function(ax) {
+                        if (relayoutData[ax + '.range[0]'] !== undefined) {
+                            out[ax] = [+relayoutData[ax + '.range[0]'], +relayoutData[ax + '.range[1]']];
+                            touched = true;
+                        } else if (Array.isArray(relayoutData[ax + '.range'])) {
+                            out[ax] = relayoutData[ax + '.range'].slice();
+                            touched = true;
+                        }
+                    });
+                    return touched ? out : nu;
+                };
+
+                window.dash_clientside.clientside.refit_y = function(relayoutData, figureData) {
+                    // Triggered by EITHER user pan (relayoutData) OR data refresh (figureData)
+
+                    var trigger = dash_clientside.callback_context.triggered;
+                    var isFigUpdate = trigger && trigger.length > 0 && trigger[0].prop_id === 'main-chart.figure';
+
+                    // Manual mode: no continuous refits — the server only
+                    // rewrites y on fresh views and otherwise re-applies the
+                    // manual-y Store, so there is nothing to do here.
+                    if (!window.__yAutoOn()) {
+                        return window.dash_clientside.no_update;
+                    }
+
+                    if (!isFigUpdate) {
+                        if (!relayoutData) return window.dash_clientside.no_update;
+                        var keys = Object.keys(relayoutData);
+                        var hasX = keys.some(function(k) { return k.indexOf('xaxis') === 0; });
+                        if (!hasX) return window.dash_clientside.no_update;
+                    }
+
+                    window.__requestRefit();
+                    return window.dash_clientside.no_update;
+                };
+
+                // Legend toggles fire plotly_restyle, which Dash has no Input
+                // for — bind directly so showing/hiding a trace (e.g. the CVD
+                // variants) refits the y-axes to what is actually visible.
+                // Rebinds automatically if the graph node is ever re-created.
+                setInterval(function() {
+                    var wrapper = document.getElementById('main-chart');
+                    if (!wrapper) return;
+                    var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
+                    if (!gd || !gd.on || gd.__restyleBound) return;
+                    gd.__restyleBound = true;
+                    gd.on('plotly_restyle', function(ev) {
+                        if (window.__is_refitting) return;
+                        if (window.__yAutoOn()) { window.__requestRefit(); return; }
+                        // Manual mode: legend toggles refit ONLY the panel the
+                        // toggled trace lives on — candle/other panels keep
+                        // their manual scale.
+                        var axes = {};
+                        var idx = (ev && ev[1]) || [];
+                        idx.forEach(function(i) {
+                            var t = gd._fullData[i];
+                            if (!t) return;
+                            var ax = {'y': 'yaxis', 'y2': 'yaxis2', 'y4': 'yaxis4'}[t.yaxis || 'y'];
+                            if (ax) axes[ax] = true;
+                        });
+                        var list = Object.keys(axes);
+                        if (list.length) {
+                            window.__requestRefit(list);
+                        }
+                    });
+                    // Manual-mode double-click: route autorange through the
+                    // one-shot custom refit (all other y moves stick as-is).
+                    gd.on('plotly_relayout', function(e) { window.__guardManualY(gd, e); });
+                }, 1000);
+            </script>
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
+
+app.layout = html.Div([
+    dbc.NavbarSimple(
+        brand="Trading CVD Bubble Dashboard",
+        brand_href="#",
+        color="dark",
+        dark=True,
+        className="mb-3",
+        style={"borderBottom": "1px solid #222", "boxShadow": "0 4px 10px rgba(0,0,0,0.5)"}
+    ),
+    
+    dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.Label("Search Ticker:", style={"fontWeight": "bold", "color": "#eee"}),
+                dbc.Input(
+                    id='ticker-input', 
+                    value='NVDA', 
+                    type='text', 
+                    debounce=True, 
+                    placeholder="Enter Ticker & hit Enter...",
+                    style={"color": "#000", "backgroundColor": "white"}
+                )
+            ], width=2),
+            
+            dbc.Col([
+                html.Label("Base Data Source:", style={"fontWeight": "bold", "color": "#eee"}),
+                dcc.RadioItems(
+                    id='source-radio',
+                    options=[
+                        {'label': ' Tiered: IBKR ticks + history (default)', 'value': 'raw_tick'},
+                        {'label': ' 1-Min Base (FinViz legacy)', 'value': 'i1'}
+                    ],
+                    value='raw_tick',
+                    inline=True,
+                    className="mt-1",
+                    labelStyle={"marginRight": "12px", "color": "#ccc"}
+                )
+            ], width=3),
+            
+            dbc.Col([
+                html.Label("Active Timeframe:", style={"fontWeight": "bold", "color": "#eee"}),
+                dcc.Dropdown(
+                    id='timeframe-dropdown',
+                    options=[], # Populated by callback
+                    value='1hr',
+                    clearable=False,
+                    style={"color": "#000"} 
+                )
+            ], width=2),
+            
+            dbc.Col([
+                html.Button("Manual Refresh", id="refresh-btn", className="btn btn-outline-info btn-sm mt-4 w-100")
+            ], width=1),
+            
+            dbc.Col([
+                html.Div(id='last-updated-text', className="mt-4 text-muted text-end", style={"fontSize": "14px", "marginRight": "10px"})
+            ], width=3),
+            
+            # Isolated Loading Spinner (does not wrap the main chart)
+            dbc.Col([
+                html.Div([
+                    dcc.Loading(
+                        id="loading-spinner",
+                        type="circle",
+                        color="#29b6f6",
+                        children=html.Div(id='loading-dummy', style={"width": "30px", "height": "30px"})
+                    )
+                ], className="mt-3")
+            ], width=1)
+        ], className="mb-2 align-items-center"),
+        
+        dbc.Row([
+            dbc.Col([
+                html.Label("Auto Refresh:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='refresh-interval-dropdown',
+                    options=[
+                        {'label': 'Off', 'value': 0},
+                        {'label': '5 sec', 'value': 5000},
+                        {'label': '10 sec', 'value': 10000},
+                        {'label': '30 sec', 'value': 30000},
+                        {'label': '60 sec', 'value': 60000}
+                    ],
+                    value=10000,
+                    clearable=False,
+                    style={"color": "#000", "width": "120px", "display": "inline-block", "marginRight": "20px"}
+                ),
+                dcc.Checklist(
+                    id='yauto-check',
+                    options=[{'label': ' Y Auto-Scale', 'value': 'on'}],
+                    value=['on'],
+                    labelStyle={"color": "white", "fontWeight": "bold"},
+                    style={"display": "inline-block", "marginRight": "20px"}
+                ),
+                html.Label("Z-Score Bubbles:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='bubbles-dropdown',
+                    options=[
+                        {'label': 'On', 'value': True},
+                        {'label': 'Off', 'value': False}
+                    ],
+                    value=True,
+                    clearable=False,
+                    style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
+                ),
+                html.Label("L2 Depth:", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='l2-dropdown',
+                    options=[
+                        {'label': 'On', 'value': True},
+                        {'label': 'Off', 'value': False}
+                    ],
+                    value=False,
+                    clearable=False,
+                    style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
+                ),
+                html.Label("Fixed Pie Charts (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='pie-chart-dropdown',
+                    options=[
+                        {'label': 'Off', 'value': 0},
+                        {'label': '25 Pies', 'value': 25},
+                        {'label': '50 Pies', 'value': 50},
+                        {'label': '100 Pies', 'value': 100},
+                        {'label': '150 Pies', 'value': 150}
+                    ],
+                    value=25,  # Default to 25 to show it off
+                    clearable=False,
+                    style={"color": "#000", "width": "150px", "display": "inline-block"}
+                )
+            ], width=12, className="d-flex align-items-center justify-content-end")
+        ], className="mb-3"),
+        
+        # Main Chart Area
+        html.Div([
+            dcc.Graph(
+                id='main-chart',
+                style={'height': '1100px'},
+                config={'scrollZoom': True, 'displayModeBar': False}
+            )
+        ], style={
+            "padding": "10px", 
+            "backgroundColor": "rgba(10, 10, 10, 0.8)", 
+            "backdropFilter": "blur(15px)",
+            "borderRadius": "12px",
+            "border": "1px solid rgba(255, 255, 255, 0.1)",
+            "boxShadow": "0 8px 32px 0 rgba(0, 0, 0, 0.5)"
+        }),
+        
+        dcc.Interval(
+            id='interval-component',
+            interval=10 * 1000, 
+            n_intervals=0
+        ),
+        
+        # Dummy div for clientside callback to prevent invalid ID errors
+        html.Div(id='clientside-dummy', style={'display': 'none'}),
+        
+        # State tracking stores
+        dcc.Store(id='last-data-state', data='{}'),
+        dcc.Store(id='days-to-load', data=3),
+        # Progressive scrollback: bars rendered per frame. Starts at the
+        # visualizer default (1,000 — cheap re-renders); doubles when the user
+        # pans to the left edge or zooms out, up to BARS_HARD_CAP.
+        dcc.Store(id='bars-to-show', data=None),
+        dcc.Store(id='manual-y', data=None),
+        dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
+        
+        
+    ], fluid=True, style={"padding": "0 2% 50px 2%"})
+], style={"backgroundColor": "#0d0d0d", "minHeight": "100vh"})
+
+
+# ── Callbacks ──
+
+@app.callback(
+    [Output('timeframe-dropdown', 'options'),
+     Output('timeframe-dropdown', 'value')],
+    [Input('source-radio', 'value')],
+    [State('timeframe-dropdown', 'value')]
+)
+def update_timeframes(base_tf, current_value):
+    if base_tf == 'raw_tick':
+        tfs = list(TIMEFRAME_RULE_IBKR.keys())
+        new_value = "raw_tick"  # Default to raw_tick as user requested
+    else: 
+        tfs = list(TIMEFRAME_RULE.keys())
+        new_value = current_value if current_value in tfs else "1hr"
+        
+    options = [{'label': t, 'value': t} for t in tfs]
+    return options, new_value
+
+
+# Global state to prevent spamming FinViz fetches
+import time
+last_finviz_fetch = {}
+# Per-ticker cooldown on the background IBKR backfill spawn. update_graph fires
+# on every polling interval, and each backfill process connects to IB Gateway on
+# the same clientId (=11) which Gateway REJECTS as a duplicate — so an unthrottled
+# spawn just piles up failing processes. A 1-day backfill runs ~65s (see DONE.md).
+last_backfill = {}
+BACKFILL_COOLDOWN_SEC = 120
+DATA_CACHE = {} # Cache for fast pie chart HUD updates
+
+# Progressive scrollback bounds: rendering is O(bars) in Plotly SVG, so the
+# default stays small and the user "buys" deeper scrollback by panning left /
+# zooming out (bars-to-show doubles per hit, never past the hard cap).
+DEFAULT_BARS = MAX_CANDLES          # 1,000
+BARS_HARD_CAP = 12000
+
+def _resolve_bars(bars_to_show, active_tf) -> int:
+    """Per-TF bars-to-show store value → effective render cap."""
+    if isinstance(bars_to_show, dict):
+        bars = bars_to_show.get('bars', DEFAULT_BARS) if bars_to_show.get('tf') == active_tf else DEFAULT_BARS
+    else:
+        bars = bars_to_show or DEFAULT_BARS
+    return max(200, min(int(bars), BARS_HARD_CAP))
+
+# Opportunistic incremental rollup: keeps the materialized tiers (1min/30min/
+# 1day) fresh for the active ticker while collectors stream 1-sec bars, without
+# requiring the standalone `python -m history.rollup --loop` worker to be up.
+# Incremental passes only touch bars past the watermark, so this is cheap.
+last_rollup = {}
+ROLLUP_COOLDOWN_SEC = 60
+
+# Fetch/rollup run OFF the request thread: a timeframe switch or interval tick
+# must never wait on a FinViz HTTP round-trip (~1-3s) or a rollup pass. The
+# chart renders from the tiers as-is; the next poll serves the merged bars.
+import threading
+_refresh_inflight = set()
+
+def _spawn_data_refresh(ticker: str, fetch: bool):
+    if ticker in _refresh_inflight:
+        return
+
+    _refresh_inflight.add(ticker)
+
+    def work():
+        try:
+            if fetch:
+                from finviz.new_finviz import fetch_and_save
+                fetch_and_save(ticker, timeframe="i1")
+            from history.rollup import rollup_ticker
+            rollup_ticker(ticker)
+            invalidate_cache(ticker)
+        except Exception as e:
+            logging.warning(f"Background refresh failed for {ticker}: {e}")
+        finally:
+            _refresh_inflight.discard(ticker)
+
+    threading.Thread(target=work, daemon=True).start()
+
+def _maybe_rollup(ticker: str):
+    now = time.time()
+    if now - last_rollup.get(ticker, 0) < ROLLUP_COOLDOWN_SEC:
+        return
+    last_rollup[ticker] = now
+    _spawn_data_refresh(ticker, fetch=False)
+
+# On-demand tick collection: viewing a ticker in tiered mode upserts a request
+# that ibkr/dynamic_collector.py (separate process, own clientId) picks up and
+# turns into a live tick-by-tick subscription + catch-up 1sec backfill. The
+# research collectors' tickers are excluded by the collector itself.
+_last_collect_req = {}
+COLLECT_REQ_COOLDOWN_SEC = 30
+
+def _request_tick_collection(ticker: str):
+    now = time.time()
+    if now - _last_collect_req.get(ticker, 0) < COLLECT_REQ_COOLDOWN_SEC:
+        return
+    _last_collect_req[ticker] = now
+
+    def work():
+        try:
+            from datetime import datetime, timezone
+            from history.schema import mongo_client, DB_NAME
+            mongo_client()[DB_NAME]["collector_requests"].update_one(
+                {"_id": ticker},
+                {"$set": {"last_requested": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        except Exception as e:
+            logging.debug(f"collector request failed for {ticker}: {e}")
+
+    threading.Thread(target=work, daemon=True).start()
+
+@app.callback(
+    [Output('interval-component', 'interval'),
+     Output('interval-component', 'disabled')],
+    [Input('refresh-interval-dropdown', 'value')]
+)
+def update_refresh_interval(val):
+    if val == 0:
+        return 10000, True
+    return val, False
+
+@app.callback(
+    [Output('main-chart', 'figure'),
+     Output('last-updated-text', 'children'),
+     Output('loading-dummy', 'children'),
+     Output('last-data-state', 'data'),
+     Output('pan-state', 'data')],
+    [Input('ticker-input', 'value'),
+     Input('source-radio', 'value'),
+     Input('timeframe-dropdown', 'value'),
+     Input('interval-component', 'n_intervals'),
+     Input('refresh-btn', 'n_clicks'),
+     Input('days-to-load', 'data'),
+     Input('pie-chart-dropdown', 'value'),
+     Input('bubbles-dropdown', 'value'),
+     Input('l2-dropdown', 'value'),
+     Input('yauto-check', 'value'),
+     Input('bars-to-show', 'data')],
+    # NOTE: deliberately NO State('main-chart', 'figure') here — that would
+    # upload the entire multi-MB figure JSON from the browser on every
+    # interval tick, which is what made the 10-s refresh feel slow.
+    # relayoutData is tiny (just the last pan/zoom event) and gives the
+    # freshest user window without waiting for the pan-state Store round-trip.
+    [State('last-data-state', 'data'),
+     State('pan-state', 'data'),
+     State('main-chart', 'relayoutData'),
+     State('manual-y', 'data')]
+)
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, last_state_json, pan_state_json, relayout_data, manual_y_store):
+    trigger = ctx.triggered_id
+    
+    if not ticker:
+        raise PreventUpdate
+    
+    ticker = str(ticker).strip().upper()
+    logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf} Days: {days_to_load}")
+    
+    try:
+        # Tier-aware serving flag (used for the serve path below AND to decide
+        # whether tiered mode needs a fresh FinViz i1 fetch).
+        tier_served = (base_tf == 'raw_tick' and active_tf in SERVE_TIER)
+
+        # Any ticker viewed in tiered/tick mode should have live ticks flowing:
+        # signal the dynamic collector (no-op if it isn't running).
+        if base_tf == 'raw_tick':
+            _request_tick_collection(ticker)
+
+        # days-to-load is scoped to the timeframe it was grown on: panning
+        # deep on one TF (up to 180 days) must not make every later timeframe
+        # switch reload that much history.
+        if isinstance(days_to_load, dict):
+            days_req = float(days_to_load.get('days', 3)) if days_to_load.get('tf') == active_tf else 3.0
+        else:
+            days_req = float(days_to_load or 3)
+
+        # Progressive scrollback: how many bars to render for this TF.
+        bars_req = _resolve_bars(bars_to_show, active_tf)
+
+        # Periodic FinViz fetch (every 60 seconds) or forced by Manual Refresh
+        now = time.time()
+        should_fetch_finviz = False
+
+        if trigger == 'refresh-btn':
+            should_fetch_finviz = True
+        elif base_tf == 'i1' or (tier_served and SERVE_TIER[active_tf] in ('1sec', '1min')):
+            # Tiered sub-daily charts need fresh FinViz 1-min bars too: the
+            # rollup merges them into the 1min tier wherever no IBKR data
+            # exists, so the current day stays dense (consolidated-tape bars)
+            # even when the tick collector is down or lagging.
+            if ticker not in last_finviz_fetch or (now - last_finviz_fetch[ticker]) > 60:
+                should_fetch_finviz = True
+                
+        if should_fetch_finviz:
+            last_finviz_fetch[ticker] = now
+            if trigger == 'refresh-btn':
+                # Manual refresh: the user explicitly wants fresh data NOW,
+                # so this one waits for the fetch (and merge, in tiered mode).
+                logging.info(f"Fetching latest FinViz data for {ticker}...")
+                try:
+                    from finviz.new_finviz import fetch_and_save
+                    fetch_and_save(ticker, timeframe="i1")
+                    if base_tf == 'raw_tick':
+                        from history.rollup import rollup_ticker
+                        rollup_ticker(ticker)
+                        last_rollup[ticker] = now
+                except Exception as e:
+                    logging.error(f"Auto-fetch failed: {e}")
+            else:
+                # Periodic path: fetch + rollup in the background so a
+                # timeframe switch never blocks on a FinViz HTTP round-trip.
+                _spawn_data_refresh(ticker, fetch=True)
+                last_rollup[ticker] = now
+
+        # While the user is panned away from the live tail, an interval tick
+        # cannot change anything visible (historical bars are immutable and
+        # pies are patched client-side on pan) — skip the full reload and the
+        # multi-second re-render. Background fetch/rollup above still ran, so
+        # data keeps accumulating; the next tail view or view switch shows it.
+        # All state here is per-client (Stores/relayoutData), so another open
+        # browser tab on a different view can't defeat the check.
+        if trigger == 'interval-component':
+            try:
+                _ps = json.loads(pan_state_json) if pan_state_json else {}
+            except Exception:
+                _ps = {}
+            try:
+                _ls = json.loads(last_state_json) if last_state_json else {}
+            except Exception:
+                _ls = {}
+            if (_ps.get('panned')
+                    and _ls.get('ticker') == ticker
+                    and _ls.get('base_tf') == base_tf
+                    and _ls.get('active_tf') == active_tf):
+                _x1 = None
+                if relayout_data and 'xaxis.range[1]' in relayout_data:
+                    _x1 = float(relayout_data['xaxis.range[1]'])
+                elif relayout_data and isinstance(relayout_data.get('xaxis.range'), (list, tuple)):
+                    _x1 = float(relayout_data['xaxis.range'][1])
+                elif 'x1' in _ps:
+                    _x1 = float(_ps['x1'])
+                n_active = _ls.get('n_active')
+                # Never skip while a bars-to-show growth is pending delivery:
+                # dash-renderer aborts an in-flight request when a newer one
+                # (this interval tick) supersedes it, so this rebuild is the
+                # grown figure's only ride to the client.
+                if (_x1 is not None and n_active and _x1 < n_active - 2
+                        and _ls.get('bars') == bars_req):
+                    raise PreventUpdate
+
+        # ── Tier-aware serving (history package) ────────────────────────────
+        # Every timeframe except the raw tick view is served from its
+        # materialized tier (1day chart reads ~2k daily rows, never 1-sec
+        # bars). The raw_tick chart and the legacy FinViz-only radio keep the
+        # old run_pipeline path.
+        if tier_served:
+            default_win = SERVE_WINDOW_DAYS.get(active_tf)
+            actual_days = None if default_win is None else max(days_req, default_win)
+            if trigger == 'refresh-btn':
+                invalidate_cache(ticker)
+            _maybe_rollup(ticker)
+            df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
+        else:
+            # Dynamic Lookback based on Timeframe (legacy path)
+            min_days = 3
+            if active_tf == '1month': min_days = 1000
+            elif active_tf == '1week': min_days = 365
+            elif active_tf == '1day': min_days = 180
+            elif active_tf == '1hr': min_days = 30
+
+            actual_days = max(days_req, min_days)
+            if active_tf in ('1sec', 'raw_tick'):
+                # The chart caps at 3,000 ticks (~minutes of trading), yet the
+                # generic 3-day default reloaded ~190k tick docs on every 10-s
+                # poll. Half a day is plenty unless the user panned deeper on
+                # this exact timeframe (then days-to-load carries their intent).
+                grown = isinstance(days_to_load, dict) and days_to_load.get('tf') == active_tf
+                actual_days = days_req if grown else 0.5
+
+            # The chart shows ONE timeframe — skip aggregating the other 11.
+            tf_map = TIMEFRAME_RULE_IBKR if base_tf in ('1sec', 'raw_tick') else TIMEFRAME_RULE
+            only = [active_tf] if active_tf in tf_map else None
+            df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=actual_days, only=only)
+        
+        # Fallback & Auto-Backfill Pipeline
+        fallback_msg = ""
+        
+        # Tiered path: a new/uncovered ticker gets instant history — FinViz
+        # daily (~8y, one request) + FinViz i1 (recent 1-min) merged through
+        # the rollup chain — then the tier query is retried.
+        if tier_served and df_base.empty:
+            try:
+                from history.backfill_finviz_daily import backfill_daily
+                from history.rollup import rollup_ticker
+                logging.info(f"Tier empty for {ticker} — running instant FinViz backfill...")
+                backfill_daily(ticker)
+                if SERVE_TIER[active_tf] != '1day':
+                    from finviz.new_finviz import fetch_and_save
+                    fetch_and_save(ticker, timeframe='i1')
+                rollup_ticker(ticker)
+                invalidate_cache(ticker)
+                df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
+                fallback_msg = " [FinViz history backfilled]"
+            except Exception as e:
+                logging.error(f"Instant FinViz backfill failed: {e}")
+
+        # Daily-tier coverage check: a ticker may have a few rolled-up days
+        # (from i1/1sec) without ever having had its FinViz daily history
+        # fetched — detect via backfill_meta and fill the ~8 years once.
+        if tier_served and not df_base.empty and SERVE_TIER[active_tf] == '1day':
+            from history.store import get_backfill_coverage
+            cov_key = f"{ticker}:1day"
+            if (get_backfill_coverage(ticker, '1day') is None
+                    and now - last_backfill.get(cov_key, 0) > BACKFILL_COOLDOWN_SEC):
+                last_backfill[cov_key] = now
+                try:
+                    from history.backfill_finviz_daily import backfill_daily
+                    logging.info(f"No daily coverage for {ticker} — fetching FinViz daily history...")
+                    backfill_daily(ticker)
+                    invalidate_cache(ticker)
+                    df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
+                    fallback_msg = " [FinViz daily history backfilled]"
+                except Exception as e:
+                    logging.error(f"Daily coverage backfill failed: {e}")
+
+        # Check if we got enough data (rough heuristic: if we want 1000 days but got < 10 days of data)
+        # Or if df_base is completely empty.
+        needs_backfill = False
+        if df_base.empty:
+            needs_backfill = True
+        elif not tier_served and actual_days is not None and actual_days > 10:
+            # Check date range of loaded data
+            data_span_days = (df_base.index[-1] - df_base.index[0]).total_seconds() / 86400.0
+            if data_span_days < (actual_days * 0.5): # If we have less than half the requested history
+                needs_backfill = True
+
+        if needs_backfill and base_tf != 'i1' and not tier_served:
+            logging.info(f"Insufficient data for {ticker} (requested {actual_days} days). Spawning auto-backfills...")
+
+            if now - last_backfill.get(ticker, 0) > BACKFILL_COOLDOWN_SEC:
+                last_backfill[ticker] = now
+                try:
+                    import subprocess
+                    import os
+                    # 1. Spawn IBKR backfill
+                    ibkr_days = min(int(max(3, actual_days or 3)), 180) # Cap IBKR 1-sec fetch to 180 days to avoid API blocks
+                    subprocess.Popen(
+                        ["python", "-m", "ibkr.backfill", "--ticker", ticker, "--days", str(ibkr_days)],
+                        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__))),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    
+                    # 2. Synchronously fetch FinViz data for immediate rendering
+                    from finviz.new_finviz import fetch_and_save
+                    fv_tf = 'd' if actual_days > 60 else 'i1'
+                    logging.info(f"Fetching fallback FinViz data (tf={fv_tf}) for immediate render...")
+                    fetch_and_save(ticker, timeframe=fv_tf)
+                    
+                    # 3. Reload pipeline with newly fetched FinViz data as temporary fallback
+                    df_base, frames = run_pipeline(ticker, base_timeframe='i1' if fv_tf == 'i1' else 'd', days=actual_days)
+                    fallback_msg = " [Rendering FinViz Fallback - IBKR Backfill in Progress...]"
+                except Exception as e:
+                    logging.error(f"Fallback fetch failed: {e}")
+        
+        if df_base.empty:
+            empty_fig = go.Figure()
+            empty_fig.update_layout(
+                template="plotly_dark", 
+                title=dict(text=f"No data available for {ticker} in MongoDB (and auto-fetch failed).", font=dict(color="white")),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+            )
+            return empty_fig, "No Data", "", "{}", pan_state_json
+
+        # Optimization: Only re-render if data has actually grown/changed
+        current_state = {
+            "ticker": ticker,
+            "base_tf": base_tf,
+            "active_tf": active_tf,
+            "len": len(df_base),
+            "oldest_date": str(df_base.index[0]),
+            "newest_date": str(df_base.index[-1]),
+            "days_loaded": days_to_load,
+            "pie_chart_count": pie_chart_count,
+            "bubbles": show_bubbles,
+            "l2": show_l2,
+            "yauto": bool(yauto_value),
+            "bars": bars_req
+        }
+        # Compare ignoring n_active (a post-build fact appended below); keep
+        # the previous value — the bars-to-show view remap below needs it.
+        try:
+            _prev_state = json.loads(last_state_json) if last_state_json else {}
+        except Exception:
+            _prev_state = {}
+        n_active_prev = _prev_state.pop('n_active', None)
+        if current_state == _prev_state and trigger == 'interval-component':
+            raise PreventUpdate
+
+        # A render-cap growth may be delivered by ANY trigger (the direct
+        # bars-to-show request is aborted by dash-renderer whenever a newer
+        # request supersedes it), so detect it from the state delta.
+        prev_bars = _prev_state.get('bars')
+        bars_grew = (prev_bars is not None and bars_req > prev_bars
+                     and _prev_state.get('active_tf') == active_tf
+                     and _prev_state.get('ticker') == ticker)
+            
+        try:
+            pan_state = json.loads(pan_state_json) if pan_state_json else {}
+        except:
+            pan_state = {}
+
+        panned = pan_state.get('panned', False)
+        pan_time = pan_state.get('time', 0)
+
+        # A timeframe/ticker/source switch is a fresh view: forget the pan
+        # window from the previous chart (its x_idx coordinates are
+        # meaningless here) and open at the newest bars.
+        if trigger in ('timeframe-dropdown', 'ticker-input', 'source-radio'):
+            panned = False
+            pan_state = {'panned': False, 'time': 0}
+
+        # NOTE: there is deliberately no idle timeout here — a panned view
+        # stays where the user put it across every auto-refresh, until they
+        # switch timeframe/ticker or double-click (autorange) back to live.
+
+        # A bars-to-show growth only ever happens mid-pan/zoom, but the
+        # pan-state Store (written by a parallel callback) may not have
+        # committed yet — trust relayoutData directly so the grown chart
+        # keeps the user's window instead of snapping to the tail.
+        if trigger == 'bars-to-show' or bars_grew:
+            panned = True
+            pan_state['panned'] = True
+            pan_state.setdefault('time', time.time())
+
+        x_range = None
+        if panned:
+            # Prefer the graph's own last relayout event over the pan-state
+            # Store: the Store is written by a separate callback, so an
+            # interval rebuild racing a fresh pan could otherwise snap the
+            # view back to the tail with pies patched for the panned window.
+            if relayout_data and 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
+                x_range = (float(relayout_data['xaxis.range[0]']), float(relayout_data['xaxis.range[1]']))
+            elif relayout_data and isinstance(relayout_data.get('xaxis.range'), (list, tuple)):
+                x_range = (float(relayout_data['xaxis.range'][0]), float(relayout_data['xaxis.range'][1]))
+            elif 'x0' in pan_state and 'x1' in pan_state:
+                x_range = (pan_state['x0'], pan_state['x1'])
+
+        # The growth payload carries the anchor window (see grow_scrollback):
+        # it is the exact event that triggered the growth, fresher than both
+        # relayoutData (may hold a y-only refit by now) and the pan Store.
+        if ((trigger == 'bars-to-show' or bars_grew)
+                and isinstance(bars_to_show, dict) and 'x0' in bars_to_show):
+            x_range = (float(bars_to_show['x0']), float(bars_to_show['x1']))
+
+        # A render-cap growth shifts the x_idx coordinate space: index 0 now
+        # points further into the past, so the view window recorded in OLD
+        # coordinates must slide right by the number of bars prepended —
+        # otherwise the chart would jump to a different region after loading.
+        if bars_grew and x_range is not None and n_active_prev:
+            _key = active_tf if active_tf in frames else list(frames.keys())[0]
+            _shift = min(len(frames[_key]), bars_req) - n_active_prev
+            if _shift > 0:
+                x_range = (x_range[0] + _shift, x_range[1] + _shift)
+
+        # ── Level-2 depth heatmap + support/resistance (mock or real —
+        # trading_cvd.level2_snapshots, filled by tests/mock_level2_stream.py
+        # today and ibkr/level2_collector.py once the depth subscription is
+        # live). Computed on the SAME truncated tail build_chart will render
+        # (iloc[-bars_req:]) so heatmap columns line up with x_idx 1:1.
+        l2_data = None
+        if show_l2:
+            try:
+                _l2_key = active_tf if active_tf in frames else list(frames.keys())[0]
+                _l2_tail = frames[_l2_key].iloc[-bars_req:]
+                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_tail, max_candles=300)
+                _closes = _l2_tail["close"].dropna() if len(_l2_tail) else _l2_tail
+                if _zm is not None and len(_closes):
+                    # last VALID close — session-grid empty candles carry NaN
+                    _mid = float(_closes.iloc[-1])
+                    l2_data = {"y_levels": _yl, "z": _zm,
+                               "sr": compute_support_resistance(_yl, _zm, _mid, z_bid=_zb)}
+                else:
+                    logging.info(f"L2: no depth snapshots for {ticker} in the visible window")
+            except Exception as e:
+                logging.error(f"L2 fetch failed (chart renders without it): {e}")
+
+        fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf, pie_chart_count=pie_chart_count, show_bubbles=show_bubbles, x_range=x_range, max_candles=bars_req, l2_data=l2_data)
+
+        # build_chart mutates `frames`: the active frame is now truncated to
+        # MAX_CANDLES with its FINAL x_idx/time_str — cache THAT frame so the
+        # pie pan-callback works in the same coordinate space as the figure.
+        # (Caching the pre-build frame shifted every x_idx by len(df)-6000
+        # whenever the frame exceeded the candle cap, so the pies summed
+        # buy/sell from completely different bars than the ones on screen.)
+        # (no `global` needed: DATA_CACHE is only item-assigned, never rebound)
+        active_key = active_tf if active_tf and active_tf in frames else list(frames.keys())[0]
+        df_active = frames[active_key]
+        DATA_CACHE['df'] = df_active
+        DATA_CACHE['pie_chart_count'] = pie_chart_count
+        DATA_CACHE['pie_indices'] = [i for i, tr in enumerate(fig.data) if tr.type == 'pie']
+        # Post-build frame length, carried in the per-client state Store: the
+        # off-tail interval skip and handle_panning both need it.
+        current_state['n_active'] = len(df_active)
+        current_state_json = json.dumps(current_state)
+
+        # View window: keep the panned window, else auto-tail to the newest bars.
+        N_total = len(df_active)
+        if x_range is not None:
+            x0, x1 = float(x_range[0]), float(x_range[1])
+        else:
+            x0, x1 = max(0, N_total - 100), N_total
+        # Write the window to EVERY x axis: the subplots' MASTER axis is
+        # xaxis3 (xaxis/xaxis2 carry matches='x3'), and build_chart has just
+        # stamped its own tail window on all of them — updating only the
+        # slave `xaxis` would let the master's tail win via the constraint.
+        fig.update_xaxes(range=[x0, x1])
+
+        # Server-side Y fit to the visible window (same 10% pad as the client
+        # refit JS). The delivered figure is already correctly scaled, so the
+        # clientside refit becomes a no-op on data refreshes — no more
+        # full-height stretch followed by a slow re-scale on every tick.
+        def _fit(*series):
+            s = pd.concat([pd.Series(x, dtype="float64") for x in series]).dropna()
+            if s.empty:
+                return None
+            lo, hi = float(s.min()), float(s.max())
+            if lo == hi:
+                lo, hi = lo - 1, hi + 1
+            pad = (hi - lo) * 0.10
+            return [lo - pad, hi + pad]
+
+        # The user's own y-zoom arrives in relayoutData (drag/scroll on an
+        # axis) — while panned, those explicit ranges beat the server fit, so
+        # a refresh doesn't yank a hand-scaled axis back to auto.
+        user_y = {}
+        if panned and relayout_data:
+            for ax in ('yaxis', 'yaxis2', 'yaxis4'):
+                k0, k1 = f'{ax}.range[0]', f'{ax}.range[1]'
+                if k0 in relayout_data and k1 in relayout_data:
+                    user_y[ax] = [float(relayout_data[k0]), float(relayout_data[k1])]
+
+        # Y Auto-Scale OFF → the server writes y ranges ONLY on fresh-view
+        # triggers (new coordinate space / toggle flips); on every other
+        # trigger the axes stay untouched and uirevision preserves whatever
+        # manual scale the user set on the price axis.
+        y_auto = bool(yauto_value)
+        fresh_view = trigger in ('ticker-input', 'source-radio',
+                                 'timeframe-dropdown', 'yauto-check')
+
+        df_vis = df_active[(df_active['x_idx'] >= x0) & (df_active['x_idx'] <= x1)]
+        if not df_vis.empty and (y_auto or fresh_view):
+            y_price = _fit(df_vis['high'], df_vis['low']) if 'high' in df_vis.columns else _fit(df_vis['close'])
+            y_pa = _fit(df_vis['buy_pressure'], -df_vis['sell_pressure'])
+            y_pb = _fit(df_vis['cvd_all_end']) if 'cvd_all_end' in df_vis.columns else None
+            # L2 on: widen the price fit so liquidity bands worth seeing
+            # (>=15% of the strongest resting size in the visible window)
+            # aren't clipped — but ignore faint fringe levels so one deep
+            # stray wall can't squash the candles.
+            if l2_data is not None and l2_data.get("z") is not None and y_price:
+                _z = l2_data["z"]
+                _n_cols = _z.shape[1]
+                _col0 = max(0, int(x0) - (N_total - _n_cols))
+                _col1 = min(_n_cols - 1, int(x1) - (N_total - _n_cols))
+                if _col0 <= _col1 and _z.max() > 0:
+                    _win = _z[:, _col0:_col1 + 1]
+                    # Same liquidity reference as the heatmap colorscale and
+                    # the clientside refit: 98th percentile of positive sizes
+                    # (trace zmax), NOT the raw max an iceberg can own.
+                    _zref = float(np.percentile(_z[_z > 0], 98))
+                    _liquid = _win.max(axis=1) >= 0.15 * _zref
+                    if _liquid.any():
+                        _lv = [l2_data["y_levels"][i] for i in range(len(_liquid)) if _liquid[i]]
+                        _pad = max(0.02, 0.05 * (max(_lv) - min(_lv)))
+                        y_price = [min(y_price[0], min(_lv) - _pad),
+                                   max(y_price[1], max(_lv) + _pad)]
+            y_price = user_y.get('yaxis', y_price)
+            y_pa = user_y.get('yaxis2', y_pa)
+            y_pb = user_y.get('yaxis4', y_pb)
+            if y_price: fig.update_layout(yaxis=dict(range=y_price))
+            if y_pa:    fig.update_layout(yaxis2=dict(range=y_pa))
+            if y_pb:    fig.update_layout(yaxis4=dict(range=y_pb))
+        elif (not y_auto) and isinstance(manual_y_store, dict):
+            # Manual mode, non-fresh rebuild: bake the user's hand-set ranges
+            # into the served figure. uirevision alone cannot protect them —
+            # it only preserves true GUI drags, and build_chart writes its own
+            # tail-fit ranges that would win on every new candle otherwise.
+            for _ax in ('yaxis', 'yaxis2', 'yaxis4'):
+                _rng = manual_y_store.get(_ax)
+                if _rng and len(_rng) == 2:
+                    fig.update_layout({_ax: dict(range=[float(_rng[0]), float(_rng[1])])})
+
+        # Manual mode unlocks the y axes: price-axis drag/wheel AND the y
+        # component of plot-area pans both stick (tracked by the manual-y
+        # Store and re-applied above).
+        fig.update_layout(yaxis=dict(fixedrange=y_auto),
+                          yaxis2=dict(fixedrange=y_auto),
+                          yaxis4=dict(fixedrange=y_auto))
+
+        # Axis uirevision: changes only when the x-coordinate space itself
+        # changes (bars added/removed shift x_idx), so Plotly then accepts the
+        # server-computed ranges above; while data is unchanged the user's
+        # pan/zoom state is preserved as before. The global uirevision keeps
+        # legend toggles etc. stable per ticker.
+        # bars_req is part of the coordinate space: growing the render cap
+        # remaps every x_idx, so the server-computed ranges must win then too.
+        # EVERY x axis must carry the revision: the subplots share x via
+        # `matches`, and a matched axis whose uirevision did NOT change would
+        # restore its old range and drag the primary axis back with it.
+        axis_rev = f"{ticker}:{current_state['len']}:{current_state['oldest_date']}:{bars_req}"
+        # Manual y mode: the y axes get a DATA-INDEPENDENT revision, so the
+        # user's hand-set scale survives every refresh (len grows each bar —
+        # with the data-sensitive revision Plotly would drop the client's y
+        # state and adopt build_chart's baked tail fit on every new candle).
+        # Fresh-view triggers change ticker/tf (or the toggle itself), which
+        # changes this string too, letting the server's one-shot fit land.
+        y_rev = axis_rev if y_auto else f"{ticker}:{active_tf}:manual"
+        for ax in list(fig.layout):
+            if ax.startswith('xaxis'):
+                fig.update_layout({ax: dict(uirevision=axis_rev)})
+            elif ax in ('yaxis', 'yaxis2', 'yaxis4'):
+                fig.update_layout({ax: dict(uirevision=y_rev)})
+
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            uirevision=ticker,
+        )
+
+        import datetime
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
+        
+        # Return fig, text, empty string for loading, new state, pan state
+        return fig, msg, "", current_state_json, json.dumps(pan_state)
+        
+    except PreventUpdate:
+        raise
+    except Exception as e:
+        logging.error(f"Error building chart: {e}")
+        import traceback
+        traceback.print_exc()
+        empty_fig = go.Figure()
+        empty_fig.update_layout(template="plotly_dark", title=dict(text=f"Error: {e}", font=dict(color="red")))
+        return empty_fig, f"Error: {e}", "", last_state_json, pan_state_json
+
+app.clientside_callback(
+    dash.ClientsideFunction(
+        namespace='clientside',
+        function_name='refit_y'
+    ),
+    Output('clientside-dummy', 'children'),
+    [Input('main-chart', 'relayoutData'),
+     Input('main-chart', 'figure')]
+)
+
+# Manual-y tracker: records every user y movement (plot-area pan, price-axis
+# drag/wheel, double-click refit result) so the server can re-apply the ranges
+# on every rebuild while Y Auto-Scale is off.
+app.clientside_callback(
+    dash.ClientsideFunction(
+        namespace='clientside',
+        function_name='track_manual_y'
+    ),
+    Output('manual-y', 'data'),
+    [Input('main-chart', 'relayoutData'),
+     Input('yauto-check', 'value')],
+    State('manual-y', 'data'),
+    prevent_initial_call=True,
+)
+
+# Bars-to-show growth: clientside so it can never be aborted by a newer
+# relayout event (see grow_scrollback in index_string).
+app.clientside_callback(
+    dash.ClientsideFunction(
+        namespace='clientside',
+        function_name='grow_scrollback'
+    ),
+    Output('bars-to-show', 'data'),
+    Input('main-chart', 'relayoutData'),
+    [State('bars-to-show', 'data'),
+     State('last-data-state', 'data')],
+    prevent_initial_call=True,
+)
+
+
+# Progressive scrollback, server half. The x axis is a LINEAR bar index
+# (x_idx: 0..n_active-1), NOT a date — hitting the left edge or zooming out
+# past what's rendered means the user wants MORE BARS:
+#   * render-cap limited (n_active == bars-to-show): the CLIENTSIDE
+#     grow_scrollback callback doubles bars-to-show (it must run in the
+#     browser: a server callback on relayoutData gets aborted whenever the
+#     y-refit fires a newer relayout event, eating the growth).
+#   * data limited (n_active < bars-to-show): this callback doubles
+#     days-to-load so the next serve pulls a deeper window from Mongo.
+# Both stores are per-TF, so growth on one timeframe never slows the others.
+@app.callback(
+    Output('days-to-load', 'data'),
+    Input('main-chart', 'relayoutData'),
+    [State('days-to-load', 'data'),
+     State('bars-to-show', 'data'),
+     State('last-data-state', 'data')]
+)
+def handle_panning(relayout_data, current_days, current_bars, last_state_json):
+    if not relayout_data:
+        raise PreventUpdate
+    if 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
+        x0, x1 = float(relayout_data['xaxis.range[0]']), float(relayout_data['xaxis.range[1]'])
+    elif isinstance(relayout_data.get('xaxis.range'), (list, tuple)):
+        x0, x1 = float(relayout_data['xaxis.range'][0]), float(relayout_data['xaxis.range'][1])
+    else:
+        raise PreventUpdate
+
+    if not last_state_json or last_state_json == "{}":
+        raise PreventUpdate
+
+    try:
+        state = json.loads(last_state_json)
+        active_tf = state.get('active_tf')
+        n_active = state.get('n_active')
+        if not n_active:
+            raise PreventUpdate
+
+        if x0 > 10:   # only deepen when the view actually reaches the oldest bars
+            raise PreventUpdate
+
+        cur_bars = _resolve_bars(current_bars, active_tf)
+        if n_active >= cur_bars:
+            raise PreventUpdate   # cap-limited: clientside bars growth handles it
+
+        if isinstance(current_days, dict):
+            cur = float(current_days.get('days', 3)) if current_days.get('tf') == active_tf else 3.0
+        else:
+            cur = float(current_days or 3)
+        # The effective window is max(store, SERVE_WINDOW_DAYS default) —
+        # double from THAT, or the store creeps below the default forever.
+        cur = max(cur, float(SERVE_WINDOW_DAYS.get(active_tf) or 0))
+        new_days = min(cur * 2 + 1, 365)
+        if new_days > cur:
+            logging.info(f"Scrollback: data-limited, growing loaded days {cur} -> {new_days} ({active_tf})")
+            return {'days': new_days, 'tf': active_tf}
+
+        raise PreventUpdate
+    except PreventUpdate:
+        raise
+    except Exception as e:
+        logging.error(f"Error in handle_panning: {e}")
+        raise PreventUpdate
+
+# NOTE: no State('main-chart', 'figure') — pulling the figure back to the
+# server on EVERY relayout event (each pan step / scroll tick) re-uploaded
+# multiple MB of JSON per gesture and made panning feel sluggish. The pie
+# trace positions are cached in DATA_CACHE by update_graph instead.
+@app.callback(
+    [Output('main-chart', 'figure', allow_duplicate=True),
+     Output('pan-state', 'data', allow_duplicate=True)],
+    Input('main-chart', 'relayoutData'),
+    prevent_initial_call=True
+)
+def update_pie_charts_on_pan(relayout_data):
+    try:
+        if not relayout_data:
+            raise PreventUpdate
+            
+        # Sometimes relayoutData has 'xaxis.range' as a list instead of 'xaxis.range[0]'
+        x0 = None
+        x1 = None
+        if 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
+            x0 = float(relayout_data['xaxis.range[0]'])
+            x1 = float(relayout_data['xaxis.range[1]'])
+        elif 'xaxis.range' in relayout_data:
+            x0 = float(relayout_data['xaxis.range'][0])
+            x1 = float(relayout_data['xaxis.range'][1])
+            
+        if x0 is None or x1 is None:
+            # User might have clicked autorange (reset), we return the pan_state but we can't update pies
+            if 'xaxis.autorange' in relayout_data:
+                return dash.no_update, json.dumps({"panned": False, "time": 0})
+            raise PreventUpdate
+            
+        # We record any panning action
+        new_pan_state = json.dumps({"panned": True, "time": time.time(), "x0": x0, "x1": x1})
+            
+        df = DATA_CACHE.get('df')
+        pie_chart_count = DATA_CACHE.get('pie_chart_count', 0)
+        pie_indices = DATA_CACHE.get('pie_indices') or []
+
+        if df is None or pie_chart_count == 0 or not pie_indices:
+            raise PreventUpdate
+
+        # Filter to visible range
+        df_vis = df[(df['x_idx'] >= x0) & (df['x_idx'] <= x1)]
+        n_pies = int(pie_chart_count)
+
+        chunk_size = (x1 - x0) / n_pies if n_pies > 0 else 1
+
+        patched_fig = dash.Patch()
+
+        if len(pie_indices) != n_pies:
+            raise PreventUpdate
+            
+        chunks = []
+        vols = []
+        for k in range(n_pies):
+            c_start = x0 + k * chunk_size
+            c_end = x0 + (k + 1) * chunk_size
+            chunk = df_vis[(df_vis['x_idx'] >= c_start) & (df_vis['x_idx'] < c_end)]
+            chunks.append(chunk)
+            if len(chunk) > 0:
+                vols.append(float(chunk["buy_pressure"].sum() + chunk["sell_pressure"].sum()))
+            else:
+                vols.append(0.0)
+                
+        max_vol = max(vols) if vols and max(vols) > 0 else 1.0
+        overall_width = 0.94
+        width = overall_width / n_pies
+            
+        for k, idx in enumerate(pie_indices):
+            chunk = chunks[k]
+            buy = float(chunk["buy_pressure"].sum()) if len(chunk) > 0 else 0.0
+            sell = float(chunk["sell_pressure"].sum()) if len(chunk) > 0 else 0.0
+            
+            if (buy + sell) > 0:
+                factor = ((buy + sell) / max_vol) ** 0.5
+                factor = max(0.15, factor)
+                if n_pies >= 50:
+                    factor *= 1.5
+                    
+                # Perfectly align with the center of the candles in this chunk
+                c_center = chunk["x_idx"].mean()
+                x_span = x1 - x0
+                if x_span > 0:
+                    x_center = (c_center - x0) / x_span * overall_width
+                else:
+                    x_center = k * width + (width / 2.0)
+                
+                radius = width * 0.45 * factor
+                x_center = max(radius, min(overall_width - radius, x_center))
+                    
+                d_x = [x_center - radius, x_center + radius]
+                d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor]
+                
+                patched_fig['data'][idx]['values'] = [buy, sell]
+                patched_fig['data'][idx]['marker'] = {'colors': ["rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)"]}
+                patched_fig['data'][idx]['hoverinfo'] = "text"
+                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+            else:
+                # Hide empty chunks completely by zeroing their domain
+                d_x = [0, 0]
+                d_y = [0, 0]
+                
+                patched_fig['data'][idx]['values'] = [0, 0]
+                patched_fig['data'][idx]['marker'] = {'colors': ["rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)"]}
+                patched_fig['data'][idx]['hoverinfo'] = "none"
+                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+                
+        logging.info(f"Patch successful for {len(pie_indices)} pies.")
+        return patched_fig, new_pan_state
+        
+    except PreventUpdate:
+        raise
+    except Exception as e:
+        import traceback
+        with open('pie_err.log', 'w') as f:
+            f.write(traceback.format_exc())
+            f.write('\nRelayout Data: ' + str(relayout_data))
+        raise PreventUpdate
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=8050)

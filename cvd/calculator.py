@@ -7,20 +7,23 @@ Source-aware pipeline:
   source='ibkr_tick'   — IBKR real-time tick data; buying_volume/selling_volume/delta
                          pre-computed by tick_collector.py (quote-based aggressor).
                          Wick decomposition is SKIPPED.
-  source='alpaca_tick' — Alpaca real-time/historical tick data; buying_volume/selling_volume/delta
-                         pre-computed by alpaca_collector.py / alpaca_backfill.py.
+  source='ibkr_tick' — IBKR real-time/historical tick data; buying_volume/selling_volume/delta
+                         pre-computed by tick_collector.py / backfill.py.
                          Wick decomposition is SKIPPED.
   source='ibkr_hist'   — 1-sec bars from reqHistoricalData (no tick-level quotes).
                          Wick decomposition applied (same as FinViz).
   source='finviz_wick' — FinViz Elite 1-min bars.  Wick decomposition applied.
 
 add_cvd_columns() detects which rows have pre-computed values and branches
-accordingly, so mixed DataFrames (ibkr_tick + alpaca_tick + finviz_wick) work
+accordingly, so mixed DataFrames (ibkr_tick + finviz_wick) work
 transparently.
 """
 
+import numpy as np
 import pandas as pd
 from pymongo import MongoClient
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 # ─────────────────────────────────────────
@@ -112,50 +115,61 @@ def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0)
 def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
     """Core closing-cross detection on minute-level (or coarser) volume bars.
 
-    The closing auction footprint spans two bars: the main cross on 15:59
-    (~2500x a normal after-hours minute) plus an overflow/official print on
-    16:00 (~167x), after which volume drops back to normal by 16:01. So:
-      1. anchor = the afternoon (>=12:00) bar with the largest volume, flagged
-         only if it dwarfs that day's regular-session median (> `mult`x). This
-         lands on 15:59 normally, or the early-close print (e.g. 12:59) on a
-         half-day — no clock time is hardcoded.
-      2. spill  = walk FORWARD from the anchor, also flagging each following bar
-         while it stays elevated (> `spill_mult`x the regular median), stopping
-         at the first normal bar. This catches the 16:00 overflow but leaves
-         16:01 onward (genuine after-hours) and the pre-close ramp (15:55-15:58,
-         genuine continuous trading) untouched. See Personal Study Log §8.
-
-    Note: feeds that don't carry the official closing cross (e.g. Alpaca's
-    IEX-only feed — the cross prints on the listing exchange) simply won't
-    have an anchor exceeding `mult`x the median, so nothing gets flagged.
+    The closing auction footprint spans two bars: the main cross on the last
+    regular minute (~2500x a normal after-hours minute) plus an overflow/
+    official print on the following one (~167x), after which volume drops back
+    to normal. So:
+      1. Pick the day's closing window — 15:59-16:01 normally, or 12:59-13:01
+         when the day is a half-day. A half-day is decided by EVIDENCE, not by
+         where the data happens to end: a genuine early close leaves only thin
+         after-hours prints between 13:10 and 15:55 (well under the morning
+         median), while a normal day being watched live before ~15:00 simply
+         has no verdict yet — and gets NO early-close flag, so a 13:00 block
+         trade can't be mistaken for the closing cross mid-session.
+      2. anchor = the largest-volume bar inside the window, flagged only if it
+         dwarfs the day's 09:30-13:00 median (> `mult`x) — a quiet day whose
+         feed lacks the official cross has no anchor and nothing is flagged.
+      3. spill  = walk FORWARD from the anchor, also flagging each following bar
+         while it stays elevated (> `spill_mult`x the median), stopping at the
+         first normal bar. This catches the 16:00 overflow but leaves later
+         genuine after-hours and the pre-close ramp (15:55-15:58) untouched.
+         See Personal Study Log §8.
     """
-    minute = df.index.hour * 60 + df.index.minute
-    reg = (minute >= 570) & (minute < 960)                 # 09:30-16:00
-    reg_med = df.loc[reg].groupby(lambda ix: ix.date())["volume"].median()
-
     flag = pd.Series(False, index=df.index)
-    
-    # Restrict anchor search to typical closing cross windows: 12:59-13:01 (early close) and 15:59-16:01 (regular close).
-    # This prevents massive after-hours news spikes (e.g. 16:20) from being misidentified as the closing auction.
-    is_candidate = ((minute >= 779) & (minute <= 781)) | ((minute >= 959) & (minute <= 961))
-    candidates = df[is_candidate]
-    
-    for d, g in candidates.groupby(lambda ix: ix.date()):
+
+    for d, g in df.groupby(lambda ix: ix.date()):
         if g.empty:
             continue
-        med = reg_med.get(d, float("nan"))
-        anchor = g["volume"].idxmax()
-        if not (pd.isna(med) or g.loc[anchor, "volume"] > mult * med):
+        minute = g.index.hour * 60 + g.index.minute
+
+        # Baseline: 09:30-13:00 volume, regular-session on both day types.
+        base = g.loc[(minute >= 570) & (minute < 780), "volume"]
+        base_med = base.median() if not base.empty else 0
+        if not base_med > 0:
+            continue
+
+        # Half-day evidence: enough post-13:00 bars, all thin.
+        aft = g.loc[(minute >= 790) & (minute <= 955), "volume"]
+        if len(aft) >= 5 and aft.median() < base_med * 0.1:
+            window_mask = (minute >= 779) & (minute <= 781)    # 12:59-13:01
+        else:
+            window_mask = (minute >= 959) & (minute <= 961)    # 15:59-16:01
+        window = g.loc[window_mask, "volume"]
+        if window.empty:
+            continue
+
+        anchor = window.idxmax()
+        if not window.loc[anchor] > base_med * mult:
             continue
         flag.loc[anchor] = True
-        
-        # Spill logic must iterate over the full day's index, not just the candidates
-        day_idx = df[df.index.date == d].index
-        for k in range(day_idx.get_loc(anchor) + 1, len(day_idx)):   # forward spill
-            if df.loc[day_idx[k], "volume"] > spill_mult * med:
-                flag.loc[day_idx[k]] = True
+
+        pos = g.index.get_loc(anchor)
+        for ts in g.index[pos + 1:]:
+            if g.loc[ts, "volume"] > base_med * spill_mult:
+                flag.loc[ts] = True
             else:
                 break
+
     return flag
 
 
@@ -173,6 +187,31 @@ def _apply_wick_decomp(df: pd.DataFrame) -> pd.DataFrame:
     df["selling_volume"] = results["selling_volume"]
     df["delta"]          = results["delta"]
     return df
+
+
+def _winsorize_delta(delta: pd.Series, q: float = 0.995) -> pd.Series:
+    """Cap each bar's |delta| at the per-session q-quantile, preserving sign.
+
+    A single block/cross print (e.g. the ~1M-share cross NVDA printed at 15:53)
+    lands entirely on one side and would otherwise dominate the CVD curve — the
+    largest single trade accounts for ~35% of a 1-sec bar's gross flow and flips
+    ~40% of 1-sec bars' direction. These mega-prints are crosses/dark-pool/combo
+    legs, NOT aggressive lit flow, so capping their weight is a noise reduction,
+    not a fit to price. Quantile is computed per trading day so a quiet day and a
+    news day get their own scale.
+
+    Requires a DatetimeIndex. Returns a Series aligned to `delta`. Operates
+    positionally so it is safe on a raw-tick index with duplicate timestamps.
+    """
+    vals = delta.to_numpy(dtype=float).copy()
+    days = np.asarray(delta.index.date)
+    for day in np.unique(days):
+        mask = days == day
+        a = np.abs(vals[mask])
+        cap = np.quantile(a, q)
+        if cap > 0:
+            vals[mask] = np.sign(vals[mask]) * np.minimum(a, cap)
+    return pd.Series(vals, index=delta.index)
 
 
 def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -226,13 +265,19 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
         and "delta" in df.columns
     )
 
-    if has_precomputed and has_source:
-        # Rows that need wick decomposition: any source that isn't a real-tick source,
-        # or rows where buying_volume is missing despite being tagged as tick data.
-        # Real-tick sources (ibkr_tick, alpaca_tick) have pre-computed buy/sell/delta.
+    if has_precomputed:
+        # Rows with a stored buy/sell/delta keep it — that covers ibkr_tick
+        # (real aggressor) AND tier docs whose split was BVC-estimated at
+        # write time (history package). Only rows missing any of the three
+        # get the legacy wick decomposition.
         needs_wick = (
-            ~df["source"].isin(["ibkr_tick", "alpaca_tick"])
-        ) | df["buying_volume"].isna()
+            df["buying_volume"].isna()
+            | df["selling_volume"].isna()
+            | df["delta"].isna()
+        )
+
+        if not has_source:
+            df["source"] = pd.NA
 
         if needs_wick.any():
             decomp = _apply_wick_decomp(df[needs_wick])
@@ -262,11 +307,8 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # auction)" line stays available for comparison. See Personal Study Log §8.
     df["is_auction"]     = _flag_auction(df)
     
-    # Do not neutralize real tick sources. Their high volume at 16:00 represents genuine 
-    # directional aggressive trades with real Bid/Ask matching, not a single MOC print.
-    if "source" in df.columns:
-        real_ticks = df["source"].isin(["alpaca_tick", "ibkr_tick"])
-        df.loc[real_ticks, "is_auction"] = False
+    # We apply neutralization for all sources, including ibkr_tick, because the 
+    # 16:00 closing cross (MOC) prints as a huge block volume, not an aggressive hit.
 
     df["delta_raw"]      = df["delta"]                       # before neutralization
     auc = df["is_auction"]
@@ -278,6 +320,39 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # CVD (all-time): default = auction-neutralized; raw = includes the auction.
     df["cvd_all"]     = df["delta"].cumsum()
     df["cvd_all_raw"] = df["delta_raw"].cumsum()
+
+    # ── Noise-reduced CVD variants (ADDITIVE — cvd_all above is unchanged) ─────
+    # Infrastructure for the tick-CVD upgrade. Two independent noise reductions:
+    #   delta_wins       — per-session winsorized delta (block/cross prints capped)
+    #   cvd_session      — cumulative delta reset each trading day (drops prior-day
+    #                      drift that the all-time cumsum drags forward; better for
+    #                      intraday price tracking)
+    #   cvd_wins         — all-time cumsum of the winsorized delta
+    #   cvd_session_wins — session-anchored + winsorized (both fixes together)
+    # NOTE: these improve the bar-level buy/sell signal and remove outlier
+    # domination, but they do NOT by themselves fix the cumulative-LEVEL vs price
+    # divergence — that is driven by systematic aggressor misclassification and
+    # requires the quote-lag fix (see ibkr/tick_collector.py instrumentation and
+    # scripts/analyze_quote_lag.py). Kept additive so nothing downstream breaks.
+    df["delta_wins"]       = _winsorize_delta(df["delta"])
+    # Session-anchored cumsums computed positionally (duplicate-timestamp safe on
+    # a raw-tick index). groupby(...).cumsum() preserves row order, so .values
+    # assignment aligns correctly even when the index has duplicate labels.
+    _day = df.index.date
+    df["cvd_session"]      = df.groupby(_day)["delta"].cumsum().values
+    df["cvd_wins"]         = df["delta_wins"].cumsum().values
+    df["cvd_session_wins"] = df.groupby(_day)["delta_wins"].cumsum().values
+
+    # ── Independent BVC-estimated CVD (ADDITIVE — wick/tick columns untouched) ─
+    # A parallel estimate of the same order flow using Bulk Volume Classification
+    # on close-to-close moves, regardless of what produced buying_volume above.
+    # Rendered as its own legend entry ("CVD (BVC est.)") so the tick/wick CVD
+    # and the BVC CVD can be compared side by side on any chart.
+    from history.bvc import bvc_split   # local import: keeps cvd↔history acyclic
+    _bvc = bvc_split(df["close"], df["volume"])
+    df["delta_bvc"] = _bvc["delta"].to_numpy()
+    df.loc[auc, "delta_bvc"] = 0.0      # same closing-auction neutralization
+    df["cvd_bvc"] = df["delta_bvc"].cumsum()
 
     return df
 
@@ -302,6 +377,7 @@ TIMEFRAME_RULE = {
 # These two extra keys are omitted from TIMEFRAME_RULE (FinViz base) because
 # resampling 1-min bars to 1-sec would upsample and produce empty rows.
 TIMEFRAME_RULE_IBKR = {
+    "raw_tick": "0S", # Special case for raw ticks
     "1sec":   "1s",
     "5sec":   "5s",
     **TIMEFRAME_RULE,
@@ -338,12 +414,38 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         cvd_all_raw_end=("cvd_all_raw", "last"),# CVD all-time (includes auction)
         auction_vol=("auction_volume", "sum"),  # auction volume falling in this bar
     )
+    # Noise-reduced CVD variants (carried through only when add_cvd_columns
+    # produced them, so older callers / bare frames still resample cleanly).
+    for src, dst, how in [
+        ("delta_wins",       "delta_wins_sum",       "sum"),
+        ("cvd_session",      "cvd_session_end",      "last"),
+        ("cvd_wins",         "cvd_wins_end",         "last"),
+        ("cvd_session_wins", "cvd_session_wins_end", "last"),
+        ("delta_bvc",        "delta_bvc_sum",        "sum"),
+        ("cvd_bvc",          "cvd_bvc_end",          "last"),
+    ]:
+        if src in df_1min.columns:
+            agg_spec[dst] = (src, how)
     if "source" in df_1min.columns:
         # Carry the (dominant) data source so the visualizer can shade
         # wick-estimated regions on every timeframe, not just the base one.
         agg_spec["source"] = ("source", "first")
-
     df_agg = df_1min.resample(rule).agg(**agg_spec).dropna(subset=["open"])
+
+    if "quality" in df_1min.columns:
+        # Worst-of quality per bucket: a coarse bar mixing real tick flow and
+        # estimates must still read as estimated ('mixed') in the chart.
+        # Vectorized via rank min/max — a Python reducer per bucket cost ~1s
+        # on a 19k-row 1-min frame (one call per output bar).
+        _RANK = {"tick": 4, "mixed": 3, "bvc": 2, "wick": 1, "neutral": 0}
+        _FROM_RANK = {v: k for k, v in _RANK.items()}
+        rank = df_1min["quality"].map(_RANK)
+        rmin = rank.resample(rule).min()
+        rmax = rank.resample(rule).max()
+        q = rmin.map(_FROM_RANK)                      # single quality → itself
+        q[(rmin != rmax) & (rmax == _RANK["tick"])] = "mixed"  # tick + estimates
+        # other mixtures already read as their worst (lowest-rank) member
+        df_agg["quality"] = q.reindex(df_agg.index)
 
     df_agg["net_pressure"] = df_agg["buy_pressure"] - df_agg["sell_pressure"]
 
@@ -378,11 +480,42 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
     return df_agg
 
 
+def _reclassify_raw_docs(docs: list[dict], max_age_ms: float) -> list[dict]:
+    """Overwrite each raw-tick doc's `delta` using stale-quote demotion.
+
+    Ticks must be re-sorted by time (the tick rule is sequential). Docs missing
+    bid/ask/quote_age_ms (pre-instrumentation ticks) keep their stored delta.
+    """
+    from cvd.aggressor import classify_demote_stale
+
+    docs = sorted(docs, key=lambda d: d["date"])
+    have = [("bid" in d and "ask" in d and "quote_age_ms" in d) for d in docs]
+    if not any(have):
+        return docs  # nothing instrumented; leave stored delta untouched
+
+    price = np.array([d["price"] for d in docs], dtype=float)
+    size  = np.array([d["size"]  for d in docs], dtype=float)
+    bid   = np.array([d.get("bid", np.nan) for d in docs], dtype=float)
+    ask   = np.array([d.get("ask", np.nan) for d in docs], dtype=float)
+    age   = np.array([d.get("quote_age_ms", np.nan) for d in docs], dtype=float)
+
+    new_delta = classify_demote_stale(price, size, bid, ask, age, max_age_ms=max_age_ms)
+    for d, nd, ok in zip(docs, new_delta, have):
+        if ok:                       # only override instrumented ticks
+            d["delta"] = float(nd)
+    return docs
+
+
 # ─────────────────────────────────────────
 # 4. Load data from MongoDB
 # ─────────────────────────────────────────
 
-def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None) -> pd.DataFrame:
+def load_from_mongo(
+    ticker: str,
+    timeframe: str = "i1",
+    days: int | None = None,
+    reclassify_stale_ms: float | None = None,
+) -> pd.DataFrame:
     """
     Load a given ticker/timeframe from MongoDB finviz_db.candles.
 
@@ -395,27 +528,55 @@ def load_from_mongo(ticker: str, timeframe: str = "i1", days: int | None = None)
           for tick-based timeframes whose `date` field is a real datetime
           (FinViz 'i1' docs store dates as strings, which a datetime range
           query would silently exclude).
+
+    reclassify_stale_ms: (raw_tick only) if set, re-derive each tick's buy/sell
+          delta with quotes older than this many ms demoted to the tick rule
+          (quote-lag fix). Requires instrumented ticks carrying bid/ask/
+          quote_age_ms; ticks without them keep their stored delta. None (default)
+          uses the delta as computed live by tick_collector.
     """
     client = MongoClient("mongodb://localhost:27017/")
-    collection = client["finviz_db"]["candles"]
+    if timeframe == "raw_tick":
+        collection = client["finviz_db"]["raw_ticks"]
+        query = {"ticker": ticker}
+        if days is not None:
+            now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            query["date"] = {"$gte": now_et - timedelta(days=days)}
+        proj = {"_id": 0, "date": 1, "price": 1, "size": 1, "delta": 1, "source": 1}
+        if reclassify_stale_ms is not None:
+            proj.update({"bid": 1, "ask": 1, "quote_age_ms": 1})
+        docs = list(collection.find(query, proj))
 
-    query = {"ticker": ticker, "timeframe": timeframe}
-    if days is not None:
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-        # Stored dates are ET-naive, so compute the cutoff in ET as well.
-        now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
-        query["date"] = {"$gte": now_et - timedelta(days=days)}
+        if reclassify_stale_ms is not None and docs:
+            docs = _reclassify_raw_docs(docs, reclassify_stale_ms)
 
-    docs = list(collection.find(
-        query,
-        {
-            "_id": 0,
-            "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
-            # Pre-computed by tick_collector (ibkr_tick) — absent for FinViz docs.
-            "buying_volume": 1, "selling_volume": 1, "delta": 1, "source": 1,
-        }
-    ))
+        # Convert raw ticks to OHLCV format so the rest of the pipeline works seamlessly
+        for doc in docs:
+            p = doc.pop("price")
+            s = doc.pop("size")
+            d = doc["delta"]
+            doc["open"] = doc["high"] = doc["low"] = doc["close"] = p
+            doc["volume"] = s
+            doc["buying_volume"] = s if d > 0 else 0.0
+            doc["selling_volume"] = s if d < 0 else 0.0
+    else:
+        collection = client["finviz_db"]["candles"]
+        query = {"ticker": ticker, "timeframe": timeframe}
+        if days is not None and timeframe != "i1":
+            now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            cutoff = now_et - timedelta(days=days)
+            query["date"] = {"$gte": cutoff}
+        
+        docs = list(collection.find(
+            query,
+            {
+                "_id": 0,
+                "date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+                # Pre-computed by tick_collector (ibkr_tick) — absent for FinViz docs.
+                "buying_volume": 1, "selling_volume": 1, "delta": 1, "source": 1,
+                "quality": 1,
+            }
+        ))
 
     if not docs:
         print(f"[MongoDB] No data found for {ticker} ({timeframe})")
@@ -434,6 +595,7 @@ def run_pipeline(
     ticker: str,
     base_timeframe: str = "i1",
     days: int | None = None,
+    only: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Load bars from MongoDB → compute CVD → aggregate into every timeframe.
@@ -445,6 +607,11 @@ def run_pipeline(
                          '1sec' → IBKR 1-second bars (tick_collector output)
         days           : only load the last N days (tick timeframes only;
                          see load_from_mongo). None = everything.
+        only           : restrict frames to these timeframe labels. The Dash
+                         app displays a single timeframe, so aggregating all
+                         12 on every callback is wasted work; None (default)
+                         keeps the build-everything behavior for the static
+                         HTML chart with timeframe buttons.
 
     Returns:
         df_base : base-granularity bars with buy/sell/delta/cvd columns
@@ -463,8 +630,30 @@ def run_pipeline(
     df_base = add_cvd_columns(df_raw)
 
     # Choose the right timeframe map: IBKR adds 1sec / 5sec buttons to the chart.
-    tf_map = TIMEFRAME_RULE_IBKR if base_timeframe == "1sec" else TIMEFRAME_RULE
-    frames = {tf: aggregate_pressure(df_base, tf) for tf in tf_map}
+    if base_timeframe in ["1sec", "raw_tick"]:
+        tf_map = TIMEFRAME_RULE_IBKR
+    else:
+        tf_map = TIMEFRAME_RULE
+        
+    frames = {}
+    for tf, rule in tf_map.items():
+        if only is not None and tf not in only:
+            continue
+        if tf == "raw_tick":
+            raw_df = df_base.copy()
+            raw_df = raw_df.rename(columns={
+                "buying_volume": "buy_pressure",
+                "selling_volume": "sell_pressure",
+                "cvd_all": "cvd_all_end",
+                "cvd_all_raw": "cvd_all_raw_end",
+                "cvd_bvc": "cvd_bvc_end",
+                "auction_volume": "auction_vol"
+            })
+            raw_df["net_pressure"] = raw_df["buy_pressure"] - raw_df["sell_pressure"]
+            raw_df["auction_frac"] = (raw_df["auction_vol"] / raw_df["volume"]).fillna(0.0) if "auction_vol" in raw_df.columns else 0.0
+            frames["raw_tick"] = raw_df
+            continue
+        frames[tf] = aggregate_pressure(df_base, tf)
 
     sources = df_base["source"].value_counts().to_dict() if "source" in df_base.columns else {}
     print(f"[Pipeline] Base bars  : {len(df_base)}  sources={sources}")

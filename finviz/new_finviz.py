@@ -10,6 +10,14 @@ client = MongoClient("mongodb://localhost:27017/")
 db = client["finviz_db"]
 collection = db["candles"]
 
+# Index the upsert key. Without it, every upsert in save_candles_to_mongo does a
+# full collection scan, so re-saving ~22k bars each loop was O(n^2) (~80s); with
+# the index it's ~0.7s. create_index is idempotent (no-op if it already exists).
+collection.create_index(
+    [("ticker", 1), ("timeframe", 1), ("date", 1)],
+    unique=True, name="ticker_tf_date",
+)
+
 BASE_URL = "https://elite.finviz.com/quote_export"
 session = requests.Session()
 
@@ -102,7 +110,17 @@ def fetch_and_save(ticker: str, timeframe: str = 'i1') -> list[dict]:
     Fetch OHLCV from FinViz and save to MongoDB in one step.
     Returns the fetched candles.
     """
-    candles = get_candle_data(ticker, timeframe)
+    try:
+        candles = get_candle_data(ticker, timeframe)
+    except FinvizTokenError:
+        print("[FinViz] Token expired. Attempting auto-renewal via finviz_curl...")
+        from finviz import finviz_curl
+        session = finviz_curl.login()
+        new_token = finviz_curl.get_token(session)
+        finviz_curl.update_api_keys(new_token)
+        print("[FinViz] Token successfully auto-renewed. Retrying fetch...")
+        candles = get_candle_data(ticker, timeframe)
+        
     save_candles_to_mongo(ticker, timeframe, candles)
     return candles
 
