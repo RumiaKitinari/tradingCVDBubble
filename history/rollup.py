@@ -28,6 +28,7 @@ import logging
 import time
 from datetime import timedelta
 
+import numpy as np
 import pandas as pd
 
 from history.bvc import bvc_split
@@ -39,7 +40,37 @@ from history.store import get_watermark, set_watermark, upsert_bars
 # Reload overlap: rebuild everything from the start of the last dst bucket.
 _PROJ = {"_id": 0, "date": 1, "open": 1, "high": 1, "low": 1, "close": 1,
          "volume": 1, "buying_volume": 1, "selling_volume": 1, "delta": 1,
-         "source": 1, "quality": 1}
+         "delta_wick": 1, "source": 1, "quality": 1}
+
+
+def _wick_delta(df: pd.DataFrame) -> np.ndarray:
+    """Per-bar wick-decomposition delta = (close - open) / (high - low) * volume.
+
+    Algebraically identical to cvd.calculator.decompose_candle's delta (the
+    equal-split half-wick terms cancel out of buy - sell), so SUMMING this up
+    the tier ladder reproduces a finest-granularity wick CVD — IBKR bars enter
+    at 1-sec, FinViz bars at 1-min, and every coarser tier is just their sum.
+    Zero-range bars (single-price seconds, dojis) contribute 0."""
+    spread = (df["high"] - df["low"]).to_numpy(dtype=float)
+    direction = (df["close"] - df["open"]).to_numpy(dtype=float)
+    vol = df["volume"].to_numpy(dtype=float)
+    out = np.zeros(len(df), dtype=float)
+    nz = spread > 0
+    out[nz] = direction[nz] / spread[nz] * vol[nz]
+    return out
+
+
+def _ensure_wick(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure a delta_wick column. Rows missing it — the finest-tier entry
+    (raw 1-sec bars, FinViz i1) — get it from their own OHLC; rows that already
+    carry a rolled-up value keep it, so it stays a sum of finest-granularity
+    wick deltas rather than being recomputed on the coarse bar."""
+    if "delta_wick" not in df.columns:
+        df["delta_wick"] = np.nan
+    need = df["delta_wick"].isna()
+    if need.any():
+        df.loc[need, "delta_wick"] = _wick_delta(df.loc[need])
+    return df
 
 
 def _load_src(col, ticker: str, tf: str, since) -> pd.DataFrame:
@@ -82,6 +113,7 @@ def _aggregate(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         buying_volume=("buying_volume", "sum"),
         selling_volume=("selling_volume", "sum"),
         delta=("delta", "sum"),
+        delta_wick=("delta_wick", "sum"),
         source=("source", lambda s: s.mode().iloc[0] if len(s) else "unknown"),
         quality=("quality", worst_quality),
     ).dropna(subset=["open"])
@@ -105,6 +137,7 @@ def rollup_pair(ticker: str, src_tf: str, dst_tf: str, client=None) -> int:
         return 0
 
     df = _ensure_split(df)
+    df = _ensure_wick(df)
     agg = _aggregate(df, rule)
     if agg.empty:
         return 0
@@ -119,6 +152,7 @@ def rollup_pair(ticker: str, src_tf: str, dst_tf: str, client=None) -> int:
             "buying_volume": float(r["buying_volume"]),
             "selling_volume": float(r["selling_volume"]),
             "delta": float(r["delta"]),
+            "delta_wick": float(r["delta_wick"]),
             "source": str(r["source"]), "quality": str(r["quality"]),
         })
     n = upsert_bars(docs, client=client)
@@ -151,6 +185,7 @@ def merge_finviz_i1(ticker: str, client=None) -> int:
         return 0
 
     est = bvc_split(df["close"], df["volume"])
+    df["delta_wick"] = _wick_delta(df)      # FinViz enters at 1-min: wick on 1-min
     out = [{
         "ticker": ticker, "timeframe": "1min", "date": ts.to_pydatetime(),
         "open": float(r["open"]), "high": float(r["high"]),
@@ -159,6 +194,7 @@ def merge_finviz_i1(ticker: str, client=None) -> int:
         "buying_volume": float(est.loc[ts, "buying_volume"]),
         "selling_volume": float(est.loc[ts, "selling_volume"]),
         "delta": float(est.loc[ts, "delta"]),
+        "delta_wick": float(r["delta_wick"]),
         "source": "finviz", "quality": "bvc",
     } for ts, r in df.iterrows()]
     n = upsert_bars(out, client=client)
@@ -243,10 +279,15 @@ def scale_tick_volume(ticker: str, since=None, client=None) -> tuple[int, "pd.Ti
                 "buying_volume": float(d.get("buying_volume") or 0.0) * factor,
                 "selling_volume": float(d.get("selling_volume") or 0.0) * factor,
                 "delta": float(d.get("delta") or 0.0) * factor,
+                # delta_wick is volume-proportional too, so it scales by the same
+                # factor — otherwise the wick CVD would sit on the raw-tick scale
+                # while cvd_all is on the consolidated scale.
+                "delta_wick": float(d.get("delta_wick") or 0.0) * factor,
                 "volume_tick": vol,
                 "buying_volume_tick": float(d.get("buying_volume") or 0.0),
                 "selling_volume_tick": float(d.get("selling_volume") or 0.0),
                 "delta_tick": float(d.get("delta") or 0.0),
+                "delta_wick_tick": float(d.get("delta_wick") or 0.0),
                 "vol_scaled": True,
                 "scale_factor": factor,
             }},
@@ -296,10 +337,25 @@ def main():
                              "to consolidated volume, then drop the 1min→30min/"
                              "30min→1day watermarks (metadata only) so the "
                              "coarse tiers re-aggregate from scaled bars")
+    parser.add_argument("--reset-wick", action="store_true",
+                        help="One-time: drop ALL rollup watermarks for the given "
+                             "tickers so the next pass re-rolls the whole chain and "
+                             "backfills delta_wick (finest-granularity wick CVD) "
+                             "into every existing tier bar. Idempotent for the "
+                             "other columns (buy/sell/delta re-sum to the same "
+                             "values). Follow with a normal pass (this flag runs "
+                             "one automatically).")
     args = parser.parse_args()
 
     client = mongo_client()
     col = client[DB_NAME]["candles"]
+
+    if args.reset_wick:
+        tickers = args.ticker or sorted(col.distinct("ticker"))
+        for t in tickers:
+            r = client[DB_NAME]["rollup_meta"].delete_many({"ticker": t.upper()})
+            logging.info(f"[reset-wick] {t}: dropped {r.deleted_count} watermarks "
+                         f"— chain will re-roll and backfill delta_wick")
 
     if args.rescale:
         tickers = args.ticker or sorted(col.distinct("ticker"))

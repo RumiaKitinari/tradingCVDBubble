@@ -2,7 +2,7 @@ import dash
 from dash import dcc, html, Input, Output, State, ctx
 import dash_bootstrap_components as dbc
 from cvd.calculator import run_pipeline, TIMEFRAME_RULE_IBKR, TIMEFRAME_RULE
-from cvd.visualizer import build_chart, MAX_CANDLES
+from cvd.visualizer import build_chart, MAX_CANDLES, pie_layout
 from history.schema import SERVE_TIER, SERVE_WINDOW_DAYS
 from history.serve import run_pipeline_tiered, invalidate_cache
 from level2_webapp.data_provider import fetch_and_aggregate_l2_data, compute_support_resistance
@@ -15,6 +15,14 @@ import time
 from dash.exceptions import PreventUpdate
 
 logging.basicConfig(level=logging.INFO)
+# Errors/timings also go to a rotating file so tracebacks survive terminal
+# scrollback (the one-shot "'<' not supported ..." startup error was lost
+# because stdout was the only sink). logs_*.log is gitignored.
+from logging.handlers import RotatingFileHandler
+_fh = RotatingFileHandler("logs_app.log", maxBytes=5_000_000, backupCount=2)
+_fh.setLevel(logging.INFO)
+_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.getLogger().addHandler(_fh)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
 
@@ -79,16 +87,68 @@ app.index_string = '''
                         var gd = wrapper.classList.contains('js-plotly-plot') ? wrapper : wrapper.querySelector('.js-plotly-plot');
                         if (!gd || !gd._fullLayout) return;
                         
-                        var YPAD = 0.10;
+                        var YPAD = 0.15;
                         var LEFT = {'y':'yaxis', 'y2':'yaxis2', 'y4':'yaxis4'};
+                        // Linear-interpolated quantile of a pre-sorted array.
+                        var __qtile = function(sorted, q) {
+                            var n = sorted.length;
+                            if (n === 0) return NaN;
+                            if (n === 1) return sorted[0];
+                            var idx = q * (n - 1), lo = Math.floor(idx), hi = Math.ceil(idx);
+                            if (lo === hi) return sorted[lo];
+                            return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+                        };
                         var ax = gd._fullLayout.xaxis;
                         if (!ax || !ax.range) return;
                         var xr = [ax.range[0], ax.range[1]];
-                        
+
+                        // ── Rebase each CVD line to 0 at the visible left edge ──
+                        // The CVD variants (all-time / raw / BVC / wick) start at
+                        // very different levels, so on one axis they squash each
+                        // other. Shifting every CVD trace by its own value at the
+                        // leftmost VISIBLE bar makes them all start at 0 for the
+                        // current view, so the y-fit below frames their SHAPES
+                        // instead of the gaps between them. Originals are stashed
+                        // per figure (re-captured when the server sends a fresh
+                        // one — see refit_y's __cvdStale) so repeated pans always
+                        // shift from raw values, never cumulatively.
+                        if (gd.__cvdStale || !gd.__cvdOrig) {
+                            gd.__cvdOrig = {};
+                            gd._fullData.forEach(function(f, i) {
+                                if (f && f.name && f.name.indexOf('CVD') === 0 && f.y) {
+                                    gd.__cvdOrig[i] = Array.prototype.slice.call(f.y);
+                                }
+                            });
+                            gd.__cvdStale = false;
+                        }
+                        var rebaseY = [], rebaseIdx = [];
+                        Object.keys(gd.__cvdOrig).forEach(function(k) {
+                            var i = +k, orig = gd.__cvdOrig[i], f = gd._fullData[i];
+                            if (!orig || !f) return;
+                            var off = (f.x0 != null ? f.x0 : 0);
+                            var i0 = Math.max(0, Math.floor(xr[0] - off));
+                            var i1 = Math.min(orig.length - 1, Math.ceil(xr[1] - off));
+                            if (i0 > i1) return;
+                            var base = null;
+                            for (var j = i0; j <= i1; j++) {
+                                var v = orig[j];
+                                if (v != null && !isNaN(v)) { base = v; break; }
+                            }
+                            if (base === null) return;      // no visible point → leave as-is
+                            var arr = new Array(orig.length);
+                            for (var j = 0; j < orig.length; j++) {
+                                var v = orig[j];
+                                arr[j] = (v == null || isNaN(v)) ? v : (v - base);
+                            }
+                            rebaseIdx.push(i); rebaseY.push(arr);
+                        });
+
+                        var doFit = function() {
                         var upd = {};
                         Object.keys(LEFT).forEach(function(yref) {
                             if (onlyAxes && onlyAxes.indexOf(LEFT[yref]) === -1) return;
-                            var lo = Infinity, hi = -Infinity;
+                            var vals = [];                           // candles + lines (primary) visible y-values
+                            var hlo = Infinity, hhi = -Infinity;     // L2 heatmap levels (secondary)
                             gd._fullData.forEach(function(f) {
                                 if (f.visible === false || f.visible === 'legendonly') return;
                                 if ((f.yaxis || 'y') !== yref) return;
@@ -110,8 +170,13 @@ app.index_string = '''
                                         for (var c = h0; c <= h1; c++) if (zrow[c] > m) m = zrow[c];
                                         if (m >= thr) {
                                             var yv = f.y[r];
-                                            if (yv < lo) lo = yv;
-                                            if (yv > hi) hi = yv;
+                                            // Heatmap goes to its OWN bounds, not
+                                            // the candle bounds — it may only
+                                            // extend the axis by a small margin
+                                            // (applied after the loop) so a far
+                                            // liquidity wall can't squish candles.
+                                            if (yv < hlo) hlo = yv;
+                                            if (yv > hhi) hhi = yv;
                                         }
                                     }
                                     return;
@@ -130,20 +195,51 @@ app.index_string = '''
                                 if (f.low && f.high) {
                                     var lows = f.low, highs = f.high;
                                     for (var i = i0; i <= i1; i++) {
-                                        if (lows[i]  < lo) lo = lows[i];
-                                        if (highs[i] > hi) hi = highs[i];
+                                        if (lows[i]  != null && !isNaN(lows[i]))  vals.push(lows[i]);
+                                        if (highs[i] != null && !isNaN(highs[i])) vals.push(highs[i]);
                                     }
                                 } else if (f.y) {
                                     var ys = f.y;
                                     for (var i = i0; i <= i1; i++) {
                                         var v = ys[i];
                                         if (v == null || isNaN(v)) continue;
-                                        if (v < lo) lo = v;
-                                        if (v > hi) hi = v;
+                                        vals.push(v);
                                     }
                                 }
                             });
+                            var lo = Infinity, hi = -Infinity;
+                            if (vals.length) {
+                                vals.sort(function(a, b) { return a - b; });
+                                lo = vals[0];
+                                hi = vals[vals.length - 1];
+                                // Outlier-robust bounds: a lone block/auction bar
+                                // or a bad-print wick would otherwise stretch the
+                                // axis and crush everything else into a sliver.
+                                // Clip lo/hi to a Tukey fence (Q1-3·IQR, Q3+3·IQR)
+                                // — k=3 is the "far out" fence so only true
+                                // extremes are dropped; when there are no outliers
+                                // the fence sits outside the data and nothing is
+                                // clipped. Needs enough points for a stable IQR.
+                                if (vals.length >= 8) {
+                                    var q1 = __qtile(vals, 0.25), q3 = __qtile(vals, 0.75), iqr = q3 - q1;
+                                    if (iqr > 0) {
+                                        lo = Math.max(lo, q1 - 3.0 * iqr);
+                                        hi = Math.min(hi, q3 + 3.0 * iqr);
+                                    }
+                                }
+                            }
                             if (lo < hi && lo !== Infinity) {
+                                // Candles/lines set the scale. Let the L2 heatmap
+                                // widen it by at most HEAT_MARGIN of the candle
+                                // span, so a wall parked near price still shows
+                                // but a far one doesn't blow up the axis (empty
+                                // space above, candles crushed into a sliver).
+                                if (hlo !== Infinity) {
+                                    var HEAT_MARGIN = 0.15;
+                                    var m = (hi - lo) * HEAT_MARGIN;
+                                    lo = Math.min(lo, Math.max(hlo, lo - m));
+                                    hi = Math.max(hi, Math.min(hhi, hi + m));
+                                }
                                 var pad = (hi - lo) * YPAD;
                                 var new_lo = lo - pad;
                                 var new_hi = hi + pad;
@@ -159,15 +255,43 @@ app.index_string = '''
                             }
                         });
                         
-                        if (Object.keys(upd).length > 0) {
+                            return Object.keys(upd).length > 0 ? Plotly.relayout(gd, upd) : null;
+                        };
+
+                        // Apply the CVD rebase first (if any), then the y-fit reads
+                        // the shifted arrays. __is_refitting stays true across both
+                        // so the restyle/relayout we emit don't re-enter this refit.
+                        var finish = function() { window.__is_refitting = false; };
+                        if (rebaseIdx.length) {
                             window.__is_refitting = true;
-                            Plotly.relayout(gd, upd).then(function() {
-                                window.__is_refitting = false;
-                            }).catch(function() {
-                                window.__is_refitting = false;
-                            });
+                            Plotly.restyle(gd, {y: rebaseY}, rebaseIdx)
+                                .then(doFit).then(finish).catch(finish);
+                        } else {
+                            var r = doFit();
+                            if (r) { window.__is_refitting = true; r.then(finish).catch(finish); }
                         }
                     }, 60);
+                };
+
+                // Relayout debounce → dcc.Store('settled-relayout'). A zoom or
+                // pan gesture fires many intermediate relayout events; the heavy
+                // server callbacks (pie reposition, days-to-load) and bars growth
+                // only need the FINAL settled view. Each call captures its own
+                // relayoutData and arms a timer; a newer event clears the prior
+                // timer, so only the last gesture's promise resolves (~160ms after
+                // motion stops). Earlier promises are left unresolved (harmless —
+                // Dash simply never applies their output).
+                window.dash_clientside.clientside.debounce_relayout = function(relayoutData) {
+                    if (!relayoutData || !Object.keys(relayoutData).length) {
+                        return window.dash_clientside.no_update;
+                    }
+                    if (window.__settleTimer) { clearTimeout(window.__settleTimer); }
+                    return new Promise(function(resolve) {
+                        window.__settleTimer = setTimeout(function() {
+                            window.__settleTimer = null;
+                            resolve(relayoutData);
+                        }, 160);
+                    });
                 };
 
                 // Progressive scrollback growth (bars-to-show doubling) runs
@@ -191,7 +315,7 @@ app.index_string = '''
                     var atLeft = x0 <= 10;
                     var zoomedOut = (x1 - x0) >= 0.95 * n;
                     if (!atLeft && !zoomedOut) return nu;
-                    var DEFAULT_BARS = 1000, HARD_CAP = 12000;
+                    var DEFAULT_BARS = 1000, HARD_CAP = 6000;   // keep in sync with app.py BARS_HARD_CAP
                     var cur = DEFAULT_BARS;
                     if (currentBars && typeof currentBars === 'object') {
                         cur = (currentBars.tf === tf) ? (currentBars.bars || DEFAULT_BARS) : DEFAULT_BARS;
@@ -235,6 +359,15 @@ app.index_string = '''
 
                     var trigger = dash_clientside.callback_context.triggered;
                     var isFigUpdate = trigger && trigger.length > 0 && trigger[0].prop_id === 'main-chart.figure';
+
+                    if (isFigUpdate) {
+                        // Fresh figure from the server → its CVD y-arrays are raw
+                        // cumulative values again; mark the rebase stash stale so
+                        // __requestRefit re-captures the originals before shifting.
+                        var _w = document.getElementById('main-chart');
+                        var _g = _w && (_w.classList.contains('js-plotly-plot') ? _w : _w.querySelector('.js-plotly-plot'));
+                        if (_g) _g.__cvdStale = true;
+                    }
 
                     // Manual mode: no continuous refits — the server only
                     // rewrites y on fresh views and otherwise re-applies the
@@ -335,14 +468,23 @@ app.layout = html.Div([
             
             dbc.Col([
                 html.Label("Active Timeframe:", style={"fontWeight": "bold", "color": "#eee"}),
-                dcc.Dropdown(
-                    id='timeframe-dropdown',
-                    options=[], # Populated by callback
-                    value='1hr',
-                    clearable=False,
-                    style={"color": "#000"} 
-                )
-            ], width=2),
+                html.Div([
+                    dcc.Dropdown(
+                        id='timeframe-dropdown',
+                        options=[], # Populated by callback
+                        value='1min',
+                        clearable=False,
+                        style={"color": "#000", "flex": 1, "minWidth": "90px"}
+                    ),
+                    dbc.Input(
+                        id='timeframe-custom',
+                        type='text',
+                        placeholder='Custom',
+                        debounce=True,
+                        style={"color": "#000", "backgroundColor": "white", "width": "80px", "marginLeft": "5px"}
+                    )
+                ], style={"display": "flex", "alignItems": "center"})
+            ], width=3),
             
             dbc.Col([
                 html.Button("Manual Refresh", id="refresh-btn", className="btn btn-outline-info btn-sm mt-4 w-100")
@@ -374,10 +516,14 @@ app.layout = html.Div([
                         {'label': 'Off', 'value': 0},
                         {'label': '5 sec', 'value': 5000},
                         {'label': '10 sec', 'value': 10000},
+                        {'label': '20 sec', 'value': 20000},
                         {'label': '30 sec', 'value': 30000},
                         {'label': '60 sec', 'value': 60000}
                     ],
-                    value=10000,
+                    # Default 20s: each refresh rebuilds the whole figure (a brief
+                    # freeze), so a slower default keeps interaction smooth while
+                    # staying live enough. Users can pick 5/10s for faster ticks.
+                    value=20000,
                     clearable=False,
                     style={"color": "#000", "width": "120px", "display": "inline-block", "marginRight": "20px"}
                 ),
@@ -395,7 +541,7 @@ app.layout = html.Div([
                         {'label': 'On', 'value': True},
                         {'label': 'Off', 'value': False}
                     ],
-                    value=True,
+                    value=False,
                     clearable=False,
                     style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
                 ),
@@ -410,17 +556,17 @@ app.layout = html.Div([
                     clearable=False,
                     style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
                 ),
-                html.Label("Fixed Pie Charts (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                html.Label("Volume Pies (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
                 dcc.Dropdown(
                     id='pie-chart-dropdown',
+                    # On/off only: the strip auto-sizes to ~25 equal-width pies
+                    # (each covering the same number of bars) for the current
+                    # zoom, so there is nothing for the user to tune.
                     options=[
                         {'label': 'Off', 'value': 0},
-                        {'label': '25 Pies', 'value': 25},
-                        {'label': '50 Pies', 'value': 50},
-                        {'label': '100 Pies', 'value': 100},
-                        {'label': '150 Pies', 'value': 150}
+                        {'label': 'On', 'value': 1}
                     ],
-                    value=25,  # Default to 25 to show it off
+                    value=0,  # Default to Off
                     clearable=False,
                     style={"color": "#000", "width": "150px", "display": "inline-block"}
                 )
@@ -445,7 +591,7 @@ app.layout = html.Div([
         
         dcc.Interval(
             id='interval-component',
-            interval=10 * 1000, 
+            interval=20 * 1000,   # matches the 20s dropdown default
             n_intervals=0
         ),
         
@@ -460,6 +606,13 @@ app.layout = html.Div([
         # pans to the left edge or zooms out, up to BARS_HARD_CAP.
         dcc.Store(id='bars-to-show', data=None),
         dcc.Store(id='manual-y', data=None),
+        # Debounced relayout: mirrors main-chart.relayoutData but only after a
+        # zoom/pan gesture SETTLES (~160ms of quiet). The heavy server callbacks
+        # (pie repositioning, days-to-load growth) and the bars-to-show growth
+        # listen to THIS instead of the raw per-frame relayout stream, so one
+        # gesture triggers one rebuild instead of a per-frame callback storm
+        # (which locked the UI once the SVG candle count grew on zoom-out).
+        dcc.Store(id='settled-relayout', data=None),
         dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
         
         
@@ -471,20 +624,35 @@ app.layout = html.Div([
 
 @app.callback(
     [Output('timeframe-dropdown', 'options'),
-     Output('timeframe-dropdown', 'value')],
-    [Input('source-radio', 'value')],
-    [State('timeframe-dropdown', 'value')]
+     Output('timeframe-dropdown', 'value'),
+     Output('timeframe-custom', 'value')],
+    [Input('source-radio', 'value'),
+     Input('timeframe-custom', 'value')],
+    [State('timeframe-dropdown', 'value'),
+     State('timeframe-dropdown', 'options')]
 )
-def update_timeframes(base_tf, current_value):
+def update_timeframes(base_tf, custom_tf, current_value, current_options):
+    import dash
+    ctx = dash.callback_context
+    trigger = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
+
+    if 'timeframe-custom' in trigger and custom_tf:
+        opts = current_options or []
+        existing = [o['value'] for o in opts]
+        if custom_tf not in existing:
+            opts.append({'label': f"{custom_tf} (Custom)", 'value': custom_tf})
+        return opts, custom_tf, ""
+        
+    # Default or source-radio changed
     if base_tf == 'raw_tick':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
-        new_value = "raw_tick"  # Default to raw_tick as user requested
+        new_value = "1min" if current_value not in tfs else current_value
     else: 
         tfs = list(TIMEFRAME_RULE.keys())
         new_value = current_value if current_value in tfs else "1hr"
         
     options = [{'label': t, 'value': t} for t in tfs]
-    return options, new_value
+    return options, new_value, ""
 
 
 # Global state to prevent spamming FinViz fetches
@@ -502,7 +670,11 @@ DATA_CACHE = {} # Cache for fast pie chart HUD updates
 # default stays small and the user "buys" deeper scrollback by panning left /
 # zooming out (bars-to-show doubles per hit, never past the hard cap).
 DEFAULT_BARS = MAX_CANDLES          # 1,000
-BARS_HARD_CAP = 12000
+# Worst-case render cap when the user pans/zooms far back. Render cost is O(bars)
+# in Plotly's SVG candlestick, so this bounds the deepest-scrollback jank. Raise
+# it for more history at the cost of a slower far-left view. Keep in sync with the
+# HARD_CAP constant in the grow_scrollback clientside function (index_string).
+BARS_HARD_CAP = 6000
 
 def _resolve_bars(bars_to_show, active_tf) -> int:
     """Per-TF bars-to-show store value → effective render cap."""
@@ -536,8 +708,22 @@ def _spawn_data_refresh(ticker: str, fetch: bool):
             if fetch:
                 from finviz.new_finviz import fetch_and_save
                 fetch_and_save(ticker, timeframe="i1")
-            from history.rollup import rollup_ticker
-            rollup_ticker(ticker)
+            # Rollup is pandas/CPU-heavy: run it in a SUBPROCESS, not in this
+            # thread. A thread shares the GIL with the web worker, and since
+            # _maybe_rollup's cooldown resets exactly on fresh-view triggers,
+            # the rollup used to crunch concurrently with the TF-switch
+            # rebuild — measured 0.08s serve stretching to ~4.6s of "data"
+            # stage. The subprocess exit is awaited here (blocking only this
+            # daemon thread) so invalidate_cache still runs after the rollup.
+            import subprocess
+            import sys
+            import os
+            subprocess.run(
+                [sys.executable, "-m", "history.rollup", "--ticker", ticker],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=600,
+            )
             invalidate_cache(ticker)
         except Exception as e:
             logging.warning(f"Background refresh failed for {ticker}: {e}")
@@ -625,16 +811,19 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
     
     ticker = str(ticker).strip().upper()
     logging.info(f"Dash update triggered by {trigger} for {ticker} ({base_tf}) TF: {active_tf} Days: {days_to_load}")
+    _t_cb0 = time.monotonic()   # stage timing (logged at return)
     
     try:
         # Tier-aware serving flag (used for the serve path below AND to decide
         # whether tiered mode needs a fresh FinViz i1 fetch).
         tier_served = (base_tf == 'raw_tick' and active_tf in SERVE_TIER)
 
-        # Any ticker viewed in tiered/tick mode should have live ticks flowing:
-        # signal the dynamic collector (no-op if it isn't running).
-        if base_tf == 'raw_tick':
-            _request_tick_collection(ticker)
+        # NOTE: the live-tick collection request used to fire here, before we
+        # knew the ticker was real. Typing "INTC" then sent I/IN/INT/INTC and
+        # each partial polluted collector_requests, churning the 3 tick slots
+        # (and starving real tickers). The request now fires only AFTER data
+        # loads successfully (see below the df_base.empty guard), so junk/partial
+        # symbols — which never resolve to data — never enter the queue.
 
         # days-to-load is scoped to the timeframe it was grown on: panning
         # deep on one TF (up to 180 days) must not make every later timeframe
@@ -749,7 +938,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
 
             # The chart shows ONE timeframe — skip aggregating the other 11.
             tf_map = TIMEFRAME_RULE_IBKR if base_tf in ('1sec', 'raw_tick') else TIMEFRAME_RULE
-            only = [active_tf] if active_tf in tf_map else None
+            only = [active_tf]
             df_base, frames = run_pipeline(ticker, base_timeframe=base_tf, days=actual_days, only=only)
         
         # Fallback & Auto-Backfill Pipeline
@@ -844,6 +1033,14 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
             return empty_fig, "No Data", "", "{}", pan_state_json
+
+        # Ticker is confirmed real (data loaded) → NOW ask the dynamic collector
+        # for live ticks. Doing it here (not at callback entry) keeps partial /
+        # invalid symbols out of collector_requests, so the LRU tick slots follow
+        # the tickers you actually view. The most-recent request wins the top
+        # slot, so the ticker on screen gets priority for a live tick line.
+        if base_tf == 'raw_tick':
+            _request_tick_collection(ticker)
 
         # Optimization: Only re-render if data has actually grown/changed
         current_state = {
@@ -941,6 +1138,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # today and ibkr/level2_collector.py once the depth subscription is
         # live). Computed on the SAME truncated tail build_chart will render
         # (iloc[-bars_req:]) so heatmap columns line up with x_idx 1:1.
+        _t_data = time.monotonic()
         l2_data = None
         if show_l2:
             try:
@@ -958,7 +1156,9 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
             except Exception as e:
                 logging.error(f"L2 fetch failed (chart renders without it): {e}")
 
+        _t_l2 = time.monotonic()
         fig = build_chart(df_base, frames, ticker, active_timeframe=active_tf, pie_chart_count=pie_chart_count, show_bubbles=show_bubbles, x_range=x_range, max_candles=bars_req, l2_data=l2_data)
+        _t_build = time.monotonic()
 
         # build_chart mutates `frames`: the active frame is now truncated to
         # MAX_CANDLES with its FINAL x_idx/time_str — cache THAT frame so the
@@ -1103,16 +1303,21 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         import datetime
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         msg = f"Last Updated: {now_str} (Trigger: {trigger}){fallback_msg}"
-        
+
+        _t_end = time.monotonic()
+        logging.info(
+            f"[timing] update_graph {_t_end-_t_cb0:.2f}s "
+            f"(data {_t_data-_t_cb0:.2f} | l2 {_t_l2-_t_data:.2f} | "
+            f"build {_t_build-_t_l2:.2f} | post {_t_end-_t_build:.2f})")
+
         # Return fig, text, empty string for loading, new state, pan state
         return fig, msg, "", current_state_json, json.dumps(pan_state)
         
     except PreventUpdate:
         raise
     except Exception as e:
-        logging.error(f"Error building chart: {e}")
         import traceback
-        traceback.print_exc()
+        logging.error(f"Error building chart: {e}\n{traceback.format_exc()}")
         empty_fig = go.Figure()
         empty_fig.update_layout(template="plotly_dark", title=dict(text=f"Error: {e}", font=dict(color="red")))
         return empty_fig, f"Error: {e}", "", last_state_json, pan_state_json
@@ -1142,15 +1347,29 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+# Relayout debounce: raw per-frame relayout stream → a single settled value
+# (~160ms after motion stops). The heavy callbacks below hang off this so one
+# gesture is one rebuild, not a per-frame storm (see debounce_relayout).
+app.clientside_callback(
+    dash.ClientsideFunction(
+        namespace='clientside',
+        function_name='debounce_relayout'
+    ),
+    Output('settled-relayout', 'data'),
+    Input('main-chart', 'relayoutData'),
+    prevent_initial_call=True,
+)
+
 # Bars-to-show growth: clientside so it can never be aborted by a newer
-# relayout event (see grow_scrollback in index_string).
+# relayout event (see grow_scrollback in index_string). Driven by the
+# DEBOUNCED relayout so a zoom-out doubles bars once per gesture, not per frame.
 app.clientside_callback(
     dash.ClientsideFunction(
         namespace='clientside',
         function_name='grow_scrollback'
     ),
     Output('bars-to-show', 'data'),
-    Input('main-chart', 'relayoutData'),
+    Input('settled-relayout', 'data'),
     [State('bars-to-show', 'data'),
      State('last-data-state', 'data')],
     prevent_initial_call=True,
@@ -1169,10 +1388,11 @@ app.clientside_callback(
 # Both stores are per-TF, so growth on one timeframe never slows the others.
 @app.callback(
     Output('days-to-load', 'data'),
-    Input('main-chart', 'relayoutData'),
+    Input('settled-relayout', 'data'),
     [State('days-to-load', 'data'),
      State('bars-to-show', 'data'),
-     State('last-data-state', 'data')]
+     State('last-data-state', 'data')],
+    prevent_initial_call=True,
 )
 def handle_panning(relayout_data, current_days, current_bars, last_state_json):
     if not relayout_data:
@@ -1227,7 +1447,7 @@ def handle_panning(relayout_data, current_days, current_bars, last_state_json):
 @app.callback(
     [Output('main-chart', 'figure', allow_duplicate=True),
      Output('pan-state', 'data', allow_duplicate=True)],
-    Input('main-chart', 'relayoutData'),
+    Input('settled-relayout', 'data'),
     prevent_initial_call=True
 )
 def update_pie_charts_on_pan(relayout_data):
@@ -1255,77 +1475,40 @@ def update_pie_charts_on_pan(relayout_data):
         new_pan_state = json.dumps({"panned": True, "time": time.time(), "x0": x0, "x1": x1})
             
         df = DATA_CACHE.get('df')
-        pie_chart_count = DATA_CACHE.get('pie_chart_count', 0)
         pie_indices = DATA_CACHE.get('pie_indices') or []
 
-        if df is None or pie_chart_count == 0 or not pie_indices:
+        if df is None or not pie_indices:
             raise PreventUpdate
 
         # Filter to visible range
         df_vis = df[(df['x_idx'] >= x0) & (df['x_idx'] <= x1)]
-        n_pies = int(pie_chart_count)
-
-        chunk_size = (x1 - x0) / n_pies if n_pies > 0 else 1
 
         patched_fig = dash.Patch()
 
-        if len(pie_indices) != n_pies:
-            raise PreventUpdate
-            
-        chunks = []
-        vols = []
-        for k in range(n_pies):
-            c_start = x0 + k * chunk_size
-            c_end = x0 + (k + 1) * chunk_size
-            chunk = df_vis[(df_vis['x_idx'] >= c_start) & (df_vis['x_idx'] < c_end)]
-            chunks.append(chunk)
-            if len(chunk) > 0:
-                vols.append(float(chunk["buy_pressure"].sum() + chunk["sell_pressure"].sum()))
-            else:
-                vols.append(0.0)
-                
-        max_vol = max(vols) if vols and max(vols) > 0 else 1.0
-        overall_width = 0.94
-        width = overall_width / n_pies
-            
+        # The trace pool is fixed at build time; use however many pie traces the
+        # figure actually has as the slot count so build_chart and the pan patch
+        # stay in the same coordinate space regardless of zoom-level pie drift.
+        n_slots = len(pie_indices)
+
+        # Same equal-width, candle-aligned geometry build_chart used, so a pan
+        # never reintroduces uneven spacing or unequal bars-per-pie.
+        layout = pie_layout(df_vis, n_slots, x0, x1)
+
         for k, idx in enumerate(pie_indices):
-            chunk = chunks[k]
-            buy = float(chunk["buy_pressure"].sum()) if len(chunk) > 0 else 0.0
-            sell = float(chunk["sell_pressure"].sum()) if len(chunk) > 0 else 0.0
-            
-            if (buy + sell) > 0:
-                factor = ((buy + sell) / max_vol) ** 0.5
-                factor = max(0.15, factor)
-                if n_pies >= 50:
-                    factor *= 1.5
-                    
-                # Perfectly align with the center of the candles in this chunk
-                c_center = chunk["x_idx"].mean()
-                x_span = x1 - x0
-                if x_span > 0:
-                    x_center = (c_center - x0) / x_span * overall_width
-                else:
-                    x_center = k * width + (width / 2.0)
-                
-                radius = width * 0.45 * factor
-                x_center = max(radius, min(overall_width - radius, x_center))
-                    
-                d_x = [x_center - radius, x_center + radius]
-                d_y = [0.52 - 0.04 * factor, 0.52 + 0.04 * factor]
-                
-                patched_fig['data'][idx]['values'] = [buy, sell]
+            slot = layout[k] if k < len(layout) else None
+            if slot is not None:
+                patched_fig['data'][idx]['values'] = [slot["buy"], slot["sell"]]
                 patched_fig['data'][idx]['marker'] = {'colors': ["rgba(38,166,154,0.7)", "rgba(239,83,80,0.7)"]}
                 patched_fig['data'][idx]['hoverinfo'] = "text"
-                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+                patched_fig['data'][idx]['hovertext'] = (
+                    f"{slot['label']}<br>Buy: {slot['buy']:,.0f}<br>Sell: {slot['sell']:,.0f}")
+                patched_fig['data'][idx]['domain'] = {'x': slot["d_x"], 'y': slot["d_y"]}
             else:
-                # Hide empty chunks completely by zeroing their domain
-                d_x = [0, 0]
-                d_y = [0, 0]
-                
+                # Hidden slot: zero the domain so it disappears.
                 patched_fig['data'][idx]['values'] = [0, 0]
                 patched_fig['data'][idx]['marker'] = {'colors': ["rgba(100,100,100,0.5)", "rgba(100,100,100,0.5)"]}
                 patched_fig['data'][idx]['hoverinfo'] = "none"
-                patched_fig['data'][idx]['domain'] = {'x': d_x, 'y': d_y}
+                patched_fig['data'][idx]['domain'] = {'x': [0, 0], 'y': [0, 0]}
                 
         logging.info(f"Patch successful for {len(pie_indices)} pies.")
         return patched_fig, new_pan_state
