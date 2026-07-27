@@ -58,7 +58,7 @@ def upsert_bars(docs: list[dict], client: MongoClient | None = None) -> int:
             {"$set": d,
              "$unset": {"vol_scaled": "", "scale_factor": "", "volume_tick": "",
                         "buying_volume_tick": "", "selling_volume_tick": "",
-                        "delta_tick": ""}},
+                        "delta_tick": "", "delta_wick_tick": ""}},
             upsert=True,
         ))
 

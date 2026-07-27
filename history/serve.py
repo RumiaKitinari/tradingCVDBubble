@@ -33,7 +33,7 @@ from history.session_grid import reindex_to_session_grid
 
 _PROJ = {"_id": 0, "date": 1, "open": 1, "high": 1, "low": 1, "close": 1,
          "volume": 1, "buying_volume": 1, "selling_volume": 1, "delta": 1,
-         "source": 1, "quality": 1}
+         "delta_wick": 1, "source": 1, "quality": 1}
 
 # (ticker, tier) → {"raw": DataFrame(indexed by date), "window_start": datetime|None}
 _CACHE: dict = {}

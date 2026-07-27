@@ -491,7 +491,41 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[auc, "delta_bvc"] = 0.0      # same closing-auction neutralization
     df["cvd_bvc"] = df["delta_bvc"].cumsum()
 
+    # ── Pure wick-decomposition CVD, unified to the finest granularity ────────
+    # delta_wick = (close-open)/(high-low)*volume — algebraically the same delta
+    # decompose_candle produces. The tiers store it SUMMED from the finest tier
+    # (IBKR 1-sec / FinViz 1-min; see history.rollup), so on every timeframe this
+    # line is "finest-granularity wick, aggregated" rather than wick recomputed
+    # on the coarse bar. When the column is absent (bare frames, un-rolled
+    # history) we fall back to wick on df's own bars — still the finest data on
+    # hand for that path. Rendered as its own legend entry ("CVD (wick est.)").
+    if "delta_wick" in df.columns and df["delta_wick"].notna().any():
+        dw = pd.to_numeric(df["delta_wick"], errors="coerce").to_numpy(dtype=float).copy()
+        # Any rows the tier left unfilled get wick from their own OHLC.
+        missing = np.isnan(dw)
+        if missing.any():
+            dw[missing] = _wick_delta_ohlc(df)[missing]
+    else:
+        dw = _wick_delta_ohlc(df)
+    df["delta_wick"] = dw
+    df.loc[auc, "delta_wick"] = 0.0     # same closing-auction neutralization
+    df["cvd_wick"] = df["delta_wick"].cumsum()
+
     return df
+
+
+def _wick_delta_ohlc(df: pd.DataFrame) -> np.ndarray:
+    """Vectorized wick delta = (close-open)/(high-low)*volume for each row.
+    Matches decompose_candle's delta (half-wick terms cancel); zero-range bars
+    contribute 0. Used as the finest-data fallback when a rolled-up delta_wick
+    column is not present on the frame."""
+    spread = (df["high"] - df["low"]).to_numpy(dtype=float)
+    direction = (df["close"] - df["open"]).to_numpy(dtype=float)
+    vol = df["volume"].to_numpy(dtype=float)
+    out = np.zeros(len(df), dtype=float)
+    nz = spread > 0
+    out[nz] = direction[nz] / spread[nz] * vol[nz]
+    return out
 
 
 # ─────────────────────────────────────────
@@ -517,6 +551,8 @@ TIMEFRAME_RULE_IBKR = {
     "raw_tick": "0S", # Special case for raw ticks
     "1sec":   "1s",
     "5sec":   "5s",
+    "10sec":  "10s",
+    "30sec":  "30s",
     **TIMEFRAME_RULE,
 }
 
@@ -535,7 +571,7 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
                (e.g. "1sec", "1min", "1hr", "1day").
     """
     _all_rules = {**TIMEFRAME_RULE, **TIMEFRAME_RULE_IBKR}
-    rule = _all_rules.get(timeframe, "1h")
+    rule = _all_rules.get(timeframe, timeframe)  # Use custom string directly if not in rules
     df_1min = df_base  # rename kept for clarity; works for any base granularity
 
     agg_spec = dict(
@@ -560,6 +596,8 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         ("cvd_session_wins", "cvd_session_wins_end", "last"),
         ("delta_bvc",        "delta_bvc_sum",        "sum"),
         ("cvd_bvc",          "cvd_bvc_end",          "last"),
+        ("delta_wick",       "delta_wick_sum",       "sum"),
+        ("cvd_wick",         "cvd_wick_end",         "last"),
     ]:
         if src in df_1min.columns:
             agg_spec[dst] = (src, how)
@@ -768,10 +806,14 @@ def run_pipeline(
 
     # Choose the right timeframe map: IBKR adds 1sec / 5sec buttons to the chart.
     if base_timeframe in ["1sec", "raw_tick"]:
-        tf_map = TIMEFRAME_RULE_IBKR
+        tf_map = dict(TIMEFRAME_RULE_IBKR)
     else:
-        tf_map = TIMEFRAME_RULE
+        tf_map = dict(TIMEFRAME_RULE)
         
+    if only is not None:
+        for tf in only:
+            if tf not in tf_map:
+                tf_map[tf] = tf  # Allow custom timeframe strings
     frames = {}
     for tf, rule in tf_map.items():
         if only is not None and tf not in only:
@@ -784,6 +826,7 @@ def run_pipeline(
                 "cvd_all": "cvd_all_end",
                 "cvd_all_raw": "cvd_all_raw_end",
                 "cvd_bvc": "cvd_bvc_end",
+                "cvd_wick": "cvd_wick_end",
                 "auction_volume": "auction_vol"
             })
             raw_df["net_pressure"] = raw_df["buy_pressure"] - raw_df["sell_pressure"]

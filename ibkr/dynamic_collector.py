@@ -45,6 +45,7 @@ from ibkr.backfill import backfill_ticker
 ET = ZoneInfo("America/New_York")
 
 POLL_SEC = 5                 # how often to reconcile subscriptions with requests
+REQUEST_TTL_SEC = 1800       # only requests seen this recently are LRU candidates
 FAIL_COOLDOWN_SEC = 300      # don't retry a ticker that failed to subscribe for this long
 RECONNECT_DELAY = 30
 MIN_BACKFILL_GAP_SEC = 120   # skip catch-up backfill for gaps smaller than this
@@ -74,10 +75,15 @@ class DynamicTickManager:
     # ── Request → desired set ────────────────────────────────────────────────
 
     def _desired(self) -> list[str]:
-        """Most recently requested tickers, minus exclusions and cooldowns."""
+        """Most recently requested tickers, minus exclusions and cooldowns.
+        Only requests seen within REQUEST_TTL_SEC count, so a ticker glanced at
+        once — or a stale/partial symbol left in the queue — ages out of the LRU
+        instead of churning a live-tick slot forever."""
         now = time.time()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=REQUEST_TTL_SEC)
         out = []
-        for d in self.req_col.find({}, {"_id": 1}).sort("last_requested", -1):
+        for d in self.req_col.find({"last_requested": {"$gte": cutoff}},
+                                   {"_id": 1}).sort("last_requested", -1):
             t = str(d["_id"]).upper()
             if t in self.exclude or self.failed_until.get(t, 0) > now:
                 continue
@@ -246,6 +252,8 @@ async def _main_async(args):
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    from ibkr.log_noise import install as _install_log_filter
+    _install_log_filter()   # drop benign IBKR data-farm / account chatter
     parser = argparse.ArgumentParser(
         description="On-demand IBKR tick collector driven by app searches")
     parser.add_argument("--port", type=int, default=7497)
