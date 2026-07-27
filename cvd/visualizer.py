@@ -785,8 +785,18 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
             # hoverable — otherwise every blank spot shows a "size 0" tooltip.
             _zplot = _z[:, -_n:].astype(float)
             _zplot[_zplot <= 0] = np.nan
+            # Column x-positions: match the z-columns to the bars they were built
+            # on by timestamp (l2_data["x_times"]), so anchor-centered views place
+            # the bands on-screen. Fall back to the last _n x_idx (tail/live view)
+            # when x_times is absent or can't be matched.
+            _xt = l2_data.get("x_times")
+            if _xt is not None and len(_xt) >= _n:
+                _pos = df.index.get_indexer(pd.DatetimeIndex(list(_xt)[-_n:]), method="nearest")
+                _xcoords = df['x_idx'].to_numpy()[_pos]
+            else:
+                _xcoords = df['x_idx'].iloc[-_n:].to_numpy()
             fig.add_trace(go.Heatmap(
-                x=df['x_idx'].iloc[-_n:].to_numpy(),
+                x=_xcoords,
                 y=list(l2_data["y_levels"]),
                 z=_zplot,
                 # Ordinary depth is kept faint (low alpha) so it reads as a
@@ -795,11 +805,11 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
                 # stand out. Dimming the mid stops fixes the "heatmap drowns the
                 # candles" overlap.
                 colorscale=[[0.0, "rgba(0,0,0,0)"],
-                            [0.08, "rgba(21,60,160,0.10)"],
-                            [0.35, "rgba(41,150,255,0.20)"],
-                            [0.70, "rgba(0,229,255,0.34)"],
-                            [0.92, "rgba(255,235,59,0.62)"],
-                            [1.0, "rgba(255,255,255,0.82)"]],
+                            [0.08, "rgba(21,60,160,0.16)"],
+                            [0.35, "rgba(41,150,255,0.30)"],
+                            [0.70, "rgba(0,229,255,0.48)"],
+                            [0.92, "rgba(255,235,59,0.74)"],
+                            [1.0, "rgba(255,255,255,0.92)"]],
                 zmin=0.0, zmax=_zmax,
                 showscale=False, hoverongaps=False,
                 hovertemplate="price %{y:.2f} · size %{z:,.0f}<extra>L2</extra>",
@@ -1114,8 +1124,8 @@ def build_chart(df: pd.DataFrame, frames: dict, ticker: str, active_timeframe: s
             fig.add_shape(
                 type="line", xref="x domain", x0=0, x1=1,
                 yref="y", y0=lvl["price"], y1=lvl["price"],
-                line=dict(color=_c, width=1.0 + 0.8 * lvl["score"], dash="dash"),
-                opacity=0.30 + 0.30 * lvl["score"], layer="above",
+                line=dict(color=_c, width=1.8 + 1.4 * lvl["score"], dash="dash"),
+                opacity=0.42 + 0.33 * lvl["score"], layer="above",
             )
             # Bookmap-style: show the wall's thickness (avg resting shares
             # while present) next to the price, so "how big is this level"

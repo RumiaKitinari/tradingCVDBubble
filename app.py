@@ -212,15 +212,18 @@ app.index_string = '''
                                 vals.sort(function(a, b) { return a - b; });
                                 lo = vals[0];
                                 hi = vals[vals.length - 1];
-                                // Outlier-robust bounds: a lone block/auction bar
-                                // or a bad-print wick would otherwise stretch the
-                                // axis and crush everything else into a sliver.
-                                // Clip lo/hi to a Tukey fence (Q1-3·IQR, Q3+3·IQR)
-                                // — k=3 is the "far out" fence so only true
-                                // extremes are dropped; when there are no outliers
-                                // the fence sits outside the data and nothing is
-                                // clipped. Needs enough points for a stable IQR.
-                                if (vals.length >= 8) {
+                                // Outlier-robust bounds: a lone bad-print wick
+                                // would otherwise stretch the axis and crush the
+                                // candles into a sliver. Clip lo/hi to a Tukey
+                                // fence (Q1-3·IQR, Q3+3·IQR) — k=3 is the "far
+                                // out" fence so only true extremes are dropped;
+                                // when there are no outliers the fence sits
+                                // outside the data and nothing is clipped. Needs
+                                // enough points for a stable IQR.
+                                // PRICE PANEL ONLY (yref 'y'): the indicator
+                                // panels (y2/y4) use plain min–max so an auction
+                                // or block bar's real magnitude is shown in full.
+                                if (yref === 'y' && vals.length >= 8) {
                                     var q1 = __qtile(vals, 0.25), q3 = __qtile(vals, 0.75), iqr = q3 - q1;
                                     if (iqr > 0) {
                                         lo = Math.max(lo, q1 - 3.0 * iqr);
@@ -572,7 +575,25 @@ app.layout = html.Div([
                 )
             ], width=12, className="d-flex align-items-center justify-content-end")
         ], className="mb-3"),
-        
+
+        # Date/time jump: load a fixed ±1500-bar window around a pinned instant
+        # (ET, as stored) instead of the live tail. Empty + Live = normal mode.
+        dbc.Row([
+            dbc.Col([
+                html.Label("Jump to (ET):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Input(
+                    id='anchor-input', type='text', debounce=False,
+                    placeholder='YYYY-MM-DD HH:MM',
+                    style={"width": "180px", "marginRight": "8px"}
+                ),
+                html.Button("Jump", id="anchor-go", n_clicks=0,
+                            className="btn btn-outline-warning btn-sm", style={"marginRight": "6px"}),
+                html.Button("Live", id="anchor-clear", n_clicks=0,
+                            className="btn btn-outline-success btn-sm"),
+                html.Span(id="anchor-status", style={"color": "#ffa726", "marginLeft": "12px", "fontSize": "0.85em"}),
+            ], width=12, className="d-flex align-items-center justify-content-end")
+        ], className="mb-2"),
+
         # Main Chart Area
         html.Div([
             dcc.Graph(
@@ -613,6 +634,9 @@ app.layout = html.Div([
         # gesture triggers one rebuild instead of a per-frame callback storm
         # (which locked the UI once the SVG candle count grew on zoom-out).
         dcc.Store(id='settled-relayout', data=None),
+        # Anchor (date/time jump): a datetime string pins a fixed ±N-bar
+        # historical window; None = live tail. Set by the Jump/Live buttons.
+        dcc.Store(id='anchor-active', data=None),
         dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
         
         
@@ -675,6 +699,27 @@ DEFAULT_BARS = MAX_CANDLES          # 1,000
 # it for more history at the cost of a slower far-left view. Keep in sync with the
 # HARD_CAP constant in the grow_scrollback clientside function (index_string).
 BARS_HARD_CAP = 6000
+
+# Anchor (date/time jump) mode: bars loaded on EACH side of the pinned instant.
+ANCHOR_BARS_EACH_SIDE = 1500
+# Initial on-screen width (bars) for an anchor jump, centered on the pinned bar
+# so the exact typed instant sits mid-screen rather than at a window edge.
+ANCHOR_VIEW_BARS = 200
+
+
+def _parse_anchor(val):
+    """Parse the anchor-active Store into an ET-naive datetime, or None (live).
+    Accepts 'YYYY-MM-DD HH:MM[:SS]' or 'YYYY-MM-DD' (ET, as stored in Mongo)."""
+    if not val or not isinstance(val, str):
+        return None
+    from datetime import datetime
+    s = val.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
 
 def _resolve_bars(bars_to_show, active_tf) -> int:
     """Per-TF bars-to-show store value → effective render cap."""
@@ -776,6 +821,26 @@ def update_refresh_interval(val):
         return 10000, True
     return val, False
 
+# Date/time jump: "Jump" pins the typed instant (anchor-active Store → a fixed
+# ±ANCHOR_BARS_EACH_SIDE window in update_graph); "Live" clears it back to the
+# live tail. The status span echoes the active pin.
+@app.callback(
+    [Output('anchor-active', 'data'),
+     Output('anchor-status', 'children')],
+    [Input('anchor-go', 'n_clicks'),
+     Input('anchor-clear', 'n_clicks')],
+    State('anchor-input', 'value'),
+    prevent_initial_call=True,
+)
+def set_anchor(go_clicks, clear_clicks, anchor_text):
+    trig = ctx.triggered_id
+    if trig == 'anchor-clear':
+        return None, ""
+    dt = _parse_anchor(anchor_text)
+    if dt is None:
+        return None, "⚠ Use format YYYY-MM-DD HH:MM"
+    return dt.strftime("%Y-%m-%d %H:%M:%S"), f"📌 {dt.strftime('%Y-%m-%d %H:%M')} (±{ANCHOR_BARS_EACH_SIDE} bars)"
+
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
@@ -792,7 +857,8 @@ def update_refresh_interval(val):
      Input('bubbles-dropdown', 'value'),
      Input('l2-dropdown', 'value'),
      Input('yauto-check', 'value'),
-     Input('bars-to-show', 'data')],
+     Input('bars-to-show', 'data'),
+     Input('anchor-active', 'data')],
     # NOTE: deliberately NO State('main-chart', 'figure') here — that would
     # upload the entire multi-MB figure JSON from the browser on every
     # interval tick, which is what made the 10-s refresh feel slow.
@@ -803,7 +869,7 @@ def update_refresh_interval(val):
      State('main-chart', 'relayoutData'),
      State('manual-y', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, last_state_json, pan_state_json, relayout_data, manual_y_store):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, anchor_active, last_state_json, pan_state_json, relayout_data, manual_y_store):
     trigger = ctx.triggered_id
     
     if not ticker:
@@ -912,13 +978,28 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # materialized tier (1day chart reads ~2k daily rows, never 1-sec
         # bars). The raw_tick chart and the legacy FinViz-only radio keep the
         # old run_pipeline path.
+        anchor_dt = None
         if tier_served:
             default_win = SERVE_WINDOW_DAYS.get(active_tf)
             actual_days = None if default_win is None else max(days_req, default_win)
             if trigger == 'refresh-btn':
                 invalidate_cache(ticker)
             _maybe_rollup(ticker)
-            df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
+            # Anchor mode: a pinned datetime loads a fixed ±N-bar window around
+            # that instant (a historical jump) instead of the live tail. Parsed
+            # here from the anchor-active Store; falls back to live on any error.
+            anchor_dt = _parse_anchor(anchor_active)
+            if anchor_dt is not None:
+                df_base, frames = run_pipeline_tiered(
+                    ticker, active_tf, anchor=anchor_dt, bars_each_side=ANCHOR_BARS_EACH_SIDE)
+                # The pinned bar sits at the CENTER of the ±N window; render the
+                # WHOLE loaded window (never the live-tail cap) so build_chart's
+                # iloc[-max_candles:] trim can't drop the anchor region. The
+                # window is bounded (~2·N bars ≤ hard cap), so this stays sane.
+                if active_tf in frames and len(frames[active_tf]):
+                    bars_req = max(bars_req, len(frames[active_tf]))
+            else:
+                df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
         else:
             # Dynamic Lookback based on Timeframe (legacy path)
             min_days = 3
@@ -943,6 +1024,12 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         
         # Fallback & Auto-Backfill Pipeline
         fallback_msg = ""
+        # Distinguishes a real fetch failure (an exception was raised while
+        # fetching FinViz/spawning the IBKR backfill) from the normal "data not
+        # here YET" case — a brand-new 1sec ticker has its IBKR backfill running
+        # asynchronously in the background, so an empty frame is "fetching", not
+        # "failed". Set only in the except blocks below.
+        fetch_error = None
         
         # Tiered path: a new/uncovered ticker gets instant history — FinViz
         # daily (~8y, one request) + FinViz i1 (recent 1-min) merged through
@@ -962,6 +1049,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 fallback_msg = " [FinViz history backfilled]"
             except Exception as e:
                 logging.error(f"Instant FinViz backfill failed: {e}")
+                fetch_error = e
 
         # Daily-tier coverage check: a ticker may have a few rolled-up days
         # (from i1/1sec) without ever having had its FinViz daily history
@@ -1021,18 +1109,42 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                     fallback_msg = " [Rendering FinViz Fallback - IBKR Backfill in Progress...]"
                 except Exception as e:
                     logging.error(f"Fallback fetch failed: {e}")
+                    fetch_error = e
         
         if df_base.empty:
+            # Two very different empty states, shown differently so the user
+            # isn't misled into thinking a valid ticker failed:
+            #   • fetch_error is None → the data just isn't here YET. A new 1sec
+            #     ticker has its IBKR backfill running asynchronously (seconds to
+            #     minutes), and FinViz can't supply 1sec at all, so an empty
+            #     frame is normal "fetching", not a failure. Poll again shortly.
+            #   • fetch_error set → an exception was actually raised while
+            #     fetching (bad symbol, network, API block) → a real error.
+            is_1sec = base_tf in ('1sec', 'raw_tick')
+            if fetch_error is not None:
+                _title = f"⚠ Error fetching {ticker}: {fetch_error}"
+                _status = "Fetch error"
+                _color = "#ef5350"
+            elif is_1sec:
+                _title = (f"⏳ Fetching {ticker} 1-sec data — IBKR backfill in "
+                          f"progress. This can take up to a minute; the chart "
+                          f"fills in automatically.")
+                _status = "Fetching…"
+                _color = "#ffa726"
+            else:
+                _title = f"⏳ Fetching {ticker} — backfill in progress…"
+                _status = "Fetching…"
+                _color = "#ffa726"
             empty_fig = go.Figure()
             empty_fig.update_layout(
-                template="plotly_dark", 
-                title=dict(text=f"No data available for {ticker} in MongoDB (and auto-fetch failed).", font=dict(color="white")),
+                template="plotly_dark",
+                title=dict(text=_title, font=dict(color=_color)),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", "", "{}", pan_state_json
+            return empty_fig, _status, "", "{}", pan_state_json
 
         # Ticker is confirmed real (data loaded) → NOW ask the dynamic collector
         # for live ticks. Doing it here (not at callback entry) keeps partial /
@@ -1085,8 +1197,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
 
         # A timeframe/ticker/source switch is a fresh view: forget the pan
         # window from the previous chart (its x_idx coordinates are
-        # meaningless here) and open at the newest bars.
-        if trigger in ('timeframe-dropdown', 'ticker-input', 'source-radio'):
+        # meaningless here) and open at the newest bars. An anchor jump (or
+        # "Live" clear) is likewise a fresh view — reset the pan so the window
+        # snaps to the anchor bar (below) rather than a stale panned window.
+        if trigger in ('timeframe-dropdown', 'ticker-input', 'source-radio', 'anchor-active'):
             panned = False
             pan_state = {'panned': False, 'time': 0}
 
@@ -1098,7 +1212,11 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # pan-state Store (written by a parallel callback) may not have
         # committed yet — trust relayoutData directly so the grown chart
         # keeps the user's window instead of snapping to the tail.
-        if trigger == 'bars-to-show' or bars_grew:
+        # EXCEPT an anchor jump: it legitimately grows bars_req (whole ±N
+        # window, see above) which would read here as bars_grew and force
+        # panned=True, suppressing the anchor centering below. The jump is a
+        # fresh centered view, not a pan, so leave panned alone for it.
+        if (trigger == 'bars-to-show' or bars_grew) and trigger != 'anchor-active':
             panned = True
             pan_state['panned'] = True
             pan_state.setdefault('time', time.time())
@@ -1143,13 +1261,33 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         if show_l2:
             try:
                 _l2_key = active_tf if active_tf in frames else list(frames.keys())[0]
-                _l2_tail = frames[_l2_key].iloc[-bars_req:]
-                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_tail, max_candles=300)
-                _closes = _l2_tail["close"].dropna() if len(_l2_tail) else _l2_tail
+                _l2_full = frames[_l2_key]
+                # Live view renders the tail, so match L2 to the tail. An anchor
+                # jump renders a window CENTERED on the pinned bar, so match L2 to
+                # THAT window instead — otherwise the depth is fetched/placed at
+                # the frame's end (far off-screen) and the heatmap never shows.
+                if anchor_dt is not None and len(_l2_full):
+                    try:
+                        _apos = _l2_full.index.get_indexer(
+                            [pd.Timestamp(anchor_dt)], method='nearest')[0]
+                    except Exception:
+                        _apos = len(_l2_full) - 1
+                    _lo = max(0, _apos - 150)
+                    _l2_win = _l2_full.iloc[_lo:_apos + 150]
+                else:
+                    _l2_win = _l2_full.iloc[-bars_req:]
+                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_win, max_candles=300)
+                _closes = _l2_win["close"].dropna() if len(_l2_win) else _l2_win
                 if _zm is not None and len(_closes):
                     # last VALID close — session-grid empty candles carry NaN
                     _mid = float(_closes.iloc[-1])
+                    # x_times = the candle timestamps the z-columns were built on
+                    # (the fetch used the LAST max_candles of _l2_win); build_chart
+                    # maps these to x_idx so the bands land on the right bars in
+                    # either tail or anchor-centered views.
+                    _nz = int(_zm.shape[1])
                     l2_data = {"y_levels": _yl, "z": _zm,
+                               "x_times": list(_l2_win.index[-_nz:]),
                                "sr": compute_support_resistance(_yl, _zm, _mid, z_bid=_zb)}
                 else:
                     logging.info(f"L2: no depth snapshots for {ticker} in the visible window")
@@ -1177,9 +1315,27 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         current_state['n_active'] = len(df_active)
         current_state_json = json.dumps(current_state)
 
-        # View window: keep the panned window, else auto-tail to the newest bars.
+        # View window: an un-panned anchor jump centers on the pinned bar; a
+        # panned view keeps its window; otherwise auto-tail to the newest bars.
         N_total = len(df_active)
-        if x_range is not None:
+        anchor_view = None
+        if anchor_dt is not None and not panned and N_total:
+            # Locate the bar nearest the pinned instant and frame a fixed-width
+            # window centered on it, so the exact typed date/time lands mid-
+            # screen instead of the front (or tail) of the ±N loaded window.
+            try:
+                pos = df_active.index.get_indexer([pd.Timestamp(anchor_dt)],
+                                                  method='nearest')[0]
+                if pos >= 0:
+                    cx = float(df_active['x_idx'].iloc[pos])
+                    half = ANCHOR_VIEW_BARS / 2.0
+                    anchor_view = (cx - half, cx + half)
+            except Exception as e:
+                logging.warning(f"anchor centering failed ({anchor_dt}): {e}")
+
+        if anchor_view is not None:
+            x0, x1 = anchor_view
+        elif x_range is not None:
             x0, x1 = float(x_range[0]), float(x_range[1])
         else:
             x0, x1 = max(0, N_total - 100), N_total
