@@ -1,18 +1,29 @@
-"""
-cvd/calculator.py
------------------
-Buy/Sell Volume Decomposition + CVD Calculator
+"""Buy/Sell Volume Decomposition + CVD Calculator
 
-Source-aware pipeline:
-  source='ibkr_tick'   — IBKR real-time tick data; buying_volume/selling_volume/delta
-                         pre-computed by tick_collector.py (quote-based aggressor).
-                         Wick decomposition is SKIPPED.
-  source='ibkr_tick' — IBKR real-time/historical tick data; buying_volume/selling_volume/delta
-                         pre-computed by tick_collector.py / backfill.py.
-                         Wick decomposition is SKIPPED.
-  source='ibkr_hist'   — 1-sec bars from reqHistoricalData (no tick-level quotes).
-                         Wick decomposition applied (same as FinViz).
-  source='finviz_wick' — FinViz Elite 1-min bars.  Wick decomposition applied.
+Pipeline:
+    source='ibkr_tick'
+        IBKR real-time tick (0.1s) data; buying_volume/selling_volume/delta
+        pre-computed by tick_collector.py (quote-based aggressor).
+        Wick decomposition is SKIPPED.
+
+    source='ibkr_tick'
+        IBKR real-time/historical tick data; buying_volume/selling_volume/delta
+        pre-computed by tick_collector.py / backfill.py. 
+        Wick decomposition is SKIPPED.
+
+    source='ibkr_hist'
+        1-sec bars from reqHistoricalData (no tick-level quotes).
+        Wick decomposition is APPLIED (same as FinViz).
+    
+    source='finviz_wick'
+        FinViz Elite 1-min bars. 
+        Wick decomposition is APPLIED.
+
+This file can also be imported as a module and contains the following
+functions:
+
+    * decompose_candle - Calculates the buy/sell volume & change in
+      price given the OHLCV.
 
 add_cvd_columns() detects which rows have pre-computed values and branches
 accordingly, so mixed DataFrames (ibkr_tick + finviz_wick) work
@@ -26,22 +37,57 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
-# ─────────────────────────────────────────
-# 1. Extract buy/sell volume from one candle
-# ─────────────────────────────────────────
+# ------------------------------------------
+# 1. Extract Buy/Sell Volume From One Candle
+# ------------------------------------------
 
 def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
-    """
-    Return estimated buy/sell volume from one candle (OHLCV).
+    """Return estimated buy/sell volume from one candle (OHLCV).
 
-    KNOWN LIMITATION — the closing auction (15:59 print):
+    Variables:
+       * spread = high - low
+       * half_wicks =  (upper_wick + lower_wick) / 2
+       * body = spread - upper_wick - lower_wick
+
+    Parameters
+    ----------
+    o : float
+        Open   (price at start of time-interval)
+    h : float
+        High   (highest price during time-interval)
+    l : float
+        Low    (lowest price during time-interval)
+    c : float
+        Close  (price at end of time-interval)
+    v : float
+        Volume (total volume traded during tine-interval period)
+
+    Returns
+    -------
+    { buying_volume, selling_volume, delta } : dict
+    buying_volume : float
+        Approximates "num. of buys" by taking avg. of wicks 
+        (+ half_wicks if BULLISH)
+    selling_volume : float
+        Approximates "num. of sells" by taking avg. of wicks 
+        (+ half_wicks if BEARISH)
+    delta : float
+        buying_volume - selling_volume
+
+    Restrictions
+    ------------
+    Time = Closing auction (15:59 print):
         US exchanges settle all Market-On-Close orders in a single closing
         cross at one price, so the 15:59 bar carries a huge volume (often ~40x
         a normal minute and ~2/3 of the final hour) packed into a near-zero
-        range / doji. This wick model then decides direction from a 1-2 cent
+        range / doji. 
+        
+        This wick model then decides direction from a 1-2 cent
         open/close difference and dumps almost the entire print onto one side,
         so the buy/sell SIGN of that bar flips day to day and is unreliable
-        (e.g. a green buy spike on a down day). The volume itself is real; only
+        (e.g. a green buy spike on a down day). 
+        
+        The volume itself is real; only
         its buy/sell split is meaningless for a single-price auction print.
         Per design decision (6/25) the logic is left as-is and documented here.
     """
@@ -86,35 +132,125 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
     }
 
 
-# ─────────────────────────────────────────
-# 2. Add buy/sell/delta/CVD to DataFrame
-# ─────────────────────────────────────────
+# ---------------------------
+# 2. Detect "Auction" Anomaly
+# ---------------------------
 
-def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
-    """Boolean Series marking each day's closing-cross bars (15:59 + 16:00).
+def _flag_auction(df: pd.DataFrame, mult: float = 6.0, spill_mult: float = 3.0) -> pd.Series:
+    """Boolean Series marking each day's closing-cross bars.
 
-    The volume thresholds below are calibrated for 1-MINUTE bars. At 1-second
-    granularity the volume distribution has a much heavier tail (a single
-    block trade easily exceeds 10x the median 1-sec volume), so running the
-    detection directly on sub-minute bars flags ordinary intraday spikes as
-    auctions almost every day. For sub-minute data we therefore aggregate the
-    volume to 1-minute buckets, run the detection there, and map the flagged
-    minutes back onto the underlying bars.
+    The closing auction is one batch print (Market-On-Close cross) that the
+    consolidated tape stamps with a sale-condition code (6 / M / X). We do not
+    have those codes in backfilled / FinViz data, so we detect the cross by its
+    volume signature — but the signature differs by granularity:
+
+    * SUB-MINUTE (1-sec bars present): the cross lands in a single second that
+      dwarfs the day. We flag any bar inside the fixed closing window whose
+      volume exceeds `_AUCTION_REF_MULT`x the day's regular-session (09:30-15:55)
+      1-second 99th-percentile volume. Measured across names the cross second is
+      44-9000x that p99 while genuine 15:59 continuous trading stays under ~7x,
+      so the window separates cleanly and name-agnostically (a heavy-volume,
+      low-price name like SOFI, whose cross is only ~10x its MINUTE median and so
+      slips past the minute test, is caught here).
+    * 1-MINUTE+ (coarse tiers, no sub-second detail): fall back to the minute
+      test — the closing-window minute must dwarf the day's 09:30-13:00 median
+      (> `mult`x) — plus a forward spill for the 16:00 overflow bar.
     """
     if len(df) >= 2:
+        # PART 1: Check if average time-interval (for data) is < 1m accuracy
         spacing = df.index.to_series().diff().dt.total_seconds().median()
         if pd.notna(spacing) and spacing < 60:
-            vol_1min = df["volume"].resample("1min").sum()
-            vol_1min = vol_1min[vol_1min > 0]          # drop empty minutes
-            minute_flags = _flag_auction_1min(vol_1min.to_frame("volume"), mult, spill_mult)
-            flagged = minute_flags[minute_flags].index
-            return pd.Series(df.index.floor("min").isin(flagged), index=df.index)
+            return _flag_auction_subminute(df)
     return _flag_auction_1min(df, mult, spill_mult)
 
 
-def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
+# Closing-window bar counts as the auction when its volume exceeds this multiple
+# of the day's regular-session 1-second p99 (see _flag_auction). 10x sits in the
+# clean gap between the cross (>=44x observed) and pre-close continuous flow
+# (<=7x observed).
+_AUCTION_REF_MULT = 10.0
+
+# Exchange condition codes (from AllLast `specialConditions`, stored by
+# tick_collector as `special_conditions`) that mark a single-priced closing/
+# opening cross — the industry-standard way to identify the auction print
+# (consolidated-tape codes 6 = Market Center Closing Trade, M = Official Close,
+# X = Cross/Auction). IBKR's EXACT strings for the US closing cross are
+# undocumented, so this set stays EMPTY (never a false positive) until real values
+# are read from captured data; fill it in and the code path in add_cvd_columns
+# takes precedence over the volume heuristic for freshly collected bars.
+_AUCTION_CONDITION_CODES: set[str] = set()
+
+
+def _has_auction_condition(cond) -> bool:
+    """True if a stored `special_conditions` string contains a known auction code.
+    Always False while _AUCTION_CONDITION_CODES is empty (pre-verification)."""
+    if not _AUCTION_CONDITION_CODES or not isinstance(cond, str) or not cond:
+        return False
+    tokens = {c.strip() for part in cond.split(",") for c in part.split() if c.strip()}
+    return bool(tokens & _AUCTION_CONDITION_CODES)
+
+
+def _flag_auction_subminute(df: pd.DataFrame, ref_mult: float = _AUCTION_REF_MULT) -> pd.Series:
+    """Sub-minute closing-cross detection (see _flag_auction).
+
+    Flags individual sub-minute bars inside the fixed closing window
+    (15:59-16:01 normal day, 12:59-13:01 half-day) whose volume dwarfs the day's
+    regular-session 1-second p99. A half-day is decided by EVIDENCE (thin
+    post-13:00 trade), not by where the data ends, so a live pre-close view gets
+    no early-close verdict.
+    """
+    flag = pd.Series(False, index=df.index)
+    vol = df["volume"]
+    for _, g in df.groupby(lambda ix: ix.date()):
+        minute = g.index.hour * 60 + g.index.minute
+        gvol = g["volume"]
+
+        # Regular-session 1-sec reference (09:30-15:55).
+        reg = gvol[(minute >= 570) & (minute <= 955)]
+        if len(reg) < 100:
+            continue                       # too little regular data to judge
+        ref = reg.quantile(0.99)
+        if not ref > 0:
+            continue
+
+        # Half-day evidence: enough thin minutes after 13:00 vs the morning.
+        vmin = gvol.groupby(minute).sum()
+        base = vmin[(vmin.index >= 570) & (vmin.index < 780)]
+        base_med = base.median() if not base.empty else 0
+        aft = vmin[(vmin.index >= 790) & (vmin.index <= 955)]
+        half = base_med > 0 and len(aft) >= 5 and aft.median() < base_med * 0.1
+        lo, hi = (779, 781) if half else (959, 961)   # 12:59-13:01 or 15:59-16:01
+
+        win = gvol[(minute >= lo) & (minute <= hi)]
+        hits = win.index[win.to_numpy() > ref_mult * ref]
+        if len(hits):
+            flag.loc[hits] = True
+    return flag
+
+
+def _flag_auction_1min(df: pd.DataFrame, mult: float = 6.0, spill_mult: float = 3.0) -> pd.Series:
     """Core closing-cross detection on minute-level (or coarser) volume bars.
 
+    Checks for whether closing occurs during "half-day" (around 13:00)
+    or "full-day" (around 16:00).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    mult : float, optional
+        "Extreme-ness" threshold for Auction flag
+        (default is 10.0x median)
+    spill_mult : float, optional
+        If volume is ___ times larger, then is also flagged as Auction
+        (default is 3.0x median)
+    
+    Returns
+    -------
+    pd.Series
+        A sequence of MINUTES which are flagged as Auction (True) or not (False)
+
+    Notes
+    -----
     The closing auction footprint spans two bars: the main cross on the last
     regular minute (~2500x a normal after-hours minute) plus an overflow/
     official print on the following one (~167x), after which volume drops back
@@ -135,46 +271,68 @@ def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float =
          genuine after-hours and the pre-close ramp (15:55-15:58) untouched.
          See Personal Study Log §8.
     """
-    flag = pd.Series(False, index=df.index)
+    flag = pd.Series(False, index=df.index) # init: no auction
 
+    # PART 1: For each DAY (groups anomalies by day)...
     for d, g in df.groupby(lambda ix: ix.date()):
-        if g.empty:
-            continue
+        if g.empty: continue
+
         minute = g.index.hour * 60 + g.index.minute
 
-        # Baseline: 09:30-13:00 volume, regular-session on both day types.
+        # PART 2: Baseline ("regular-session") = Median volume between 09:30 - 13:00
         base = g.loc[(minute >= 570) & (minute < 780), "volume"]
         base_med = base.median() if not base.empty else 0
         if not base_med > 0:
             continue
 
-        # Half-day evidence: enough post-13:00 bars, all thin.
+        # PART 3: IF: Average vol. between 13:10 – 15:55 is <10% median, THEN: Is half-day
         aft = g.loc[(minute >= 790) & (minute <= 955), "volume"]
         if len(aft) >= 5 and aft.median() < base_med * 0.1:
-            window_mask = (minute >= 779) & (minute <= 781)    # 12:59-13:01
+            window_mask = (minute >= 779) & (minute <= 781) # Closing: Half-Day = 12:59-13:01
         else:
-            window_mask = (minute >= 959) & (minute <= 961)    # 15:59-16:01
+            window_mask = (minute >= 959) & (minute <= 961) # Closing: Full-Day = 15:59-16:01
         window = g.loc[window_mask, "volume"]
         if window.empty:
             continue
-
+        
+        # PART 4: Calculats the max volume in a 3-minute window + checks
+        #         if exceeds the `mult` threshold for Auction detection
         anchor = window.idxmax()
         if not window.loc[anchor] > base_med * mult:
             continue
         flag.loc[anchor] = True
 
+        # PART 4.1: Checks following minute-blocks for auction-"spillover"
         pos = g.index.get_loc(anchor)
         for ts in g.index[pos + 1:]:
             if g.loc[ts, "volume"] > base_med * spill_mult:
                 flag.loc[ts] = True
             else:
                 break
-
+    
     return flag
 
+# -----------------------------------------------------
+# 3. Convert data to auction-filtered, buy/sell-aligned
+# -----------------------------------------------------
 
 def _apply_wick_decomp(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply decompose_candle to every row of df; returns df with the three columns set."""
+    """Converts Open-High-Low-Close-Volume to Buying-Volume/Selling-Volume/Delta
+    
+    Apply `decompose_candle` to every row of df; returns df with
+    the three columns set.
+    
+    Parameters
+    ----------
+    pd.Dataframe 
+        Rows contain Open-High-Low-Close-Volume and a timestamp-index
+    
+    Returns
+    -------
+    pd.Dataframe
+        Rows contain buying vol., selling vol., and change in price b/t time-interval
+    """
+
     results = df.apply(
         lambda row: decompose_candle(
             row["open"], row["high"], row["low"], row["close"], row["volume"]
@@ -190,7 +348,23 @@ def _apply_wick_decomp(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _winsorize_delta(delta: pd.Series, q: float = 0.995) -> pd.Series:
-    """Cap each bar's |delta| at the per-session q-quantile, preserving sign.
+    """Hides extreme delta (price-change) from the graph if it's `q`-abnormal
+    
+    Takes the q-percent-extremely-large-volume trades and ignores them.
+
+    Parameters
+    ----------
+    delta : pd.Series
+        A set of price-changes ("delta"-s) with timestamps
+    
+    Returns
+    -------
+    pd.Series
+        A set of 
+
+    Notes
+    -----
+    Cap each bar's |delta| at the per-session q-quantile, preserving sign.
 
     A single block/cross print (e.g. the ~1M-share cross NVDA printed at 15:53)
     lands entirely on one side and would otherwise dominate the CVD curve — the
@@ -203,12 +377,18 @@ def _winsorize_delta(delta: pd.Series, q: float = 0.995) -> pd.Series:
     Requires a DatetimeIndex. Returns a Series aligned to `delta`. Operates
     positionally so it is safe on a raw-tick index with duplicate timestamps.
     """
+
+    # PART 1: Splits the price-changes into days
     vals = delta.to_numpy(dtype=float).copy()
     days = np.asarray(delta.index.date)
+
     for day in np.unique(days):
+        # PART 2.1: For each day, finds the q-large extreme data `cap`
         mask = days == day
         a = np.abs(vals[mask])
         cap = np.quantile(a, q)
+
+        # PART 2.2. Caps extreme-volume trades to the minimum-extreme `cap`
         if cap > 0:
             vals[mask] = np.sign(vals[mask]) * np.minimum(a, cap)
     return pd.Series(vals, index=delta.index)
@@ -306,8 +486,17 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # default CVD, and keep an un-neutralized `delta_raw` so a "CVD raw (incl.
     # auction)" line stays available for comparison. See Personal Study Log §8.
     df["is_auction"]     = _flag_auction(df)
-    
-    # We apply neutralization for all sources, including ibkr_tick, because the 
+
+    # Ground-truth override: a bar whose stored AllLast condition code marks the
+    # closing cross (see tick_collector's `special_conditions`) is an auction
+    # regardless of the volume heuristic. The column is absent on estimated/older
+    # bars, and _AUCTION_CONDITION_CODES is empty until real IBKR strings are
+    # observed, so today this is a no-op that never mis-flags.
+    if "special_conditions" in df.columns:
+        code_auc = df["special_conditions"].map(_has_auction_condition)
+        df["is_auction"] = df["is_auction"] | code_auc.fillna(False).astype(bool)
+
+    # We apply neutralization for all sources, including ibkr_tick, because the
     # 16:00 closing cross (MOC) prints as a huge block volume, not an aggressive hit.
 
     df["delta_raw"]      = df["delta"]                       # before neutralization
@@ -354,7 +543,41 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[auc, "delta_bvc"] = 0.0      # same closing-auction neutralization
     df["cvd_bvc"] = df["delta_bvc"].cumsum()
 
+    # ── Pure wick-decomposition CVD, unified to the finest granularity ────────
+    # delta_wick = (close-open)/(high-low)*volume — algebraically the same delta
+    # decompose_candle produces. The tiers store it SUMMED from the finest tier
+    # (IBKR 1-sec / FinViz 1-min; see history.rollup), so on every timeframe this
+    # line is "finest-granularity wick, aggregated" rather than wick recomputed
+    # on the coarse bar. When the column is absent (bare frames, un-rolled
+    # history) we fall back to wick on df's own bars — still the finest data on
+    # hand for that path. Rendered as its own legend entry ("CVD (wick est.)").
+    if "delta_wick" in df.columns and df["delta_wick"].notna().any():
+        dw = pd.to_numeric(df["delta_wick"], errors="coerce").to_numpy(dtype=float).copy()
+        # Any rows the tier left unfilled get wick from their own OHLC.
+        missing = np.isnan(dw)
+        if missing.any():
+            dw[missing] = _wick_delta_ohlc(df)[missing]
+    else:
+        dw = _wick_delta_ohlc(df)
+    df["delta_wick"] = dw
+    df.loc[auc, "delta_wick"] = 0.0     # same closing-auction neutralization
+    df["cvd_wick"] = df["delta_wick"].cumsum()
+
     return df
+
+
+def _wick_delta_ohlc(df: pd.DataFrame) -> np.ndarray:
+    """Vectorized wick delta = (close-open)/(high-low)*volume for each row.
+    Matches decompose_candle's delta (half-wick terms cancel); zero-range bars
+    contribute 0. Used as the finest-data fallback when a rolled-up delta_wick
+    column is not present on the frame."""
+    spread = (df["high"] - df["low"]).to_numpy(dtype=float)
+    direction = (df["close"] - df["open"]).to_numpy(dtype=float)
+    vol = df["volume"].to_numpy(dtype=float)
+    out = np.zeros(len(df), dtype=float)
+    nz = spread > 0
+    out[nz] = direction[nz] / spread[nz] * vol[nz]
+    return out
 
 
 # ─────────────────────────────────────────
@@ -380,6 +603,8 @@ TIMEFRAME_RULE_IBKR = {
     "raw_tick": "0S", # Special case for raw ticks
     "1sec":   "1s",
     "5sec":   "5s",
+    "10sec":  "10s",
+    "30sec":  "30s",
     **TIMEFRAME_RULE,
 }
 
@@ -398,7 +623,7 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
                (e.g. "1sec", "1min", "1hr", "1day").
     """
     _all_rules = {**TIMEFRAME_RULE, **TIMEFRAME_RULE_IBKR}
-    rule = _all_rules.get(timeframe, "1h")
+    rule = _all_rules.get(timeframe, timeframe)  # Use custom string directly if not in rules
     df_1min = df_base  # rename kept for clarity; works for any base granularity
 
     agg_spec = dict(
@@ -423,6 +648,8 @@ def aggregate_pressure(df_base: pd.DataFrame, timeframe: str = "1hr") -> pd.Data
         ("cvd_session_wins", "cvd_session_wins_end", "last"),
         ("delta_bvc",        "delta_bvc_sum",        "sum"),
         ("cvd_bvc",          "cvd_bvc_end",          "last"),
+        ("delta_wick",       "delta_wick_sum",       "sum"),
+        ("cvd_wick",         "cvd_wick_end",         "last"),
     ]:
         if src in df_1min.columns:
             agg_spec[dst] = (src, how)
@@ -631,10 +858,14 @@ def run_pipeline(
 
     # Choose the right timeframe map: IBKR adds 1sec / 5sec buttons to the chart.
     if base_timeframe in ["1sec", "raw_tick"]:
-        tf_map = TIMEFRAME_RULE_IBKR
+        tf_map = dict(TIMEFRAME_RULE_IBKR)
     else:
-        tf_map = TIMEFRAME_RULE
+        tf_map = dict(TIMEFRAME_RULE)
         
+    if only is not None:
+        for tf in only:
+            if tf not in tf_map:
+                tf_map[tf] = tf  # Allow custom timeframe strings
     frames = {}
     for tf, rule in tf_map.items():
         if only is not None and tf not in only:
@@ -647,6 +878,7 @@ def run_pipeline(
                 "cvd_all": "cvd_all_end",
                 "cvd_all_raw": "cvd_all_raw_end",
                 "cvd_bvc": "cvd_bvc_end",
+                "cvd_wick": "cvd_wick_end",
                 "auction_volume": "auction_vol"
             })
             raw_df["net_pressure"] = raw_df["buy_pressure"] - raw_df["sell_pressure"]

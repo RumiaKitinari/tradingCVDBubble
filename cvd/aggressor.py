@@ -22,6 +22,7 @@ def classify_aggressor(
     ask: float | None,
     prev_price: float | None,
     prev_dir: float = 0.0,
+    use_midpoint: bool = False,
 ) -> float:
     """
     Return the signed delta contribution of one trade tick.
@@ -32,12 +33,25 @@ def classify_aggressor(
     `prev_dir` is the last non-zero tick direction (+1/-1/0), used by the
     zero-tick rule when the price is unchanged from the previous trade.
     Callers maintain it via `next_tick_dir()`.
+
+    use_midpoint: classic Lee-Ready quote test — an inside-spread trade is
+      classified vs the MIDPOINT (price > mid -> buy, < mid -> sell) instead of
+      only at/through the touch. This recovers a direction for trades between the
+      quotes that would otherwise fall to the (weaker) tick rule. A trade exactly
+      at the mid still falls to the tick rule.
     """
     if bid is not None and ask is not None and bid < ask:
-        if price >= ask:
-            return size
-        if price <= bid:
-            return -size
+        if use_midpoint:
+            mid = (bid + ask) / 2.0
+            if price > mid:
+                return size
+            if price < mid:
+                return -size
+        else:
+            if price >= ask:
+                return size
+            if price <= bid:
+                return -size
     if prev_price is not None:
         if price > prev_price:
             return size
@@ -62,6 +76,7 @@ def classify_vectorized(
     ask: np.ndarray,
     prev_price: float | None = None,
     prev_dir: float = 0.0,
+    use_midpoint: bool = False,
 ) -> tuple[np.ndarray, float | None, float]:
     """
     Vectorized version of classify_aggressor (same priority + zero-tick rule).
@@ -95,9 +110,15 @@ def classify_vectorized(
     delta = np.zeros(n)
     has_spread = ~np.isnan(bid) & ~np.isnan(ask) & (bid < ask)
 
-    # 1. Quote-based
-    buy_q  = has_spread & (price >= ask)
-    sell_q = has_spread & (price <= bid)
+    # 1. Quote-based. use_midpoint = classic Lee-Ready (classify inside-spread
+    #    trades vs the mid); else only at/through the touch (inside-spread -> tick).
+    if use_midpoint:
+        mid = (bid + ask) / 2.0
+        buy_q  = has_spread & (price > mid)
+        sell_q = has_spread & (price < mid)
+    else:
+        buy_q  = has_spread & (price >= ask)
+        sell_q = has_spread & (price <= bid)
     delta[buy_q]  =  size[buy_q]
     delta[sell_q] = -size[sell_q]
 
@@ -117,6 +138,7 @@ def classify_demote_stale(
     max_age_ms: float = 50.0,
     prev_price: float | None = None,
     prev_dir: float = 0.0,
+    use_midpoint: bool = False,
 ) -> np.ndarray:
     """Re-classify trades, DEMOTING stale quotes to the tick rule.
 
@@ -144,6 +166,6 @@ def classify_demote_stale(
     ask[stale] = np.nan
     delta, _, _ = classify_vectorized(
         np.asarray(price, dtype=float), np.asarray(size, dtype=float),
-        bid, ask, prev_price, prev_dir,
+        bid, ask, prev_price, prev_dir, use_midpoint=use_midpoint,
     )
     return delta

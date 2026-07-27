@@ -23,6 +23,7 @@ import pandas as pd
 
 from finviz.new_finviz import get_candle_data
 from history.bvc import bvc_split
+from history.rollup import _wick_delta
 from history.schema import mongo_client
 from history.store import set_backfill_coverage, upsert_bars
 
@@ -42,6 +43,7 @@ def backfill_daily(ticker: str, client=None) -> int:
     df = df[~df.index.duplicated(keep="last")]
 
     est = bvc_split(df["close"], df["volume"])
+    df["delta_wick"] = _wick_delta(df)      # FinViz daily-only rows: wick on the daily bar
     docs = [{
         "ticker": ticker,
         "timeframe": "1day",
@@ -52,6 +54,7 @@ def backfill_daily(ticker: str, client=None) -> int:
         "buying_volume": float(est.loc[ts, "buying_volume"]),
         "selling_volume": float(est.loc[ts, "selling_volume"]),
         "delta": float(est.loc[ts, "delta"]),
+        "delta_wick": float(r["delta_wick"]),
         "source": "finviz",
         "quality": "bvc",
     } for ts, r in df.iterrows()]
