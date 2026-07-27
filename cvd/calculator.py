@@ -176,14 +176,16 @@ _AUCTION_REF_MULT = 10.0
 # consolidated-tape sale conditions for the close:
 #     '6' = Closing Prints (Market Center Closing Trade)
 #     'M' = Market Center Official Close
-# Both are ORed with the volume heuristic in add_cvd_columns, so this only ADDS
-# precision: if a code is present the bar is flagged even if its volume were
-# ambiguous, and if these codes never appear the behavior is exactly the old
-# heuristic. Chosen to be false-positive-safe: an empirical sweep of a session of
-# live NVDA ticks showed regular flow only ever carries {I, F, 4, 7, V, W, C} —
-# 'M'/'6' never appear intraday, so they can only ever match a genuine close.
-# Verify against a real 16:00 capture with scripts/inspect_auction_conditions.py
-# and add the exact observed token(s) if IBKR emits a different string.
+# CONFIRMED against a real close (NVDA 2026-07-27 16:00:00, verified with
+# scripts/inspect_auction_conditions.py): the closing-cross tick carried
+# specialConditions '6 X,F,F I,FT,FTI,I,T,TI' — i.e. token '6' matched. In the
+# same session, regular intraday flow only ever carried {I, F, 4, 7, V, W, C}
+# and '6' appeared exactly once, on the cross — so it is false-positive-safe.
+# ('M' was not observed but is kept as a harmless documented fallback for venues
+# that stamp the official close with it; it likewise never appears intraday.)
+# These are ORed with the volume heuristic in add_cvd_columns, which is still
+# needed: same-second auction volume also arrives on finviz/ibkr_hist bars that
+# carry NO condition string, and only the heuristic catches those.
 _AUCTION_CONDITION_CODES: set[str] = {"6", "M"}
 
 
