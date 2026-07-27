@@ -67,6 +67,30 @@ def get_candle_data(ticker: str, timeframe: str = 'd') -> list[dict]:
     return candles
 
 
+def symbol_exists(ticker: str) -> bool:
+    """Cheap validity probe: True if FinViz recognizes the symbol.
+
+    A brand-new but VALID ticker returns daily rows; an UNKNOWN symbol comes
+    back HTTP 400/404 with no data. Used by the app to tell "valid ticker still
+    backfilling" apart from "bad symbol" so the chart can say which one it is
+    instead of spinning on "Fetching…" forever. Conservative on ambiguity —
+    a network hiccup or a token problem returns True so a real ticker is never
+    wrongly condemned.
+    """
+    importlib.reload(api_keys)
+    url = f"{BASE_URL}?t={ticker}&p=d&auth={api_keys.FINVIZ_AUTH_TOKEN}"
+    try:
+        r = session.get(url, timeout=8)
+    except Exception:
+        return True                       # transient network issue, not the symbol
+    if r.status_code in (401, 403):
+        return True                       # token problem, not the symbol's fault
+    if r.status_code != 200:
+        return False                      # 400/404 → FinViz doesn't know this symbol
+    # 200 but header-only (no data rows) also means "not a tradable symbol here".
+    return len((r.content or b"").strip().splitlines()) > 1
+
+
 def test_connection(ticker: str = 'NVDA') -> bool:
     print(f"[FinViz] Testing connection with ticker={ticker}...")
     data = get_candle_data(ticker, timeframe='d')

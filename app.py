@@ -471,22 +471,13 @@ app.layout = html.Div([
             
             dbc.Col([
                 html.Label("Active Timeframe:", style={"fontWeight": "bold", "color": "#eee"}),
-                html.Div([
-                    dcc.Dropdown(
-                        id='timeframe-dropdown',
-                        options=[], # Populated by callback
-                        value='1min',
-                        clearable=False,
-                        style={"color": "#000", "flex": 1, "minWidth": "90px"}
-                    ),
-                    dbc.Input(
-                        id='timeframe-custom',
-                        type='text',
-                        placeholder='Custom',
-                        debounce=True,
-                        style={"color": "#000", "backgroundColor": "white", "width": "80px", "marginLeft": "5px"}
-                    )
-                ], style={"display": "flex", "alignItems": "center"})
+                dcc.Dropdown(
+                    id='timeframe-dropdown',
+                    options=[], # Populated by callback
+                    value='1min',
+                    clearable=False,
+                    style={"color": "#000", "minWidth": "90px"}
+                )
             ], width=3),
             
             dbc.Col([
@@ -648,35 +639,21 @@ app.layout = html.Div([
 
 @app.callback(
     [Output('timeframe-dropdown', 'options'),
-     Output('timeframe-dropdown', 'value'),
-     Output('timeframe-custom', 'value')],
-    [Input('source-radio', 'value'),
-     Input('timeframe-custom', 'value')],
-    [State('timeframe-dropdown', 'value'),
-     State('timeframe-dropdown', 'options')]
+     Output('timeframe-dropdown', 'value')],
+    [Input('source-radio', 'value')],
+    [State('timeframe-dropdown', 'value')]
 )
-def update_timeframes(base_tf, custom_tf, current_value, current_options):
-    import dash
-    ctx = dash.callback_context
-    trigger = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
-
-    if 'timeframe-custom' in trigger and custom_tf:
-        opts = current_options or []
-        existing = [o['value'] for o in opts]
-        if custom_tf not in existing:
-            opts.append({'label': f"{custom_tf} (Custom)", 'value': custom_tf})
-        return opts, custom_tf, ""
-        
-    # Default or source-radio changed
+def update_timeframes(base_tf, current_value):
+    # The available timeframes depend only on the data source (tick vs FinViz).
     if base_tf == 'raw_tick':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
         new_value = "1min" if current_value not in tfs else current_value
-    else: 
+    else:
         tfs = list(TIMEFRAME_RULE.keys())
         new_value = current_value if current_value in tfs else "1hr"
-        
+
     options = [{'label': t, 'value': t} for t in tfs]
-    return options, new_value, ""
+    return options, new_value
 
 
 # Global state to prevent spamming FinViz fetches
@@ -688,6 +665,28 @@ last_finviz_fetch = {}
 # spawn just piles up failing processes. A 1-day backfill runs ~65s (see DONE.md).
 last_backfill = {}
 BACKFILL_COOLDOWN_SEC = 120
+
+# Ticker-validity cache. When a fresh ticker loads empty we probe FinViz once to
+# tell a valid-but-still-backfilling symbol from an unknown one, and remember the
+# verdict so the 10-s poll doesn't re-probe every tick. A ticker that later
+# collects real data drops out of the empty path entirely, so a False here is
+# only ever set for symbols FinViz doesn't recognize.
+_symbol_valid_cache = {}
+
+
+def _ticker_is_valid(ticker: str) -> bool:
+    """Cached wrapper around finviz.symbol_exists (see there). Defaults to True
+    on any error so a real ticker is never wrongly flagged as unknown."""
+    if ticker in _symbol_valid_cache:
+        return _symbol_valid_cache[ticker]
+    try:
+        from finviz.new_finviz import symbol_exists
+        ok = bool(symbol_exists(ticker))
+    except Exception as e:
+        logging.warning(f"symbol validity probe failed for {ticker}: {e}")
+        ok = True
+    _symbol_valid_cache[ticker] = ok
+    return ok
 DATA_CACHE = {} # Cache for fast pie chart HUD updates
 
 # Progressive scrollback bounds: rendering is O(bars) in Plotly SVG, so the
@@ -1112,16 +1111,24 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                     fetch_error = e
         
         if df_base.empty:
-            # Two very different empty states, shown differently so the user
-            # isn't misled into thinking a valid ticker failed:
-            #   • fetch_error is None → the data just isn't here YET. A new 1sec
-            #     ticker has its IBKR backfill running asynchronously (seconds to
-            #     minutes), and FinViz can't supply 1sec at all, so an empty
-            #     frame is normal "fetching", not a failure. Poll again shortly.
-            #   • fetch_error set → an exception was actually raised while
-            #     fetching (bad symbol, network, API block) → a real error.
+            # Three different empty states, shown differently so the user isn't
+            # misled into thinking a valid ticker failed:
+            #   • symbol unknown → FinViz doesn't recognize the ticker at all
+            #     (e.g. a typo, or a symbol not on FinViz/IBKR). It would spin on
+            #     "Fetching…" forever, so we probe once and say so outright.
+            #   • fetch_error set → an exception was raised while fetching
+            #     (network, API block) → a real, transient error.
+            #   • otherwise → the data just isn't here YET. A new 1sec ticker has
+            #     its IBKR backfill running asynchronously (seconds to minutes),
+            #     and FinViz can't supply 1sec at all, so an empty frame is
+            #     normal "fetching", not a failure. The poll fills it in.
             is_1sec = base_tf in ('1sec', 'raw_tick')
-            if fetch_error is not None:
+            if not _ticker_is_valid(ticker):
+                _title = (f"⚠ '{ticker}' is not a recognized ticker — check the "
+                          f"symbol. (No data on FinViz or IBKR.)")
+                _status = "Unknown ticker"
+                _color = "#ef5350"
+            elif fetch_error is not None:
                 _title = f"⚠ Error fetching {ticker}: {fetch_error}"
                 _status = "Fetch error"
                 _color = "#ef5350"
