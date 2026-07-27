@@ -543,12 +543,14 @@ app.layout = html.Div([
                 dcc.Dropdown(
                     id='l2-dropdown',
                     options=[
-                        {'label': 'On', 'value': True},
-                        {'label': 'Off', 'value': False}
+                        {'label': 'Off', 'value': 0},
+                        {'label': '10 levels', 'value': 10},
+                        {'label': '20 levels', 'value': 20},
+                        {'label': 'Full book', 'value': 999},
                     ],
-                    value=False,
+                    value=0,
                     clearable=False,
-                    style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
+                    style={"color": "#000", "width": "130px", "display": "inline-block", "marginRight": "20px"}
                 ),
                 html.Label("Volume Pies (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
                 dcc.Dropdown(
@@ -687,6 +689,26 @@ def _ticker_is_valid(ticker: str) -> bool:
         ok = True
     _symbol_valid_cache[ticker] = ok
     return ok
+
+
+def _clip_l2_levels(y_levels, z, z_bid, mid, n_each_side):
+    """Keep only the `n_each_side` price levels nearest `mid` on each side of the
+    L2 heatmap — the "L2 Depth" selector (10 / 20 / Full book) is a Bookmap-style
+    depth zoom. A falsy/large n_each_side, or a book already shorter than the
+    request, is returned unchanged (Full book uses a large sentinel)."""
+    if not y_levels or not n_each_side:
+        return y_levels, z, z_bid
+    arr = np.asarray(y_levels, dtype=float)
+    if n_each_side * 2 + 1 >= len(arr):
+        return y_levels, z, z_bid
+    ci = int(np.abs(arr - mid).argmin())          # level nearest the current mid
+    lo = max(0, ci - n_each_side)
+    hi = min(len(arr), ci + n_each_side + 1)
+    zc = z[lo:hi, :] if z is not None else None
+    zbc = z_bid[lo:hi, :] if z_bid is not None else None
+    return list(arr[lo:hi]), zc, zbc
+
+
 DATA_CACHE = {} # Cache for fast pie chart HUD updates
 
 # Progressive scrollback bounds: rendering is O(bars) in Plotly SVG, so the
@@ -1288,6 +1310,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 if _zm is not None and len(_closes):
                     # last VALID close — session-grid empty candles carry NaN
                     _mid = float(_closes.iloc[-1])
+                    # Depth-zoom: the "L2 Depth" selector (10 / 20 / Full book)
+                    # keeps that many price levels each side of the current mid,
+                    # so the heatmap reads like Bookmap at the chosen depth.
+                    _yl, _zm, _zb = _clip_l2_levels(_yl, _zm, _zb, _mid, show_l2)
                     # x_times = the candle timestamps the z-columns were built on
                     # (the fetch used the LAST max_candles of _l2_win); build_chart
                     # maps these to x_idx so the bands land on the right bars in

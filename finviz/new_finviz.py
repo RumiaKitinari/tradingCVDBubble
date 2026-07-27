@@ -74,8 +74,11 @@ def symbol_exists(ticker: str) -> bool:
     back HTTP 400/404 with no data. Used by the app to tell "valid ticker still
     backfilling" apart from "bad symbol" so the chart can say which one it is
     instead of spinning on "Fetching…" forever. Conservative on ambiguity —
-    a network hiccup or a token problem returns True so a real ticker is never
-    wrongly condemned.
+    ONLY a definitive "not found" (400/404) returns False. Everything else
+    (network hiccup, token 401/403, rate-limit 429, server 5xx) returns True so
+    a real ticker is never wrongly condemned by a transient response — and the
+    caller can safely cache the verdict, since a False here is always a stable
+    "symbol not found", never a passing outage.
     """
     importlib.reload(api_keys)
     url = f"{BASE_URL}?t={ticker}&p=d&auth={api_keys.FINVIZ_AUTH_TOKEN}"
@@ -83,10 +86,10 @@ def symbol_exists(ticker: str) -> bool:
         r = session.get(url, timeout=8)
     except Exception:
         return True                       # transient network issue, not the symbol
-    if r.status_code in (401, 403):
-        return True                       # token problem, not the symbol's fault
+    if r.status_code in (400, 404):
+        return False                      # FinViz definitively doesn't know this symbol
     if r.status_code != 200:
-        return False                      # 400/404 → FinViz doesn't know this symbol
+        return True                       # 401/403/429/5xx → transient, not the symbol's fault
     # 200 but header-only (no data rows) also means "not a tradable symbol here".
     return len((r.content or b"").strip().splitlines()) > 1
 

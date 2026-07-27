@@ -170,20 +170,28 @@ def _flag_auction(df: pd.DataFrame, mult: float = 6.0, spill_mult: float = 3.0) 
 # (<=7x observed).
 _AUCTION_REF_MULT = 10.0
 
-# Exchange condition codes (from AllLast `specialConditions`, stored by
-# tick_collector as `special_conditions`) that mark a single-priced closing/
-# opening cross — the industry-standard way to identify the auction print
-# (consolidated-tape codes 6 = Market Center Closing Trade, M = Official Close,
-# X = Cross/Auction). IBKR's EXACT strings for the US closing cross are
-# undocumented, so this set stays EMPTY (never a false positive) until real values
-# are read from captured data; fill it in and the code path in add_cvd_columns
-# takes precedence over the volume heuristic for freshly collected bars.
-_AUCTION_CONDITION_CODES: set[str] = set()
+# Exchange condition codes (tokens inside AllLast `specialConditions`, stored by
+# tick_collector as `special_conditions`) that mark the single-priced CLOSING
+# cross — the industry-standard way to identify the auction print. These are the
+# consolidated-tape sale conditions for the close:
+#     '6' = Closing Prints (Market Center Closing Trade)
+#     'M' = Market Center Official Close
+# CONFIRMED against a real close (NVDA 2026-07-27 16:00:00, verified with
+# scripts/inspect_auction_conditions.py): the closing-cross tick carried
+# specialConditions '6 X,F,F I,FT,FTI,I,T,TI' — i.e. token '6' matched. In the
+# same session, regular intraday flow only ever carried {I, F, 4, 7, V, W, C}
+# and '6' appeared exactly once, on the cross — so it is false-positive-safe.
+# ('M' was not observed but is kept as a harmless documented fallback for venues
+# that stamp the official close with it; it likewise never appears intraday.)
+# These are ORed with the volume heuristic in add_cvd_columns, which is still
+# needed: same-second auction volume also arrives on finviz/ibkr_hist bars that
+# carry NO condition string, and only the heuristic catches those.
+_AUCTION_CONDITION_CODES: set[str] = {"6", "M"}
 
 
 def _has_auction_condition(cond) -> bool:
     """True if a stored `special_conditions` string contains a known auction code.
-    Always False while _AUCTION_CONDITION_CODES is empty (pre-verification)."""
+    Tokens may be comma- and/or space-separated (e.g. '4 I,7 V,M')."""
     if not _AUCTION_CONDITION_CODES or not isinstance(cond, str) or not cond:
         return False
     tokens = {c.strip() for part in cond.split(",") for c in part.split() if c.strip()}

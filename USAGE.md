@@ -128,8 +128,17 @@ zoom, so each pie always covers a whole number of bars.
 
 ## 7. Level-2 (L2) Depth (on the price panel)
 
-Turn on **L2 Depth** to overlay the resting order book as a Bookmap-style
-heatmap behind the candles:
+The **L2 Depth** selector overlays the resting order book as a Bookmap-style
+heatmap behind the candles, and lets you choose how deep to look:
+
+- **Off** — no heatmap.
+- **10 levels** — the 10 price levels nearest the current price on each side
+  (the tight, near-touch book).
+- **20 levels** — 20 each side (a wider view).
+- **Full book** — every level the collector holds within the ±5% display band.
+
+Pick a shallower depth for a clean near-the-money read, or **Full book** for the
+complete Bookmap-style picture. The heatmap:
 
 - **Heatmap color = resting size** at each price: transparent/dark = thin,
   blue → cyan = ordinary depth, **yellow → white = the big walls** (top ~2% of
@@ -138,6 +147,46 @@ heatmap behind the candles:
   resting liquidity: **blue = support**, **amber = resistance**. The right-edge
   label shows the wall's average size (e.g. `R 205.58 · 1.2M`). Thicker/brighter
   lines = stronger, more persistent walls.
+
+The heatmap requests **20 book levels per side** from IBKR (up from 10), so the
+depth band now spans roughly ±5% of price — a deeper, more Bookmap-like view.
+IBKR's SMART depth caps how many levels it actually returns; the collector log
+line `[col] subscribed depth …` and the snapshot documents show the real count.
+The displayed price band is capped at ±5% by `L2_BAND` (tunable via the
+`L2_BAND` environment variable) so a lone far-away limit order can't stretch the
+axis and squash the candles.
+
+### Why the two S&R lines are critical to the trade approach
+
+The heatmap shows the *whole* resting book, but the **two lines distill it to the
+two prices that actually matter** — the largest, most persistent bid wall below
+(**support**) and ask wall above (**resistance**). They are where the biggest
+passive liquidity is parked, and they matter because **that is where aggressive
+flow meets a wall**:
+
+- **They are the battlegrounds.** A resistance wall is a large block of resting
+  sell limit orders; for price to rise through it, aggressive buyers must *absorb*
+  the entire wall. A support wall is the mirror image for a fall. Price tends to
+  **stall or reverse at these levels** and to **accelerate once one breaks**.
+- **They tell you *where*; CVD tells you *how hard*.** This is the core of the
+  approach: read the two together.
+  - CVD climbing (aggressive buying) **into a resistance wall that holds** →
+    buyers are being **absorbed**; the wall is winning → likely **rejection**.
+    (This is exactly what a 🟣 purple *absorption* bubble flags — big delta, no
+    price move — and it usually prints right at one of these lines.)
+  - CVD climbing into a resistance wall and the wall **shrinks / disappears** on
+    the heatmap → the wall is being eaten → a **breakout**, and for a squeeze
+    name that break can trigger the run we are looking for.
+- **They are the decision points.** Entries, exits and stops are placed relative
+  to these two levels: buy the hold at support, take profit into resistance, and
+  treat a decisive break (confirmed by CVD) as the signal to stay in for the
+  continuation. Everything else on the book is context; **these two lines are the
+  trigger levels.**
+
+In short: the heatmap is the terrain, and the two lines are the front lines where
+the fight between aggressive orders (CVD) and passive liquidity (the book) is
+decided — which is why we surface them explicitly instead of leaving them buried
+in the heatmap.
 
 L2 is depth-only and available for the actively collected tickers. It also works
 in **Jump-to** mode — jump to a past time and the book at that time is shown.
@@ -162,7 +211,8 @@ bars, auto-updating).
 
 - **Bubbles** — show/hide the Z-Score bubbles.
 - **Pies** — show/hide the volume pie strip.
-- **L2 Depth** — show/hide the order-book heatmap and S&R lines.
+- **L2 Depth** — choose the order-book heatmap depth (Off / 10 / 20 / Full book);
+  the S&R lines follow the chosen depth.
 - **Y Auto-Scale** — ON: the price axis auto-fits as you pan. OFF: your manual
   y-zoom sticks.
 - **Manual Refresh** — force a data reload without waiting for the poll.
