@@ -139,6 +139,46 @@ heatmap behind the candles:
   label shows the wall's average size (e.g. `R 205.58 · 1.2M`). Thicker/brighter
   lines = stronger, more persistent walls.
 
+The heatmap requests **20 book levels per side** from IBKR (up from 10), so the
+depth band now spans roughly ±5% of price — a deeper, more Bookmap-like view.
+IBKR's SMART depth caps how many levels it actually returns; the collector log
+line `[col] subscribed depth …` and the snapshot documents show the real count.
+The displayed price band is capped at ±5% by `L2_BAND` (tunable via the
+`L2_BAND` environment variable) so a lone far-away limit order can't stretch the
+axis and squash the candles.
+
+### Why the two S&R lines are critical to the trade approach
+
+The heatmap shows the *whole* resting book, but the **two lines distill it to the
+two prices that actually matter** — the largest, most persistent bid wall below
+(**support**) and ask wall above (**resistance**). They are where the biggest
+passive liquidity is parked, and they matter because **that is where aggressive
+flow meets a wall**:
+
+- **They are the battlegrounds.** A resistance wall is a large block of resting
+  sell limit orders; for price to rise through it, aggressive buyers must *absorb*
+  the entire wall. A support wall is the mirror image for a fall. Price tends to
+  **stall or reverse at these levels** and to **accelerate once one breaks**.
+- **They tell you *where*; CVD tells you *how hard*.** This is the core of the
+  approach: read the two together.
+  - CVD climbing (aggressive buying) **into a resistance wall that holds** →
+    buyers are being **absorbed**; the wall is winning → likely **rejection**.
+    (This is exactly what a 🟣 purple *absorption* bubble flags — big delta, no
+    price move — and it usually prints right at one of these lines.)
+  - CVD climbing into a resistance wall and the wall **shrinks / disappears** on
+    the heatmap → the wall is being eaten → a **breakout**, and for a squeeze
+    name that break can trigger the run we are looking for.
+- **They are the decision points.** Entries, exits and stops are placed relative
+  to these two levels: buy the hold at support, take profit into resistance, and
+  treat a decisive break (confirmed by CVD) as the signal to stay in for the
+  continuation. Everything else on the book is context; **these two lines are the
+  trigger levels.**
+
+In short: the heatmap is the terrain, and the two lines are the front lines where
+the fight between aggressive orders (CVD) and passive liquidity (the book) is
+decided — which is why we surface them explicitly instead of leaving them buried
+in the heatmap.
+
 L2 is depth-only and available for the actively collected tickers. It also works
 in **Jump-to** mode — jump to a past time and the book at that time is shown.
 

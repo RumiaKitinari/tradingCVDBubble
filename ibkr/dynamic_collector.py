@@ -433,8 +433,11 @@ def main():
                         help="disable Level-2 depth collection (ticks only)")
     parser.add_argument("--no-smart", action="store_true",
                         help="single-exchange depth instead of SMART aggregated")
-    parser.add_argument("--depth", type=int, default=10,
-                        help="L2 book rows per side (default: 10)")
+    parser.add_argument("--depth", type=int, default=20,
+                        help="L2 book rows per side to request from IBKR "
+                             "(default: 20 for a deeper, Bookmap-style heatmap; "
+                             "IBKR SMART depth may cap the number actually "
+                             "returned — see logs '[col] subscribed depth').")
     args = parser.parse_args()
     asyncio.run(_main_async(args))
 
