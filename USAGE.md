@@ -128,8 +128,17 @@ zoom, so each pie always covers a whole number of bars.
 
 ## 7. Level-2 (L2) Depth (on the price panel)
 
-Turn on **L2 Depth** to overlay the resting order book as a Bookmap-style
-heatmap behind the candles:
+The **L2 Depth** selector overlays the resting order book as a Bookmap-style
+heatmap behind the candles, and lets you choose how deep to look:
+
+- **Off** — no heatmap.
+- **10 levels** — the 10 price levels nearest the current price on each side
+  (the tight, near-touch book).
+- **20 levels** — 20 each side (a wider view).
+- **Full book** — every level the collector holds within the ±5% display band.
+
+Pick a shallower depth for a clean near-the-money read, or **Full book** for the
+complete Bookmap-style picture. The heatmap:
 
 - **Heatmap color = resting size** at each price: transparent/dark = thin,
   blue → cyan = ordinary depth, **yellow → white = the big walls** (top ~2% of
@@ -202,7 +211,8 @@ bars, auto-updating).
 
 - **Bubbles** — show/hide the Z-Score bubbles.
 - **Pies** — show/hide the volume pie strip.
-- **L2 Depth** — show/hide the order-book heatmap and S&R lines.
+- **L2 Depth** — choose the order-book heatmap depth (Off / 10 / 20 / Full book);
+  the S&R lines follow the chosen depth.
 - **Y Auto-Scale** — ON: the price axis auto-fits as you pan. OFF: your manual
   y-zoom sticks.
 - **Manual Refresh** — force a data reload without waiting for the poll.
