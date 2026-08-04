@@ -54,15 +54,14 @@ so it is clear what still needs attention.
    (odd lots; prices can lag the consolidated tape).
 
 ### Level-2 support/resistance display
-4. **Sometimes only one S&R line shows (e.g. support but no resistance).** Two
-   causes: (a) the **L2 Depth** selector clips the heatmap to N levels around the
-   current price, so a wall on the other side that sits just outside the clip is
-   dropped — most visible at **10 / 20 levels**; and (b) a side only draws a line
-   if it has a wall that passes the persistence + size threshold, so a one-sided
-   book at that moment yields a one-sided line. **Workaround:** switch L2 Depth to
-   **Full book** to see both sides. *(Follow-up idea: compute S&R on the full
-   book even when the heatmap is clipped, so both lines always reflect the real
-   strongest walls regardless of the depth zoom.)*
+4. **A side may still show no S&R line when the book is genuinely one-sided.** A
+   side only draws a line if it has a wall that passes the persistence + size
+   threshold, so if there is no meaningful resting wall on that side at the
+   moment, no line is drawn (this is correct, not a bug). *Fixed:* S&R is now
+   computed on the **full book** and both line prices are included in the price-
+   axis fit, so the depth selector (10 / 20 levels) no longer hides a real wall
+   that sits outside the visible heatmap — both lines show whenever both walls
+   exist, at any depth.
 5. **S&R side classification depends on the bid/ask dominance in the captured
    window.** If the last close drifts away from the resting book, the
    classification can skew everything to one side.
