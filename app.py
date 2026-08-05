@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import logging
 import json
+import os
 import time
 from dash.exceptions import PreventUpdate
 
@@ -1756,4 +1757,12 @@ def update_pie_charts_on_pan(relayout_data):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8050)
+    # Overridable so the app can run on a machine where 8050 is taken, or be
+    # reached from another host:  PORT=8060 HOST=0.0.0.0 python -m app
+    # DASH_DEBUG=0 turns off the auto-reloader (which otherwise starts a second
+    # process — keep it on for development, off when running it as a service).
+    app.run(
+        debug=os.environ.get("DASH_DEBUG", "1") != "0",
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8050")),
+    )
