@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import logging
 import json
+import os
 import time
 from dash.exceptions import PreventUpdate
 
@@ -212,15 +213,18 @@ app.index_string = '''
                                 vals.sort(function(a, b) { return a - b; });
                                 lo = vals[0];
                                 hi = vals[vals.length - 1];
-                                // Outlier-robust bounds: a lone block/auction bar
-                                // or a bad-print wick would otherwise stretch the
-                                // axis and crush everything else into a sliver.
-                                // Clip lo/hi to a Tukey fence (Q1-3·IQR, Q3+3·IQR)
-                                // — k=3 is the "far out" fence so only true
-                                // extremes are dropped; when there are no outliers
-                                // the fence sits outside the data and nothing is
-                                // clipped. Needs enough points for a stable IQR.
-                                if (vals.length >= 8) {
+                                // Outlier-robust bounds: a lone bad-print wick
+                                // would otherwise stretch the axis and crush the
+                                // candles into a sliver. Clip lo/hi to a Tukey
+                                // fence (Q1-3·IQR, Q3+3·IQR) — k=3 is the "far
+                                // out" fence so only true extremes are dropped;
+                                // when there are no outliers the fence sits
+                                // outside the data and nothing is clipped. Needs
+                                // enough points for a stable IQR.
+                                // PRICE PANEL ONLY (yref 'y'): the indicator
+                                // panels (y2/y4) use plain min–max so an auction
+                                // or block bar's real magnitude is shown in full.
+                                if (yref === 'y' && vals.length >= 8) {
                                     var q1 = __qtile(vals, 0.25), q3 = __qtile(vals, 0.75), iqr = q3 - q1;
                                     if (iqr > 0) {
                                         lo = Math.max(lo, q1 - 3.0 * iqr);
@@ -239,6 +243,28 @@ app.index_string = '''
                                     var m = (hi - lo) * HEAT_MARGIN;
                                     lo = Math.min(lo, Math.max(hlo, lo - m));
                                     hi = Math.max(hi, Math.min(hhi, hi + m));
+                                }
+                                // The two S&R lines are LAYOUT SHAPES (not traces),
+                                // so the loop above never sees them. They are the
+                                // key trade signal and the depth selector may clip a
+                                // wall out of the heatmap, so pull the price-panel
+                                // S&R line prices into the fit UNCONDITIONALLY (not
+                                // capped like the heatmap) — otherwise this
+                                // client-side refit re-crops the axis to candles +
+                                // clipped heatmap right after the server render and
+                                // hides the far wall (the "only one S&R line shows
+                                // at 10 levels" bug). On the price panel (yref 'y')
+                                // the only line shapes are the S&R lines; the source
+                                // shading / demarcation shapes use yref 'paper'.
+                                if (yref === 'y' && gd._fullLayout.shapes) {
+                                    gd._fullLayout.shapes.forEach(function(sh) {
+                                        if (sh && sh.type === 'line' &&
+                                            (sh.yref === 'y' || sh.yref === 'y1') &&
+                                            sh.y0 != null) {
+                                            if (sh.y0 < lo) lo = sh.y0;
+                                            if (sh.y0 > hi) hi = sh.y0;
+                                        }
+                                    });
                                 }
                                 var pad = (hi - lo) * YPAD;
                                 var new_lo = lo - pad;
@@ -468,22 +494,13 @@ app.layout = html.Div([
             
             dbc.Col([
                 html.Label("Active Timeframe:", style={"fontWeight": "bold", "color": "#eee"}),
-                html.Div([
-                    dcc.Dropdown(
-                        id='timeframe-dropdown',
-                        options=[], # Populated by callback
-                        value='1min',
-                        clearable=False,
-                        style={"color": "#000", "flex": 1, "minWidth": "90px"}
-                    ),
-                    dbc.Input(
-                        id='timeframe-custom',
-                        type='text',
-                        placeholder='Custom',
-                        debounce=True,
-                        style={"color": "#000", "backgroundColor": "white", "width": "80px", "marginLeft": "5px"}
-                    )
-                ], style={"display": "flex", "alignItems": "center"})
+                dcc.Dropdown(
+                    id='timeframe-dropdown',
+                    options=[], # Populated by callback
+                    value='1min',
+                    clearable=False,
+                    style={"color": "#000", "minWidth": "90px"}
+                )
             ], width=3),
             
             dbc.Col([
@@ -549,12 +566,14 @@ app.layout = html.Div([
                 dcc.Dropdown(
                     id='l2-dropdown',
                     options=[
-                        {'label': 'On', 'value': True},
-                        {'label': 'Off', 'value': False}
+                        {'label': 'Off', 'value': 0},
+                        {'label': '10 levels', 'value': 10},
+                        {'label': '20 levels', 'value': 20},
+                        {'label': 'Full book', 'value': 999},
                     ],
-                    value=False,
+                    value=0,
                     clearable=False,
-                    style={"color": "#000", "width": "100px", "display": "inline-block", "marginRight": "20px"}
+                    style={"color": "#000", "width": "130px", "display": "inline-block", "marginRight": "20px"}
                 ),
                 html.Label("Volume Pies (Bottom):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
                 dcc.Dropdown(
@@ -572,7 +591,25 @@ app.layout = html.Div([
                 )
             ], width=12, className="d-flex align-items-center justify-content-end")
         ], className="mb-3"),
-        
+
+        # Date/time jump: load a fixed ±1500-bar window around a pinned instant
+        # (ET, as stored) instead of the live tail. Empty + Live = normal mode.
+        dbc.Row([
+            dbc.Col([
+                html.Label("Jump to (ET):", style={"fontWeight": "bold", "color": "#eee", "marginRight": "10px"}),
+                dcc.Input(
+                    id='anchor-input', type='text', debounce=False,
+                    placeholder='YYYY-MM-DD HH:MM',
+                    style={"width": "180px", "marginRight": "8px"}
+                ),
+                html.Button("Jump", id="anchor-go", n_clicks=0,
+                            className="btn btn-outline-warning btn-sm", style={"marginRight": "6px"}),
+                html.Button("Live", id="anchor-clear", n_clicks=0,
+                            className="btn btn-outline-success btn-sm"),
+                html.Span(id="anchor-status", style={"color": "#ffa726", "marginLeft": "12px", "fontSize": "0.85em"}),
+            ], width=12, className="d-flex align-items-center justify-content-end")
+        ], className="mb-2"),
+
         # Main Chart Area
         html.Div([
             dcc.Graph(
@@ -613,6 +650,9 @@ app.layout = html.Div([
         # gesture triggers one rebuild instead of a per-frame callback storm
         # (which locked the UI once the SVG candle count grew on zoom-out).
         dcc.Store(id='settled-relayout', data=None),
+        # Anchor (date/time jump): a datetime string pins a fixed ±N-bar
+        # historical window; None = live tail. Set by the Jump/Live buttons.
+        dcc.Store(id='anchor-active', data=None),
         dcc.Store(id='pan-state', data='{"panned": false, "time": 0}')
         
         
@@ -624,35 +664,21 @@ app.layout = html.Div([
 
 @app.callback(
     [Output('timeframe-dropdown', 'options'),
-     Output('timeframe-dropdown', 'value'),
-     Output('timeframe-custom', 'value')],
-    [Input('source-radio', 'value'),
-     Input('timeframe-custom', 'value')],
-    [State('timeframe-dropdown', 'value'),
-     State('timeframe-dropdown', 'options')]
+     Output('timeframe-dropdown', 'value')],
+    [Input('source-radio', 'value')],
+    [State('timeframe-dropdown', 'value')]
 )
-def update_timeframes(base_tf, custom_tf, current_value, current_options):
-    import dash
-    ctx = dash.callback_context
-    trigger = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
-
-    if 'timeframe-custom' in trigger and custom_tf:
-        opts = current_options or []
-        existing = [o['value'] for o in opts]
-        if custom_tf not in existing:
-            opts.append({'label': f"{custom_tf} (Custom)", 'value': custom_tf})
-        return opts, custom_tf, ""
-        
-    # Default or source-radio changed
+def update_timeframes(base_tf, current_value):
+    # The available timeframes depend only on the data source (tick vs FinViz).
     if base_tf == 'raw_tick':
         tfs = list(TIMEFRAME_RULE_IBKR.keys())
         new_value = "1min" if current_value not in tfs else current_value
-    else: 
+    else:
         tfs = list(TIMEFRAME_RULE.keys())
         new_value = current_value if current_value in tfs else "1hr"
-        
+
     options = [{'label': t, 'value': t} for t in tfs]
-    return options, new_value, ""
+    return options, new_value
 
 
 # Global state to prevent spamming FinViz fetches
@@ -664,6 +690,48 @@ last_finviz_fetch = {}
 # spawn just piles up failing processes. A 1-day backfill runs ~65s (see DONE.md).
 last_backfill = {}
 BACKFILL_COOLDOWN_SEC = 120
+
+# Ticker-validity cache. When a fresh ticker loads empty we probe FinViz once to
+# tell a valid-but-still-backfilling symbol from an unknown one, and remember the
+# verdict so the 10-s poll doesn't re-probe every tick. A ticker that later
+# collects real data drops out of the empty path entirely, so a False here is
+# only ever set for symbols FinViz doesn't recognize.
+_symbol_valid_cache = {}
+
+
+def _ticker_is_valid(ticker: str) -> bool:
+    """Cached wrapper around finviz.symbol_exists (see there). Defaults to True
+    on any error so a real ticker is never wrongly flagged as unknown."""
+    if ticker in _symbol_valid_cache:
+        return _symbol_valid_cache[ticker]
+    try:
+        from finviz.new_finviz import symbol_exists
+        ok = bool(symbol_exists(ticker))
+    except Exception as e:
+        logging.warning(f"symbol validity probe failed for {ticker}: {e}")
+        ok = True
+    _symbol_valid_cache[ticker] = ok
+    return ok
+
+
+def _clip_l2_levels(y_levels, z, z_bid, mid, n_each_side):
+    """Keep only the `n_each_side` price levels nearest `mid` on each side of the
+    L2 heatmap — the "L2 Depth" selector (10 / 20 / Full book) is a Bookmap-style
+    depth zoom. A falsy/large n_each_side, or a book already shorter than the
+    request, is returned unchanged (Full book uses a large sentinel)."""
+    if not y_levels or not n_each_side:
+        return y_levels, z, z_bid
+    arr = np.asarray(y_levels, dtype=float)
+    if n_each_side * 2 + 1 >= len(arr):
+        return y_levels, z, z_bid
+    ci = int(np.abs(arr - mid).argmin())          # level nearest the current mid
+    lo = max(0, ci - n_each_side)
+    hi = min(len(arr), ci + n_each_side + 1)
+    zc = z[lo:hi, :] if z is not None else None
+    zbc = z_bid[lo:hi, :] if z_bid is not None else None
+    return list(arr[lo:hi]), zc, zbc
+
+
 DATA_CACHE = {} # Cache for fast pie chart HUD updates
 
 # Progressive scrollback bounds: rendering is O(bars) in Plotly SVG, so the
@@ -675,6 +743,27 @@ DEFAULT_BARS = MAX_CANDLES          # 1,000
 # it for more history at the cost of a slower far-left view. Keep in sync with the
 # HARD_CAP constant in the grow_scrollback clientside function (index_string).
 BARS_HARD_CAP = 6000
+
+# Anchor (date/time jump) mode: bars loaded on EACH side of the pinned instant.
+ANCHOR_BARS_EACH_SIDE = 1500
+# Initial on-screen width (bars) for an anchor jump, centered on the pinned bar
+# so the exact typed instant sits mid-screen rather than at a window edge.
+ANCHOR_VIEW_BARS = 200
+
+
+def _parse_anchor(val):
+    """Parse the anchor-active Store into an ET-naive datetime, or None (live).
+    Accepts 'YYYY-MM-DD HH:MM[:SS]' or 'YYYY-MM-DD' (ET, as stored in Mongo)."""
+    if not val or not isinstance(val, str):
+        return None
+    from datetime import datetime
+    s = val.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
 
 def _resolve_bars(bars_to_show, active_tf) -> int:
     """Per-TF bars-to-show store value → effective render cap."""
@@ -776,6 +865,26 @@ def update_refresh_interval(val):
         return 10000, True
     return val, False
 
+# Date/time jump: "Jump" pins the typed instant (anchor-active Store → a fixed
+# ±ANCHOR_BARS_EACH_SIDE window in update_graph); "Live" clears it back to the
+# live tail. The status span echoes the active pin.
+@app.callback(
+    [Output('anchor-active', 'data'),
+     Output('anchor-status', 'children')],
+    [Input('anchor-go', 'n_clicks'),
+     Input('anchor-clear', 'n_clicks')],
+    State('anchor-input', 'value'),
+    prevent_initial_call=True,
+)
+def set_anchor(go_clicks, clear_clicks, anchor_text):
+    trig = ctx.triggered_id
+    if trig == 'anchor-clear':
+        return None, ""
+    dt = _parse_anchor(anchor_text)
+    if dt is None:
+        return None, "⚠ Use format YYYY-MM-DD HH:MM"
+    return dt.strftime("%Y-%m-%d %H:%M:%S"), f"📌 {dt.strftime('%Y-%m-%d %H:%M')} (±{ANCHOR_BARS_EACH_SIDE} bars)"
+
 @app.callback(
     [Output('main-chart', 'figure'),
      Output('last-updated-text', 'children'),
@@ -792,7 +901,8 @@ def update_refresh_interval(val):
      Input('bubbles-dropdown', 'value'),
      Input('l2-dropdown', 'value'),
      Input('yauto-check', 'value'),
-     Input('bars-to-show', 'data')],
+     Input('bars-to-show', 'data'),
+     Input('anchor-active', 'data')],
     # NOTE: deliberately NO State('main-chart', 'figure') here — that would
     # upload the entire multi-MB figure JSON from the browser on every
     # interval tick, which is what made the 10-s refresh feel slow.
@@ -803,7 +913,7 @@ def update_refresh_interval(val):
      State('main-chart', 'relayoutData'),
      State('manual-y', 'data')]
 )
-def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, last_state_json, pan_state_json, relayout_data, manual_y_store):
+def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load, pie_chart_count, show_bubbles, show_l2, yauto_value, bars_to_show, anchor_active, last_state_json, pan_state_json, relayout_data, manual_y_store):
     trigger = ctx.triggered_id
     
     if not ticker:
@@ -912,13 +1022,28 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # materialized tier (1day chart reads ~2k daily rows, never 1-sec
         # bars). The raw_tick chart and the legacy FinViz-only radio keep the
         # old run_pipeline path.
+        anchor_dt = None
         if tier_served:
             default_win = SERVE_WINDOW_DAYS.get(active_tf)
             actual_days = None if default_win is None else max(days_req, default_win)
             if trigger == 'refresh-btn':
                 invalidate_cache(ticker)
             _maybe_rollup(ticker)
-            df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
+            # Anchor mode: a pinned datetime loads a fixed ±N-bar window around
+            # that instant (a historical jump) instead of the live tail. Parsed
+            # here from the anchor-active Store; falls back to live on any error.
+            anchor_dt = _parse_anchor(anchor_active)
+            if anchor_dt is not None:
+                df_base, frames = run_pipeline_tiered(
+                    ticker, active_tf, anchor=anchor_dt, bars_each_side=ANCHOR_BARS_EACH_SIDE)
+                # The pinned bar sits at the CENTER of the ±N window; render the
+                # WHOLE loaded window (never the live-tail cap) so build_chart's
+                # iloc[-max_candles:] trim can't drop the anchor region. The
+                # window is bounded (~2·N bars ≤ hard cap), so this stays sane.
+                if active_tf in frames and len(frames[active_tf]):
+                    bars_req = max(bars_req, len(frames[active_tf]))
+            else:
+                df_base, frames = run_pipeline_tiered(ticker, active_tf, days=actual_days)
         else:
             # Dynamic Lookback based on Timeframe (legacy path)
             min_days = 3
@@ -943,6 +1068,12 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         
         # Fallback & Auto-Backfill Pipeline
         fallback_msg = ""
+        # Distinguishes a real fetch failure (an exception was raised while
+        # fetching FinViz/spawning the IBKR backfill) from the normal "data not
+        # here YET" case — a brand-new 1sec ticker has its IBKR backfill running
+        # asynchronously in the background, so an empty frame is "fetching", not
+        # "failed". Set only in the except blocks below.
+        fetch_error = None
         
         # Tiered path: a new/uncovered ticker gets instant history — FinViz
         # daily (~8y, one request) + FinViz i1 (recent 1-min) merged through
@@ -962,6 +1093,7 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                 fallback_msg = " [FinViz history backfilled]"
             except Exception as e:
                 logging.error(f"Instant FinViz backfill failed: {e}")
+                fetch_error = e
 
         # Daily-tier coverage check: a ticker may have a few rolled-up days
         # (from i1/1sec) without ever having had its FinViz daily history
@@ -1021,18 +1153,50 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                     fallback_msg = " [Rendering FinViz Fallback - IBKR Backfill in Progress...]"
                 except Exception as e:
                     logging.error(f"Fallback fetch failed: {e}")
+                    fetch_error = e
         
         if df_base.empty:
+            # Three different empty states, shown differently so the user isn't
+            # misled into thinking a valid ticker failed:
+            #   • symbol unknown → FinViz doesn't recognize the ticker at all
+            #     (e.g. a typo, or a symbol not on FinViz/IBKR). It would spin on
+            #     "Fetching…" forever, so we probe once and say so outright.
+            #   • fetch_error set → an exception was raised while fetching
+            #     (network, API block) → a real, transient error.
+            #   • otherwise → the data just isn't here YET. A new 1sec ticker has
+            #     its IBKR backfill running asynchronously (seconds to minutes),
+            #     and FinViz can't supply 1sec at all, so an empty frame is
+            #     normal "fetching", not a failure. The poll fills it in.
+            is_1sec = base_tf in ('1sec', 'raw_tick')
+            if not _ticker_is_valid(ticker):
+                _title = (f"⚠ '{ticker}' is not a recognized ticker — check the "
+                          f"symbol. (No data on FinViz or IBKR.)")
+                _status = "Unknown ticker"
+                _color = "#ef5350"
+            elif fetch_error is not None:
+                _title = f"⚠ Error fetching {ticker}: {fetch_error}"
+                _status = "Fetch error"
+                _color = "#ef5350"
+            elif is_1sec:
+                _title = (f"⏳ Fetching {ticker} 1-sec data — IBKR backfill in "
+                          f"progress. This can take up to a minute; the chart "
+                          f"fills in automatically.")
+                _status = "Fetching…"
+                _color = "#ffa726"
+            else:
+                _title = f"⏳ Fetching {ticker} — backfill in progress…"
+                _status = "Fetching…"
+                _color = "#ffa726"
             empty_fig = go.Figure()
             empty_fig.update_layout(
-                template="plotly_dark", 
-                title=dict(text=f"No data available for {ticker} in MongoDB (and auto-fetch failed).", font=dict(color="white")),
+                template="plotly_dark",
+                title=dict(text=_title, font=dict(color=_color)),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
             )
-            return empty_fig, "No Data", "", "{}", pan_state_json
+            return empty_fig, _status, "", "{}", pan_state_json
 
         # Ticker is confirmed real (data loaded) → NOW ask the dynamic collector
         # for live ticks. Doing it here (not at callback entry) keeps partial /
@@ -1085,8 +1249,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
 
         # A timeframe/ticker/source switch is a fresh view: forget the pan
         # window from the previous chart (its x_idx coordinates are
-        # meaningless here) and open at the newest bars.
-        if trigger in ('timeframe-dropdown', 'ticker-input', 'source-radio'):
+        # meaningless here) and open at the newest bars. An anchor jump (or
+        # "Live" clear) is likewise a fresh view — reset the pan so the window
+        # snaps to the anchor bar (below) rather than a stale panned window.
+        if trigger in ('timeframe-dropdown', 'ticker-input', 'source-radio', 'anchor-active'):
             panned = False
             pan_state = {'panned': False, 'time': 0}
 
@@ -1098,7 +1264,11 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # pan-state Store (written by a parallel callback) may not have
         # committed yet — trust relayoutData directly so the grown chart
         # keeps the user's window instead of snapping to the tail.
-        if trigger == 'bars-to-show' or bars_grew:
+        # EXCEPT an anchor jump: it legitimately grows bars_req (whole ±N
+        # window, see above) which would read here as bars_grew and force
+        # panned=True, suppressing the anchor centering below. The jump is a
+        # fresh centered view, not a pan, so leave panned alone for it.
+        if (trigger == 'bars-to-show' or bars_grew) and trigger != 'anchor-active':
             panned = True
             pan_state['panned'] = True
             pan_state.setdefault('time', time.time())
@@ -1143,14 +1313,46 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         if show_l2:
             try:
                 _l2_key = active_tf if active_tf in frames else list(frames.keys())[0]
-                _l2_tail = frames[_l2_key].iloc[-bars_req:]
-                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_tail, max_candles=300)
-                _closes = _l2_tail["close"].dropna() if len(_l2_tail) else _l2_tail
+                _l2_full = frames[_l2_key]
+                # Live view renders the tail, so match L2 to the tail. An anchor
+                # jump renders a window CENTERED on the pinned bar, so match L2 to
+                # THAT window instead — otherwise the depth is fetched/placed at
+                # the frame's end (far off-screen) and the heatmap never shows.
+                if anchor_dt is not None and len(_l2_full):
+                    try:
+                        _apos = _l2_full.index.get_indexer(
+                            [pd.Timestamp(anchor_dt)], method='nearest')[0]
+                    except Exception:
+                        _apos = len(_l2_full) - 1
+                    _lo = max(0, _apos - 150)
+                    _l2_win = _l2_full.iloc[_lo:_apos + 150]
+                else:
+                    _l2_win = _l2_full.iloc[-bars_req:]
+                _, _yl, _zm, _zb = fetch_and_aggregate_l2_data(ticker, _l2_win, max_candles=300)
+                _closes = _l2_win["close"].dropna() if len(_l2_win) else _l2_win
                 if _zm is not None and len(_closes):
                     # last VALID close — session-grid empty candles carry NaN
                     _mid = float(_closes.iloc[-1])
+                    # S&R is computed on the FULL book (before the depth clip) so
+                    # the strongest support AND resistance walls are always found
+                    # and classified with full-book context — the depth selector
+                    # must never hide one side. (The score threshold and bid/ask
+                    # dominance are relative to the levels passed in, so clipping
+                    # first would drop the far wall and skew the classification.)
+                    _sr = compute_support_resistance(_yl, _zm, _mid, z_bid=_zb)
+                    # Depth-zoom: the "L2 Depth" selector (10 / 20 / Full book)
+                    # then clips only the HEATMAP display to that many levels each
+                    # side of the current mid, so it reads like Bookmap at the
+                    # chosen depth while the two S&R lines stay full-book.
+                    _yl, _zm, _zb = _clip_l2_levels(_yl, _zm, _zb, _mid, show_l2)
+                    # x_times = the candle timestamps the z-columns were built on
+                    # (the fetch used the LAST max_candles of _l2_win); build_chart
+                    # maps these to x_idx so the bands land on the right bars in
+                    # either tail or anchor-centered views.
+                    _nz = int(_zm.shape[1])
                     l2_data = {"y_levels": _yl, "z": _zm,
-                               "sr": compute_support_resistance(_yl, _zm, _mid, z_bid=_zb)}
+                               "x_times": list(_l2_win.index[-_nz:]),
+                               "sr": _sr}
                 else:
                     logging.info(f"L2: no depth snapshots for {ticker} in the visible window")
             except Exception as e:
@@ -1177,9 +1379,27 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         current_state['n_active'] = len(df_active)
         current_state_json = json.dumps(current_state)
 
-        # View window: keep the panned window, else auto-tail to the newest bars.
+        # View window: an un-panned anchor jump centers on the pinned bar; a
+        # panned view keeps its window; otherwise auto-tail to the newest bars.
         N_total = len(df_active)
-        if x_range is not None:
+        anchor_view = None
+        if anchor_dt is not None and not panned and N_total:
+            # Locate the bar nearest the pinned instant and frame a fixed-width
+            # window centered on it, so the exact typed date/time lands mid-
+            # screen instead of the front (or tail) of the ±N loaded window.
+            try:
+                pos = df_active.index.get_indexer([pd.Timestamp(anchor_dt)],
+                                                  method='nearest')[0]
+                if pos >= 0:
+                    cx = float(df_active['x_idx'].iloc[pos])
+                    half = ANCHOR_VIEW_BARS / 2.0
+                    anchor_view = (cx - half, cx + half)
+            except Exception as e:
+                logging.warning(f"anchor centering failed ({anchor_dt}): {e}")
+
+        if anchor_view is not None:
+            x0, x1 = anchor_view
+        elif x_range is not None:
             x0, x1 = float(x_range[0]), float(x_range[1])
         else:
             x0, x1 = max(0, N_total - 100), N_total
@@ -1218,8 +1438,10 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
         # trigger the axes stay untouched and uirevision preserves whatever
         # manual scale the user set on the price axis.
         y_auto = bool(yauto_value)
+        # 'l2-dropdown' included so changing the L2 depth always refits the price
+        # axis to the new heatmap + both S&R lines, even when Y Auto-Scale is off.
         fresh_view = trigger in ('ticker-input', 'source-radio',
-                                 'timeframe-dropdown', 'yauto-check')
+                                 'timeframe-dropdown', 'yauto-check', 'l2-dropdown')
 
         df_vis = df_active[(df_active['x_idx'] >= x0) & (df_active['x_idx'] <= x1)]
         if not df_vis.empty and (y_auto or fresh_view):
@@ -1247,6 +1469,17 @@ def update_graph(ticker, base_tf, active_tf, n_intervals, n_clicks, days_to_load
                         _pad = max(0.02, 0.05 * (max(_lv) - min(_lv)))
                         y_price = [min(y_price[0], min(_lv) - _pad),
                                    max(y_price[1], max(_lv) + _pad)]
+                # The two S&R lines are computed on the full book but the heatmap
+                # may be clipped to a shallow depth, so a wall can sit outside the
+                # visible band. Include the S&R prices in the fit so BOTH the
+                # support and resistance lines are always on screen — they are the
+                # key signal, and the depth selector must not hide one.
+                _sr_lv = [lvl["price"] for lvl in (l2_data.get("sr") or [])]
+                if _sr_lv and y_price:
+                    _srpad = 0.02 * (max(_sr_lv) - min(_sr_lv)) if len(_sr_lv) > 1 else 0.0
+                    _srpad = max(0.02, _srpad)
+                    y_price = [min(y_price[0], min(_sr_lv) - _srpad),
+                               max(y_price[1], max(_sr_lv) + _srpad)]
             y_price = user_y.get('yaxis', y_price)
             y_pa = user_y.get('yaxis2', y_pa)
             y_pb = user_y.get('yaxis4', y_pb)
@@ -1524,4 +1757,12 @@ def update_pie_charts_on_pan(relayout_data):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8050)
+    # Overridable so the app can run on a machine where 8050 is taken, or be
+    # reached from another host:  PORT=8060 HOST=0.0.0.0 python -m app
+    # DASH_DEBUG=0 turns off the auto-reloader (which otherwise starts a second
+    # process — keep it on for development, off when running it as a service).
+    app.run(
+        debug=os.environ.get("DASH_DEBUG", "1") != "0",
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8050")),
+    )

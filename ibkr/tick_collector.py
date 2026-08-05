@@ -110,6 +110,13 @@ class TickCollector:
         self.tick_buffer: list[tuple[float, float, float]] = []
         self.raw_buffer = []
         self.quote_buffer = []
+        # Distinct AllLast specialConditions strings seen in the current second.
+        # Captured so the closing-auction print can eventually be flagged by its
+        # exchange condition code (the ground-truth signal) instead of the volume
+        # heuristic — see cvd.calculator._flag_auction. IBKR's exact code strings
+        # for the closing cross are undocumented, so we STORE them now and add the
+        # matcher once real values are observed at 16:00.
+        self.cond_seen: set[str] = set()
 
         mongo = MongoClient(MONGO_URI)
         self.col = mongo[DB_NAME]["candles"]
@@ -176,9 +183,15 @@ class TickCollector:
                     self._flush(self.current_second)
                 self.current_second = sec
                 self.tick_buffer = []
+                self.cond_seen = set()
 
             price = float(tick.price)
             size = float(tick.size)
+            # AllLast condition string (undocumented for the closing cross;
+            # captured raw for offline verification). May be "" for regular sales.
+            cond = (getattr(tick, "specialConditions", "") or "").strip()
+            if cond:
+                self.cond_seen.add(cond)
             # Snapshot the classification path + NBBO staleness BEFORE mutating
             # prev-tick state, so we can audit quote-lag offline.
             method = self._classify_method(price)
@@ -212,6 +225,7 @@ class TickCollector:
                 "ask_size": self.ask_size,
                 "quote_age_ms": quote_age_ms,
                 "cls": method,
+                "cond": cond,
             })
 
     def _on_bidask_tick(self, ticker_obj):
@@ -325,6 +339,10 @@ class TickCollector:
             "delta":          bv - sv,
             "source":         "ibkr_tick",
         }
+        # Persist the distinct AllLast condition codes seen this second (if any),
+        # so the closing-cross print can later be flagged by its exchange code.
+        if self.cond_seen:
+            bar["special_conditions"] = ",".join(sorted(self.cond_seen))
 
         try:
             self.col.update_one(

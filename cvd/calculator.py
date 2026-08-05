@@ -136,57 +136,108 @@ def decompose_candle(o: float, h: float, l: float, c: float, v: float) -> dict:
 # 2. Detect "Auction" Anomaly
 # ---------------------------
 
-def _flag_auction(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
-    """Pandas Boolean Series marking each day's closing bars.
+def _flag_auction(df: pd.DataFrame, mult: float = 6.0, spill_mult: float = 3.0) -> pd.Series:
+    """Boolean Series marking each day's closing-cross bars.
 
-    Aggregates into a sequence of MINUTES. Searches for anomalous times 
-    (indicated by mult / spill_mult) and removes them from the Pandas time 
-    series. 
+    The closing auction is one batch print (Market-On-Close cross) that the
+    consolidated tape stamps with a sale-condition code (6 / M / X). We do not
+    have those codes in backfilled / FinViz data, so we detect the cross by its
+    volume signature — but the signature differs by granularity:
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        
-    mult : float, optional
-        "Extreme-ness" threshold for Auction flag
-        (default is 10.0x median)
-    spill_mult : float, optional
-        If volume is ___ times larger, then is also flagged as Auction
-        (default is 3.0x median)
-
-    Returns
-    -------
-    pd.Series
-        A sequence of MINUTES which are flagged as Auction (True) or not (False)
-
-    Notes
-    -----        
-    The volume thresholds below are calibrated for 1-MINUTE bars. At 1-second
-        granularity the volume distribution has a much heavier tail (a single
-        block trade easily exceeds 10x the median 1-sec volume), so running the
-        detection directly on sub-minute bars flags ordinary intraday spikes as
-        auctions almost every day. For sub-minute data we therefore aggregate the
-        volume to 1-minute buckets, run the detection there, and map the flagged
-        minutes back onto the underlying bars.
+    * SUB-MINUTE (1-sec bars present): the cross lands in a single second that
+      dwarfs the day. We flag any bar inside the fixed closing window whose
+      volume exceeds `_AUCTION_REF_MULT`x the day's regular-session (09:30-15:55)
+      1-second 99th-percentile volume. Measured across names the cross second is
+      44-9000x that p99 while genuine 15:59 continuous trading stays under ~7x,
+      so the window separates cleanly and name-agnostically (a heavy-volume,
+      low-price name like SOFI, whose cross is only ~10x its MINUTE median and so
+      slips past the minute test, is caught here).
+    * 1-MINUTE+ (coarse tiers, no sub-second detail): fall back to the minute
+      test — the closing-window minute must dwarf the day's 09:30-13:00 median
+      (> `mult`x) — plus a forward spill for the 16:00 overflow bar.
     """
     if len(df) >= 2:
         # PART 1: Check if average time-interval (for data) is < 1m accuracy
         spacing = df.index.to_series().diff().dt.total_seconds().median()
-
-        if pd.notna(spacing) and spacing < 60: # PART 2: If is second-by-second...
-            # PART 2.1. Aggregates data into "minute" blocks
-            vol_1min = df["volume"].resample("1min").sum()
-            vol_1min = vol_1min[vol_1min > 0]          # drop empty minutes
-
-            # PART 2.2. Calls `_flag_auction_1min()` to determine auction on aggregated data
-            minute_flags = _flag_auction_1min(vol_1min.to_frame("volume"), mult, spill_mult)
-            flagged = minute_flags[minute_flags].index
-            return pd.Series(df.index.floor("min").isin(flagged), index=df.index)
+        if pd.notna(spacing) and spacing < 60:
+            return _flag_auction_subminute(df)
     return _flag_auction_1min(df, mult, spill_mult)
 
 
-def _flag_auction_1min(df: pd.DataFrame, mult: float = 10.0, spill_mult: float = 3.0) -> pd.Series:
-    """Flags closing on 3-minute-level (or coarser) volume bars.
+# Closing-window bar counts as the auction when its volume exceeds this multiple
+# of the day's regular-session 1-second p99 (see _flag_auction). 10x sits in the
+# clean gap between the cross (>=44x observed) and pre-close continuous flow
+# (<=7x observed).
+_AUCTION_REF_MULT = 10.0
+
+# Exchange condition codes (tokens inside AllLast `specialConditions`, stored by
+# tick_collector as `special_conditions`) that mark the single-priced CLOSING
+# cross — the industry-standard way to identify the auction print. These are the
+# consolidated-tape sale conditions for the close:
+#     '6' = Closing Prints (Market Center Closing Trade)
+#     'M' = Market Center Official Close
+# CONFIRMED against a real close (NVDA 2026-07-27 16:00:00, verified with
+# scripts/inspect_auction_conditions.py): the closing-cross tick carried
+# specialConditions '6 X,F,F I,FT,FTI,I,T,TI' — i.e. token '6' matched. In the
+# same session, regular intraday flow only ever carried {I, F, 4, 7, V, W, C}
+# and '6' appeared exactly once, on the cross — so it is false-positive-safe.
+# ('M' was not observed but is kept as a harmless documented fallback for venues
+# that stamp the official close with it; it likewise never appears intraday.)
+# These are ORed with the volume heuristic in add_cvd_columns, which is still
+# needed: same-second auction volume also arrives on finviz/ibkr_hist bars that
+# carry NO condition string, and only the heuristic catches those.
+_AUCTION_CONDITION_CODES: set[str] = {"6", "M"}
+
+
+def _has_auction_condition(cond) -> bool:
+    """True if a stored `special_conditions` string contains a known auction code.
+    Tokens may be comma- and/or space-separated (e.g. '4 I,7 V,M')."""
+    if not _AUCTION_CONDITION_CODES or not isinstance(cond, str) or not cond:
+        return False
+    tokens = {c.strip() for part in cond.split(",") for c in part.split() if c.strip()}
+    return bool(tokens & _AUCTION_CONDITION_CODES)
+
+
+def _flag_auction_subminute(df: pd.DataFrame, ref_mult: float = _AUCTION_REF_MULT) -> pd.Series:
+    """Sub-minute closing-cross detection (see _flag_auction).
+
+    Flags individual sub-minute bars inside the fixed closing window
+    (15:59-16:01 normal day, 12:59-13:01 half-day) whose volume dwarfs the day's
+    regular-session 1-second p99. A half-day is decided by EVIDENCE (thin
+    post-13:00 trade), not by where the data ends, so a live pre-close view gets
+    no early-close verdict.
+    """
+    flag = pd.Series(False, index=df.index)
+    vol = df["volume"]
+    for _, g in df.groupby(lambda ix: ix.date()):
+        minute = g.index.hour * 60 + g.index.minute
+        gvol = g["volume"]
+
+        # Regular-session 1-sec reference (09:30-15:55).
+        reg = gvol[(minute >= 570) & (minute <= 955)]
+        if len(reg) < 100:
+            continue                       # too little regular data to judge
+        ref = reg.quantile(0.99)
+        if not ref > 0:
+            continue
+
+        # Half-day evidence: enough thin minutes after 13:00 vs the morning.
+        vmin = gvol.groupby(minute).sum()
+        base = vmin[(vmin.index >= 570) & (vmin.index < 780)]
+        base_med = base.median() if not base.empty else 0
+        aft = vmin[(vmin.index >= 790) & (vmin.index <= 955)]
+        half = base_med > 0 and len(aft) >= 5 and aft.median() < base_med * 0.1
+        lo, hi = (779, 781) if half else (959, 961)   # 12:59-13:01 or 15:59-16:01
+
+        win = gvol[(minute >= lo) & (minute <= hi)]
+        hits = win.index[win.to_numpy() > ref_mult * ref]
+        if len(hits):
+            flag.loc[hits] = True
+    return flag
+
+
+def _flag_auction_1min(df: pd.DataFrame, mult: float = 6.0, spill_mult: float = 3.0) -> pd.Series:
+    """Core closing-cross detection on minute-level (or coarser) volume bars.
 
     Checks for whether closing occurs during "half-day" (around 13:00)
     or "full-day" (around 16:00).
@@ -443,8 +494,17 @@ def add_cvd_columns(df: pd.DataFrame) -> pd.DataFrame:
     # default CVD, and keep an un-neutralized `delta_raw` so a "CVD raw (incl.
     # auction)" line stays available for comparison. See Personal Study Log §8.
     df["is_auction"]     = _flag_auction(df)
-    
-    # We apply neutralization for all sources, including ibkr_tick, because the 
+
+    # Ground-truth override: a bar whose stored AllLast condition code marks the
+    # closing cross (see tick_collector's `special_conditions`) is an auction
+    # regardless of the volume heuristic. The column is absent on estimated/older
+    # bars, and _AUCTION_CONDITION_CODES is empty until real IBKR strings are
+    # observed, so today this is a no-op that never mis-flags.
+    if "special_conditions" in df.columns:
+        code_auc = df["special_conditions"].map(_has_auction_condition)
+        df["is_auction"] = df["is_auction"] | code_auc.fillna(False).astype(bool)
+
+    # We apply neutralization for all sources, including ibkr_tick, because the
     # 16:00 closing cross (MOC) prints as a huge block volume, not an aggressive hit.
 
     df["delta_raw"]      = df["delta"]                       # before neutralization
