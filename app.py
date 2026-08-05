@@ -243,6 +243,28 @@ app.index_string = '''
                                     lo = Math.min(lo, Math.max(hlo, lo - m));
                                     hi = Math.max(hi, Math.min(hhi, hi + m));
                                 }
+                                // The two S&R lines are LAYOUT SHAPES (not traces),
+                                // so the loop above never sees them. They are the
+                                // key trade signal and the depth selector may clip a
+                                // wall out of the heatmap, so pull the price-panel
+                                // S&R line prices into the fit UNCONDITIONALLY (not
+                                // capped like the heatmap) — otherwise this
+                                // client-side refit re-crops the axis to candles +
+                                // clipped heatmap right after the server render and
+                                // hides the far wall (the "only one S&R line shows
+                                // at 10 levels" bug). On the price panel (yref 'y')
+                                // the only line shapes are the S&R lines; the source
+                                // shading / demarcation shapes use yref 'paper'.
+                                if (yref === 'y' && gd._fullLayout.shapes) {
+                                    gd._fullLayout.shapes.forEach(function(sh) {
+                                        if (sh && sh.type === 'line' &&
+                                            (sh.yref === 'y' || sh.yref === 'y1') &&
+                                            sh.y0 != null) {
+                                            if (sh.y0 < lo) lo = sh.y0;
+                                            if (sh.y0 > hi) hi = sh.y0;
+                                        }
+                                    });
+                                }
                                 var pad = (hi - lo) * YPAD;
                                 var new_lo = lo - pad;
                                 var new_hi = hi + pad;
