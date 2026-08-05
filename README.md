@@ -1,8 +1,7 @@
 # Trading CVD Bubble
 
 A **Cumulative Volume Delta (CVD)** dashboard for reading order-flow pressure
-behind a stock's price — built to spot the buying pressure that precedes a
-short squeeze.
+behind a stock's price.
 
 A candlestick chart tells you *where* price went. This tool tells you *how hard
 it was pushed and by whom*: every individual trade is classified as
@@ -11,6 +10,11 @@ into a CVD curve, and drawn together with the resting order book (Level-2
 depth) as a Bookmap-style heatmap. Aggressive flow meeting a passive wall is
 where price stalls, reverses, or breaks out — the chart is designed to make
 that moment visible.
+
+Underneath it is supply and demand: a price chart shows only the *result* of the
+imbalance, after the fact. This measures the imbalance itself, as it
+accumulates. What it produces is a **measurement layer**, not a trading
+strategy — see [Where this could be applied](#where-this-could-be-applied).
 
 - **[USAGE.md](USAGE.md) — how to read the chart** (every color, line and control).
 - Jump to: [Quick start](#quick-start-demo-mode-no-broker-account-needed) ·
@@ -214,6 +218,24 @@ volume, which is why FinViz bars are used to rescale volume; and the
 closing-cross condition code `'6'` was confirmed against a real NVDA close.
 
 ---
+
+## Where this could be applied
+
+What the system produces is a measured supply/demand imbalance per bar, at any
+resolution, with the resting order book alongside it. That is an input to other
+work rather than a strategy in itself:
+
+- **Short-squeeze detection** — the original motivation for the project. Forced
+  buying by short sellers would appear here as aggressive buying absorbed at a
+  wall until the wall breaks. **This is not implemented**: there is no
+  short-interest, float or borrow-rate data anywhere in this system, and no
+  squeeze detector. What exists is the measurement layer such a detector needs.
+- **Execution quality** — when working a large order, whether you are the
+  aggressor moving the price against yourself, and where the resting liquidity
+  you are about to consume actually sits.
+- **Order-flow research** — the tiered store, the classified tick archive and
+  the quality flags are reusable for studies unrelated to this chart. The
+  scripts in `scripts/` are examples.
 
 ## Known issues & current limitations
 
