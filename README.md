@@ -17,20 +17,64 @@ accumulates. What it produces is a **measurement layer**, not a trading
 strategy — see [Where this could be applied](#where-this-could-be-applied).
 
 - **[USAGE.md](USAGE.md) — how to read the chart** (every color, line and control).
-- Jump to: [Quick start](#quick-start-demo-mode-no-broker-account-needed) ·
-  [What is where](#what-is-where) · [Live mode](#live-mode-real-time-collection) ·
+- Jump to: [Quick start](#quick-start-live-data) ·
+  [Demo mode](#demo-mode-optional-no-broker-account) ·
+  [What is where](#what-is-where) ·
   [How it works](#how-it-works) · [Known issues](#known-issues--current-limitations) ·
   [Troubleshooting](#troubleshooting)
 
 ---
 
-## Quick start (demo mode, no broker account needed)
+## Quick start (live data)
 
-The dashboard reads from a local MongoDB that is normally filled by the live
-IBKR collector. So that anyone can run this repository without a brokerage
-account or a paid market-data subscription, a **real slice of the project's own
-data is bundled in `demo_data/`** (NVDA, trading day 2026-07-22: tick-classified
-1-second bars plus the real Level-2 order book).
+This is the real system: it connects to Interactive Brokers, classifies every
+trade tick-by-tick as it happens, and builds the CVD / Level-2 view from that
+live feed. Requires accounts:
+
+| Requirement | Why |
+|---|---|
+| **IBKR account + IB Gateway / TWS** running and logged in, API enabled on port 7497 | tick-by-tick trades and quotes |
+| **Market-data subscription** (e.g. Nasdaq TotalView for depth) | without it, depth requests fail and quotes are delayed |
+| **FinViz Elite account** | consolidated 1-minute bars, used to scale the thin tick-stream volume to real traded volume |
+
+```bash
+git clone <this-repo-url>
+cd tradingCVDBubble
+
+python3 -m venv venv_main
+./venv_main/bin/pip install -r requirements.txt
+
+cp .env.example .env                 # then fill in FINVIZ_USERNAME / FINVIZ_PASSWORD
+./start_all.sh                       # collector + dashboard
+./stop_all.sh                        # stop both
+```
+
+`start_all.sh` picks its interpreter from `$PYTHON`, then an active virtualenv,
+then `./venv_main`, then `python3` on PATH — override with
+`PYTHON=/path/to/python ./start_all.sh`.
+
+The whole live system is **two processes**:
+
+1. **Collector** — `python -m ibkr.dynamic_collector`. One IB connection
+   handling ticks → 1-second bars, a one-time catch-up backfill, and L2 depth.
+   It is **on demand**: nothing is collected until you search a ticker in the
+   app. It keeps the 5 most recently viewed tickers (3 for depth) and evicts the
+   oldest.
+2. **App** — `python -m app` (<http://127.0.0.1:8050>).
+
+Open <http://127.0.0.1:8050>, search a ticker (e.g. **NVDA**), and it starts
+collecting and charting from the live feed.
+
+---
+
+## Demo mode (optional, no broker account)
+
+The dashboard reads from a local MongoDB, which the live collector above fills.
+If you don't have an IBKR / FinViz account handy — e.g. reviewing this repo
+without setting one up — a **real slice of the project's own data is bundled in
+`demo_data/`** (NVDA, trading day 2026-07-22: tick-classified 1-second bars plus
+the real Level-2 order book), so the same dashboard can be viewed without live
+collection.
 
 **Prerequisites:** Python 3.12+ and a local MongoDB.
 
@@ -63,8 +107,7 @@ You should see candles with no background shading (real tick data), the three
 CVD lines, Z-Score bubbles, and the depth heatmap behind the candles.
 
 > `requirements-demo.txt` is the short list needed to *view* data. Use the full
-> `requirements.txt` if you also want to collect new data or run the research
-> scripts.
+> `requirements.txt` for live collection (above) or the research scripts.
 
 ---
 
@@ -127,38 +170,6 @@ tradingCVDBubble/
 **Databases** (local MongoDB): `finviz_db.candles` holds every bar tier plus
 `raw_ticks` / `raw_quotes`; `trading_cvd.level2_snapshots` holds the order-book
 snapshots.
-
----
-
-## Live mode (real-time collection)
-
-Only needed to collect *new* market data. Requires accounts:
-
-| Requirement | Why |
-|---|---|
-| **IBKR account + IB Gateway / TWS** running and logged in, API enabled on port 7497 | tick-by-tick trades and quotes |
-| **Market-data subscription** (e.g. Nasdaq TotalView for depth) | without it, depth requests fail and quotes are delayed |
-| **FinViz Elite account** | consolidated 1-minute bars, used to scale the thin tick-stream volume to real traded volume |
-
-```bash
-cp .env.example .env                 # then fill in FINVIZ_USERNAME / FINVIZ_PASSWORD
-./venv_main/bin/pip install -r requirements.txt
-./start_all.sh                       # collector + dashboard
-./stop_all.sh                        # stop both
-```
-
-`start_all.sh` picks its interpreter from `$PYTHON`, then an active virtualenv,
-then `./venv_main`, then `python3` on PATH — override with
-`PYTHON=/path/to/python ./start_all.sh`.
-
-The whole live system is **two processes**:
-
-1. **Collector** — `python -m ibkr.dynamic_collector`. One IB connection
-   handling ticks → 1-second bars, a one-time catch-up backfill, and L2 depth.
-   It is **on demand**: nothing is collected until you search a ticker in the
-   app. It keeps the 5 most recently viewed tickers (3 for depth) and evicts the
-   oldest.
-2. **App** — `python -m app` (<http://127.0.0.1:8050>).
 
 ---
 
