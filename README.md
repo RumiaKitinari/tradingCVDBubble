@@ -63,6 +63,23 @@ loudly rather than silently falling back, so a deliberate choice is never
 overridden. If nothing answers, it prints the full checklist (Gateway logged in?
 API enabled? port match? 127.0.0.1 trusted?) instead of a bare connection error.
 
+**Gateway on a different machine.** The IB API is a plain socket, so the
+collector does not have to run where Gateway runs. Set `IB_HOST`:
+
+```bash
+IB_HOST=192.168.1.42 python start_all.py
+```
+
+On the Gateway machine, untick **API > Settings > "Allow connections from
+localhost only"** and add the client's IP under **Trusted IPs**.
+
+This is the supported way to exercise the collector from a second machine.
+IBKR streams real-time data to **one session at a time**, so logging a second
+Gateway in elsewhere knocks the first one off and stops its collection — and
+1-second tick history cannot be backfilled afterwards, so that gap is permanent.
+Pointing another *collector* at the one existing Gateway has no such effect:
+separate `clientId`s are ordinary concurrent API clients.
+
 ---
 
 ## Install

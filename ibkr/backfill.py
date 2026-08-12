@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from ib_async import IB, Stock
+from ibkr import IB_HOST
 
 from history.bvc import bvc_split
 from history.schema import mongo_client
@@ -129,7 +130,7 @@ async def backfill_ticker(
 
     ib = IB()
     try:
-        await ib.connectAsync("127.0.0.1", port, clientId=client_id)
+        await ib.connectAsync(IB_HOST, port, clientId=client_id)
     except Exception as e:
         logging.error(f"[Backfill] Connection failed: {e}")
         return
