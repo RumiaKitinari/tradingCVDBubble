@@ -45,7 +45,6 @@ from zoneinfo import ZoneInfo
 
 from pymongo import MongoClient
 from ib_async import IB, Stock
-from ibkr import IB_HOST
 
 from ibkr.tick_collector import TickCollector, MONGO_URI, DB_NAME
 from ibkr.backfill import backfill_ticker
@@ -373,9 +372,9 @@ class UnifiedCollector:
         errors = []
         for port, label in candidates:
             try:
-                logging.info(f"[col] connecting to IB at {IB_HOST}:{port} "
-                             f"({label}), clientId={self.client_id}...")
-                await self.ib.connectAsync(IB_HOST, port,
+                logging.info(f"[col] connecting to IB on port {port} ({label}), "
+                             f"clientId={self.client_id}...")
+                await self.ib.connectAsync("127.0.0.1", port,
                                            clientId=self.client_id,
                                            timeout=CONNECT_PROBE_TIMEOUT)
             except Exception as e:
@@ -402,10 +401,7 @@ class UnifiedCollector:
             "    3. The API port there matches one of "
             f"{', '.join(str(p) for p, _ in IB_PORTS)} "
             "(Gateway paper is 4002, TWS paper 7497).\n"
-            f"    4. This machine's IP is in the Trusted IPs list (host tried: {IB_HOST}).\n"
-            "       For a Gateway on ANOTHER machine, also untick 'Allow\n"
-            "       connections from localhost only' there, and set IB_HOST to\n"
-            "       its address:  IB_HOST=192.168.1.42 python start_all.py\n"
+            "    4. 127.0.0.1 is in the Trusted IPs list.\n"
             "  Force a specific port with:  python -m ibkr.dynamic_collector --port <n>"
         )
         raise ConnectionError("no IB API port answered")

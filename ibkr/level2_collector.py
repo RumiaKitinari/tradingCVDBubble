@@ -46,7 +46,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from ib_async import IB, Stock
-from ibkr import IB_HOST
 
 from level2_webapp.data_provider import (
     get_l2_collection, snapshot_doc, ensure_l2_indexes,
@@ -156,7 +155,7 @@ class Level2Collector:
                 await self._subscribe_one(sym)
 
     async def _connect_and_subscribe(self):
-        await self.ib.connectAsync(IB_HOST, self.port, clientId=self.client_id)
+        await self.ib.connectAsync("127.0.0.1", self.port, clientId=self.client_id)
         log.info(f"Connected (clientId={self.client_id})")
         self.books = {}
         self.contracts = {}

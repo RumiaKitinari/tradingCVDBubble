@@ -40,7 +40,6 @@ from zoneinfo import ZoneInfo
 
 from pymongo import MongoClient
 from ib_async import IB, Stock
-from ibkr import IB_HOST
 
 # Shared aggressor classification (same logic as the Alpaca pipeline).
 # Note: during the closing auction (15:59 ET) the entire MOC order book
@@ -367,7 +366,7 @@ class TickCollector:
             f"[{self.ticker}] Connecting to IB Gateway "
             f"(port={self.port}, clientId={self.client_id})..."
         )
-        await self.ib.connectAsync(IB_HOST, self.port, clientId=self.client_id)
+        await self.ib.connectAsync("127.0.0.1", self.port, clientId=self.client_id)
         logging.info(f"[{self.ticker}] Connected.")
 
         contract = Stock(self.ticker, "SMART", "USD")
